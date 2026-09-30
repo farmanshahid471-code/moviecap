@@ -21,8 +21,13 @@ jobs:
           $code = $LASTEXITCODE
           Get-Content build.log -Tail 150
           if ($code -ne 0) {
-            # Surface the compiler errors in the job summary, where they can be
-            # read without downloading the raw logs.
+            # Surface the compiler errors as annotations + job summary, so they
+            # can be read without downloading the raw logs.
+            $errs = Select-String -Path build.log -Pattern 'error|LINK :|fatal' |
+                    Select-Object -First 12
+            foreach ($e in $errs) {
+              Write-Host ("::error title=MSVC build::{0}" -f $e.Line)
+            }
             $fence = '```'
             Add-Content $env:GITHUB_STEP_SUMMARY "### MSVC build failed (exit $code)"
             Add-Content $env:GITHUB_STEP_SUMMARY $fence
