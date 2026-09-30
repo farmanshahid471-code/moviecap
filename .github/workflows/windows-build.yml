@@ -60,6 +60,76 @@ jobs:
           if (-not (Select-String -Path smoke.log -Pattern "Processing: Amélie's Test \(2001\)" -Quiet)) { throw "unicode movie was not picked up" }
           if (-not (Select-String -Path smoke.log -Pattern "All done" -Quiet)) { throw "run did not finish" }
 
+      - name: Test the portable FFmpeg lookup (nothing on PATH)
+        shell: pwsh
+        run: |
+          # This is what makes the F: install work: run.bat drops ffmpeg.exe next to
+          # the project instead of editing the system PATH, so the app has to find it.
+          $real = Get-ChildItem "C:\ProgramData\chocolatey\lib\ffmpeg" -Recurse -Filter ffmpeg.exe |
+                  Select-Object -First 1
+          if (-not $real) { throw "could not locate chocolatey's ffmpeg.exe to copy" }
+          $probe = Join-Path $real.DirectoryName "ffprobe.exe"
+          if (-not (Test-Path $probe)) { throw "ffprobe.exe is not next to ffmpeg.exe" }
+
+          New-Item -ItemType Directory -Force "smoke\tools\ffmpeg\bin" | Out-Null
+          Copy-Item $real.FullName "smoke\tools\ffmpeg\bin\"
+          Copy-Item $probe "smoke\tools\ffmpeg\bin\"
+
+          Push-Location smoke
+          $env:Path = "C:\Windows\System32;C:\Windows"
+          if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
+            throw "ffmpeg is still on PATH, so this test would prove nothing"
+          }
+          .\movie_summary_cli.exe 2>&1 | Tee-Object -FilePath ..\portable.log
+          Pop-Location
+
+          if (-not (Select-String -Path portable.log -Pattern "ffmpeg \+ ffprobe found" -Quiet)) {
+            throw "the app did not pick up the portable FFmpeg from tools\ffmpeg\bin"
+          }
+          Write-Host "portable FFmpeg lookup OK (found tools\ffmpeg\bin with an empty PATH)"
+
+      - name: Test the FFmpeg auto-installer (install_tools.ps1)
+        shell: pwsh
+        run: |
+          # Really downloads and unpacks FFmpeg, exactly like run.bat does for a user.
+          $dest = Join-Path $env:RUNNER_TEMP "moviecap-tools"
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\install_tools.ps1 -ToolsDir $dest
+          if ($LASTEXITCODE -ne 0) { throw "install_tools.ps1 returned $LASTEXITCODE" }
+
+          $ff = Join-Path $dest "ffmpeg\bin\ffmpeg.exe"
+          $fp = Join-Path $dest "ffmpeg\bin\ffprobe.exe"
+          if (-not (Test-Path $ff)) { throw "the installer did not produce ffmpeg.exe" }
+          if (-not (Test-Path $fp)) { throw "the installer did not produce ffprobe.exe" }
+          & $ff -version | Select-Object -First 1
+          if ($LASTEXITCODE -ne 0) { throw "the installed ffmpeg.exe does not run" }
+          if (Test-Path (Join-Path $dest "downloads\ffmpeg.zip")) { throw "the zip was not cleaned up" }
+
+          # a second run must be a no-op, not a second download
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\install_tools.ps1 -ToolsDir $dest
+          if ($LASTEXITCODE -ne 0) { throw "re-running install_tools.ps1 failed" }
+          Write-Host "install_tools.ps1 OK -> $dest"
+
+      - name: Test run.bat (finds the FFmpeg the installer put on disk)
+        shell: cmd
+        run: |
+          REM Proves run.bat and install_tools.ps1 agree on the folder layout:
+          REM with no ffmpeg on PATH, run.bat must locate the portable copy.
+          set "PATH=C:\Windows\System32;C:\Windows"
+          set "MOVIECAP_TOOLS=%RUNNER_TEMP%\moviecap-tools"
+          call run.bat setup > runbat.log 2>&1
+          if errorlevel 1 (
+            type runbat.log
+            exit /b 1
+          )
+          findstr /C:"Using the portable FFmpeg" runbat.log >nul
+          if errorlevel 1 (
+            echo run.bat did not report the portable FFmpeg:
+            type runbat.log
+            exit /b 1
+          )
+          type runbat.log
+          echo run.bat OK
+
       - name: Smoke test the web control panel
         shell: pwsh
         run: |
@@ -117,7 +187,7 @@ jobs:
           New-Item -ItemType Directory -Force $pkg | Out-Null
           Copy-Item build\Release\movie_summary_bot.exe, build\Release\movie_summary_cli.exe, build\Release\movie_summary_web.exe $pkg\
           Copy-Item -Recurse resources, backgroundmusic $pkg\
-          Copy-Item config.json, README.md, run.bat, setup.ps1 $pkg\
+          Copy-Item config.json, README.md, run.bat, setup.ps1, install_tools.ps1 $pkg\
           Compress-Archive -Path $pkg\* -DestinationPath "$pkg.zip" -Force
 
       - uses: actions/upload-artifact@v4

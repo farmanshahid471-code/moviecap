@@ -216,24 +216,87 @@ static bool looks_like_project_root_w(const wchar_t *dir) {
   return false;
 }
 
-bool plat_enter_project_dir(void) {
+/*
+ * run.bat / install_tools.ps1 install a portable FFmpeg (by default under
+ * F:\AI-Movie-Shorts\tools) instead of touching the system, so those binaries
+ * are not on the system PATH. Find them and put the folder at the front of this
+ * process' PATH - child processes inherit it, and C: stays untouched.
+ */
+static void plat_use_portable_tools(void) {
   wchar_t cwd[4096];
-  if (GetCurrentDirectoryW(4096, cwd) && looks_like_project_root_w(cwd)) return true;
+  DWORD cn = GetCurrentDirectoryW(4096, cwd);
+  if (cn == 0 || cn >= 4096) cwd[0] = 0;
 
-  wchar_t exe[4096];
-  DWORD n = GetModuleFileNameW(NULL, exe, 4096);
-  if (n == 0 || n >= 4096) return false;
+  wchar_t envtools[4096] = L"";
+  GetEnvironmentVariableW(L"MOVIECAP_TOOLS", envtools, 4096);
 
-  /* strip file name, then walk up */
-  for (int level = 0; level <= 5; level++) {
-    wchar_t *slash = wcsrchr(exe, L'\\');
-    if (!slash) break;
-    *slash = 0;
-    if (looks_like_project_root_w(exe)) {
-      return SetCurrentDirectoryW(exe) != 0;
+  wchar_t b_env[4200], b_cwd_tools[4200], b_cwd_ff[4200];
+  _snwprintf(b_env, 4200, L"%ls\\ffmpeg\\bin", envtools);        b_env[4199] = 0;
+  _snwprintf(b_cwd_tools, 4200, L"%ls\\tools\\ffmpeg\\bin", cwd); b_cwd_tools[4199] = 0;
+  _snwprintf(b_cwd_ff, 4200, L"%ls\\ffmpeg\\bin", cwd);        b_cwd_ff[4199] = 0;
+
+  const wchar_t *cands[4];
+  cands[0] = envtools[0] ? b_env : NULL;
+  cands[1] = L"F:\\AI-Movie-Shorts\\tools\\ffmpeg\\bin";
+  cands[2] = cwd[0] ? b_cwd_tools : NULL;
+  cands[3] = cwd[0] ? b_cwd_ff : NULL;
+
+  for (int i = 0; i < 4; i++) {
+    if (!cands[i] || !cands[i][0]) continue;
+
+    wchar_t ff[4300], fp[4300];
+    _snwprintf(ff, 4300, L"%ls\\ffmpeg.exe", cands[i]);  ff[4299] = 0;
+    _snwprintf(fp, 4300, L"%ls\\ffprobe.exe", cands[i]); fp[4299] = 0;
+    if (GetFileAttributesW(ff) == INVALID_FILE_ATTRIBUTES) continue;
+    if (GetFileAttributesW(fp) == INVALID_FILE_ATTRIBUTES) continue;
+
+    DWORD need = GetEnvironmentVariableW(L"PATH", NULL, 0); /* size incl. NUL */
+    size_t total = wcslen(cands[i]) + (need ? need + 1 : 0) + 2;
+    wchar_t *np = (wchar_t *)malloc(total * sizeof(wchar_t));
+    if (!np) return;
+    if (need > 1) {
+      wchar_t *cur = (wchar_t *)malloc(need * sizeof(wchar_t));
+      if (!cur) { free(np); return; }
+      GetEnvironmentVariableW(L"PATH", cur, need);
+      _snwprintf(np, total, L"%ls;%ls", cands[i], cur);
+      free(cur);
+    } else {
+      _snwprintf(np, total, L"%ls", cands[i]);
+    }
+    np[total - 1] = 0;
+
+    SetEnvironmentVariableW(L"PATH", np); /* what CreateProcessW children inherit */
+    _wputenv_s(L"PATH", np);              /* keep the CRT copy in sync as well   */
+    free(np);
+    return;
+  }
+}
+
+bool plat_enter_project_dir(void) {
+  bool ok = false;
+
+  wchar_t cwd[4096];
+  if (GetCurrentDirectoryW(4096, cwd) && looks_like_project_root_w(cwd)) {
+    ok = true;
+  } else {
+    wchar_t exe[4096];
+    DWORD n = GetModuleFileNameW(NULL, exe, 4096);
+    if (n != 0 && n < 4096) {
+      /* strip file name, then walk up */
+      for (int level = 0; level <= 5; level++) {
+        wchar_t *slash = wcsrchr(exe, L'\\');
+        if (!slash) break;
+        *slash = 0;
+        if (looks_like_project_root_w(exe)) {
+          ok = SetCurrentDirectoryW(exe) != 0;
+          break;
+        }
+      }
     }
   }
-  return false;
+
+  plat_use_portable_tools();
+  return ok;
 }
 
 /* ---------- processes ---------- */
@@ -520,27 +583,68 @@ bool plat_getcwd(char *out, size_t outsz) {
   return true;
 }
 
+/* Same idea as the Windows version: prefer a bundled/portable FFmpeg that was
+ * installed next to the project over whatever happens to be on PATH. */
+static void plat_use_portable_tools(void) {
+  const char *envtools = getenv("MOVIECAP_TOOLS");
+
+  char b_env[PATH_MAX + 64], b_tools[PATH_MAX + 64], b_ff[PATH_MAX + 64];
+  if (envtools && envtools[0]) snprintf(b_env, sizeof(b_env), "%s/ffmpeg/bin", envtools);
+  else b_env[0] = 0;
+  snprintf(b_tools, sizeof(b_tools), "tools/ffmpeg/bin");
+  snprintf(b_ff, sizeof(b_ff), "ffmpeg/bin");
+
+  const char *cands[3] = { b_env, b_tools, b_ff };
+  for (int i = 0; i < 3; i++) {
+    if (!cands[i][0]) continue;
+    char ff[PATH_MAX + 80], fp[PATH_MAX + 80];
+    snprintf(ff, sizeof(ff), "%s/ffmpeg", cands[i]);
+    snprintf(fp, sizeof(fp), "%s/ffprobe", cands[i]);
+    if (plat_stat(ff, NULL) != PLAT_FILE || plat_stat(fp, NULL) != PLAT_FILE) continue;
+
+    const char *cur = getenv("PATH");
+    size_t need = strlen(cands[i]) + (cur ? strlen(cur) + 2 : 1);
+    char *np = (char *)malloc(need);
+    if (!np) return;
+    if (cur && cur[0]) snprintf(np, need, "%s:%s", cands[i], cur);
+    else snprintf(np, need, "%s", cands[i]);
+    setenv("PATH", np, 1);
+    free(np);
+    return;
+  }
+}
+
 bool plat_enter_project_dir(void) {
+  bool ok = false;
+
   if (plat_stat("resources/Inter-Regular.ttf", NULL) == PLAT_FILE ||
-      plat_stat("config.json", NULL) == PLAT_FILE) return true;
+      plat_stat("config.json", NULL) == PLAT_FILE) {
+    ok = true;
+  }
 #if defined(__linux__)
-  char exe[PATH_MAX];
-  ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-  if (n <= 0) return false;
-  exe[n] = 0;
-  for (int level = 0; level <= 5; level++) {
-    char *slash = strrchr(exe, '/');
-    if (!slash || slash == exe) break;
-    *slash = 0;
-    char p1[PATH_MAX + 64], p2[PATH_MAX + 64];
-    snprintf(p1, sizeof(p1), "%s/resources/Inter-Regular.ttf", exe);
-    snprintf(p2, sizeof(p2), "%s/config.json", exe);
-    if (plat_stat(p1, NULL) == PLAT_FILE || plat_stat(p2, NULL) == PLAT_FILE) {
-      return chdir(exe) == 0;
+  else {
+    char exe[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+      exe[n] = 0;
+      for (int level = 0; level <= 5; level++) {
+        char *slash = strrchr(exe, '/');
+        if (!slash || slash == exe) break;
+        *slash = 0;
+        char p1[PATH_MAX + 64], p2[PATH_MAX + 64];
+        snprintf(p1, sizeof(p1), "%s/resources/Inter-Regular.ttf", exe);
+        snprintf(p2, sizeof(p2), "%s/config.json", exe);
+        if (plat_stat(p1, NULL) == PLAT_FILE || plat_stat(p2, NULL) == PLAT_FILE) {
+          ok = chdir(exe) == 0;
+          break;
+        }
+      }
     }
   }
 #endif
-  return false;
+
+  plat_use_portable_tools();
+  return ok;
 }
 
 char *plat_quote_arg(const char *s) {

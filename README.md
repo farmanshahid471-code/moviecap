@@ -12,8 +12,30 @@ Example Video: [Citizen Kane (1941)](https://www.youtube.com/watch?v=ej8c0NwKW00
 
 ## Quick start (Windows 10 / 11)
 
+**Using the ready-made zip (no compiler needed):**
+
+```bat
+run.bat web
+```
+
+That is the whole install. The first time you run it, `run.bat` notices that FFmpeg
+is missing and **downloads and installs it for you** — portable, no admin rights,
+nothing written to `C:\` and no system `PATH` change:
+
+```
+F:\AI-Movie-Shorts\tools\ffmpeg\bin\ffmpeg.exe
+F:\AI-Movie-Shorts\tools\ffmpeg\bin\ffprobe.exe
+```
+
+Everything the app needs lives under `F:\AI-Movie-Shorts\tools`. Want it somewhere
+else? Set `MOVIECAP_TOOLS` before running (e.g. `set MOVIECAP_TOOLS=F:\MovieTools`),
+or pass `-ToolsDir` to `install_tools.ps1`. If there is no `F:` drive it falls back to
+a `tools\` folder next to the app.
+
+**Building from source:**
+
 ```powershell
-# 1. one-time setup: installs FFmpeg, CMake and the Visual Studio C compiler via winget
+# 1. one-time setup: installs CMake and the Visual Studio C compiler via winget
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
 
 # 2. open a NEW terminal, then build
@@ -31,7 +53,9 @@ Then put a movie in `movies\` (e.g. `movies\Citizen Kane.mp4`) and click **START
 
 > **No compiler?** Every push is built by GitHub Actions on Windows (see `.github/workflows/windows-build.yml`).
 > Download the **AI-Movie-Shorts-Windows** zip from the latest run's *Artifacts* section. It contains the
-> ready-to-run `.exe` files, `resources\`, `backgroundmusic\`, `config.json` and `run.bat`. You still need FFmpeg (`winget install Gyan.FFmpeg`).
+> ready-to-run `.exe` files, `resources\`, `backgroundmusic\`, `config.json`, `run.bat` and
+> `install_tools.ps1`. You do **not** need to install anything first — `run.bat` fetches a
+> portable FFmpeg into `F:\AI-Movie-Shorts\tools` on first launch.
 
 ---
 
@@ -147,6 +171,7 @@ executable and in up to 5 parent folders, then switches to it.
   - `ui.png` — UI screenshot (for README)
   - `app.ico`, `app.rc` — Windows icon + version info embedded into the `.exe`
 - `src\` — C source (see *Source layout* below)
+- `install_tools.ps1` — portable FFmpeg downloader (called by `run.bat`; installs to `F:\AI-Movie-Shorts\tools`)
 - `tools\mock_api_server.py` — offline stand-in for the OpenAI + ElevenLabs APIs
   and for the three free narration contracts (XTTS `/tts_to_audio/`, Piper
   `/synthesize`, OpenAI-compatible `/audio/speech`) — for testing
@@ -414,7 +439,7 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
 ## Notes & troubleshooting
 
 - **Filename matters**: `movies\My Movie.mp4` → treated as title `My Movie`
-- **"ffmpeg/ffprobe not found in PATH"** → `winget install Gyan.FFmpeg`, then **close and reopen** the app/terminal so the new PATH applies. Check with `ffmpeg -version`.
+- **"ffmpeg/ffprobe not found in PATH"** → start the app with `run.bat`; it installs a portable FFmpeg into `F:\AI-Movie-Shorts\tools\ffmpeg\bin` and puts it on PATH for that session. If the download is blocked, run `install_tools.ps1` yourself or `winget install Gyan.FFmpeg`, then **close and reopen** the app/terminal. Check with `ffmpeg -version`.
 - **Windows SmartScreen** may warn about an unsigned `.exe` you built or downloaded. Click *More info → Run anyway*.
 - If you see "plan count = 0" / "No plan returned" or missing clips, check:
   - your OpenAI key (the exact error from OpenAI is shown in the log)
