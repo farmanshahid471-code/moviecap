@@ -53,6 +53,9 @@ if exist "build\Release\%EXE%" (
 exit /b %errorlevel%
 
 REM --------------------------------------------------------------------------
+REM  NOTE: every path out of this subroutine uses an explicit "exit /b N".
+REM  ECHO and GOTO do not reset ERRORLEVEL, so a leftover failure from the
+REM  "where" lookups would otherwise be reported as a failed install.
 :ensure_tools
 REM Already on PATH? Then there is nothing to download.
 where ffmpeg >nul 2>nul
@@ -60,18 +63,18 @@ if errorlevel 1 goto :need_tools
 where ffprobe >nul 2>nul
 if errorlevel 1 goto :need_tools
 echo [OK] FFmpeg found on PATH.
-goto :eof
+exit /b 0
 
 :need_tools
 if exist "%FFBIN%\ffmpeg.exe" if exist "%FFBIN%\ffprobe.exe" (
   echo [OK] Using the portable FFmpeg in %FFBIN%
-  goto :eof
+  exit /b 0
 )
 REM A previous run may have fallen back to the app folder (no F: drive).
 if exist "%~dp0tools\ffmpeg\bin\ffmpeg.exe" if exist "%~dp0tools\ffmpeg\bin\ffprobe.exe" (
   set "FFBIN=%~dp0tools\ffmpeg\bin"
   echo [OK] Using the portable FFmpeg in %~dp0tools\ffmpeg\bin
-  goto :eof
+  exit /b 0
 )
 
 echo.
@@ -90,6 +93,6 @@ if errorlevel 1 (
 )
 
 REM The installer falls back to <app folder>\tools when F: is not available.
-if exist "%FFBIN%\ffmpeg.exe" goto :eof
+if exist "%FFBIN%\ffmpeg.exe" exit /b 0
 if exist "%~dp0tools\ffmpeg\bin\ffmpeg.exe" set "FFBIN=%~dp0tools\ffmpeg\bin"
-goto :eof
+exit /b 0

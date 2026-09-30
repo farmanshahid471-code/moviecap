@@ -33,3 +33,7 @@ scripts/srt_files/
 client_secrets.json
 cookies.txt
 config.local.json
+
+# CI only: portable FFmpeg installed by the workflow tests
+/ci-tools/
+/runbat.log
