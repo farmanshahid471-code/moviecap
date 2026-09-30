@@ -165,6 +165,57 @@ jobs:
           if ($rc1 -ne 0 -or -not (Test-Path "tools\ffmpeg\bin\ffmpeg.exe") -or $bad) { exit 1 }
           Write-Host "no-F: fallback OK"
 
+      - name: "Test the free Piper engine end to end (run.bat tts)"
+        shell: pwsh
+        run: |
+          # Installs a private Python + piper-tts + a voice model, starts the real
+          # server and asks it for audio. This is the whole free-narration path.
+          $env:Path = "C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0"
+          $tools = Join-Path (Get-Location) "ci-tools"
+          $env:MOVIECAP_TOOLS = $tools
+
+          & cmd /c "run.bat tts install" *> piper-install.log
+          $rc = $LASTEXITCODE
+          Get-Content piper-install.log | Select-Object -Last 12 | ForEach-Object { Write-Host "::notice title=piper-install:: $_" }
+          Write-Host "::notice title=piper-install::exit=$rc"
+          if ($rc -ne 0) { Write-Host "::error title=piper::run.bat tts install exited with code $rc" }
+
+          $py   = Join-Path $tools "piper\python\python.exe"
+          $onnx = Join-Path $tools "piper\voices\en_US-lessac-medium.onnx"
+          if (-not (Test-Path $py))   { Write-Host "::error title=piper::no private python.exe was installed" }
+          if (-not (Test-Path $onnx)) { Write-Host "::error title=piper::the voice model was not downloaded" }
+          if ($rc -ne 0 -or -not (Test-Path $py) -or -not (Test-Path $onnx)) { exit 1 }
+
+          $srv = Start-Process -FilePath $py -PassThru -WindowStyle Hidden `
+                   -ArgumentList "-m","piper.http_server","--host","127.0.0.1","--port","5099","-m","en_US-lessac-medium","--data-dir","$tools\piper\voices" `
+                   -RedirectStandardError piper-err.log -RedirectStandardOutput piper-out.log
+          try {
+            $up = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Seconds 2
+              try { Invoke-WebRequest "http://127.0.0.1:5099/" -UseBasicParsing -TimeoutSec 5 | Out-Null; $up = $true; break } catch {}
+            }
+            if (-not $up) {
+              Get-Content piper-err.log -Tail 20 | ForEach-Object { Write-Host "::notice title=piper-server:: $_" }
+              Write-Host "::error title=piper::the server never answered on /"
+              exit 1
+            }
+
+            Invoke-WebRequest -Method Post -Uri "http://127.0.0.1:5099/synthesize" `
+              -ContentType "application/json" -Body '{"text":"Hello from the free narration engine."}' `
+              -OutFile piper.wav -UseBasicParsing -TimeoutSec 300
+            $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path piper.wav))
+            $hdr = [System.Text.Encoding]::ASCII.GetString($bytes[0..3])
+            Write-Host "::notice title=piper::/synthesize returned $($bytes.Length) bytes, header=$hdr"
+            if ($bytes.Length -lt 5000 -or $hdr -ne "RIFF") {
+              Write-Host "::error title=piper::/synthesize did not return WAV audio"
+              exit 1
+            }
+          } finally {
+            Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "Piper end to end OK"
+
       - name: Smoke test the web control panel
         shell: pwsh
         run: |
@@ -222,7 +273,7 @@ jobs:
           New-Item -ItemType Directory -Force $pkg | Out-Null
           Copy-Item build\Release\movie_summary_bot.exe, build\Release\movie_summary_cli.exe, build\Release\movie_summary_web.exe $pkg\
           Copy-Item -Recurse resources, backgroundmusic $pkg\
-          Copy-Item config.json, README.md, run.bat, setup.ps1, install_tools.ps1 $pkg\
+          Copy-Item config.json, README.md, run.bat, setup.ps1, install_tools.ps1, install_piper.ps1 $pkg\
           Compress-Archive -Path $pkg\* -DestinationPath "$pkg.zip" -Force
 
       - uses: actions/upload-artifact@v4

@@ -32,6 +32,16 @@ else? Set `MOVIECAP_TOOLS` before running (e.g. `set MOVIECAP_TOOLS=F:\MovieTool
 or pass `-ToolsDir` to `install_tools.ps1`. If there is no `F:` drive it falls back to
 a `tools\` folder next to the app.
 
+**Free narration instead of ElevenLabs:**
+
+```bat
+run.bat tts
+```
+
+Installs the free **Piper** engine (private Python + voice, all under
+`F:\AI-Movie-Shorts\tools\piper`) and starts it on <http://127.0.0.1:5000>.
+Then set *Narration engine* → **Piper** in the panel. No API key, no `C:` usage.
+
 **Building from source:**
 
 ```powershell
@@ -171,6 +181,7 @@ executable and in up to 5 parent folders, then switches to it.
   - `ui.png` — UI screenshot (for README)
   - `app.ico`, `app.rc` — Windows icon + version info embedded into the `.exe`
 - `src\` — C source (see *Source layout* below)
+- `install_piper.ps1` — installs the free Piper narration engine (private Python + voice) into `F:\AI-Movie-Shorts\tools\piper`
 - `install_tools.ps1` — portable FFmpeg downloader (called by `run.bat`; installs to `F:\AI-Movie-Shorts\tools`)
 - `tools\mock_api_server.py` — offline stand-in for the OpenAI + ElevenLabs APIs
   and for the three free narration contracts (XTTS `/tts_to_audio/`, Piper
@@ -270,7 +281,7 @@ so clipping, concatenation and mixing behave exactly the same.
 |---|---|---|---|
 | `elevenlabs` | paid (default) | nothing, it is the ElevenLabs cloud API | `POST {elevenlabs_base_url}/text-to-speech/{voice}` |
 | `xtts` | **free** | `pip install xtts-api-server` then `python -m xtts_api_server` (port 8020) | `POST {tts_base_url}/tts_to_audio/` → WAV |
-| `piper` | **free** | `pip install piper-tts flask` then `python -m piper.http_server --port 5000 -m en_US-lessac-medium.onnx` | `POST {tts_base_url}/synthesize` → WAV |
+| `piper` | **free** | `run.bat tts` (installs a private Python + voice into `F:\AI-Movie-Shorts\tools\piper` and starts the server) | `POST {tts_base_url}/synthesize` → WAV |
 | `openai_tts` | paid or free | OpenAI, or a local OpenAI-compatible server such as Kokoro-FastAPI | `POST {tts_base_url}/audio/speech` → MP3 |
 
 Example — free XTTS narration with your own voice sample (drop a `.wav` in the
@@ -284,6 +295,18 @@ server's `speakers` folder and use its file name):
   "tts_language": "en"
 }
 ```
+
+**Piper in one command** — no Python, no pip, nothing on `C:`:
+
+```bat
+run.bat tts
+```
+
+That downloads a private (embeddable) Python, `piper-tts[http]` and the
+`en_US-lessac-medium` voice into `F:\AI-Movie-Shorts\tools\piper`, then starts the
+server on <http://127.0.0.1:5000>. Keep the window open and set *Narration engine*
+to **Piper** in the panel. Use `run.bat tts install` to install without starting it,
+and `set PIPER_VOICE=en_US-amy-medium` for a different voice.
 
 - With any provider other than `elevenlabs` the ElevenLabs key is **not**
   required, so a missing or placeholder `elevenlabs_api_key` no longer stops the run.

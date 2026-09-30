@@ -1085,7 +1085,7 @@ static const char *PAGE_HTML[] = {
   "var TTS_HELP = {",
   "  elevenlabs: 'Needs an ElevenLabs API key. Voice id and TTS model above are used.',",
   "  xtts: 'Free. Run: pip install xtts-api-server && python -m xtts_api_server  (port 8020). Voice = a .wav in the servers speakers folder. Language: en, hi, ur, es, ...',",
-  "  piper: 'Free and offline. Run: pip install piper-tts flask && python -m piper.http_server --port 5000 -m en_US-lessac-medium.onnx  Voice is optional.',",
+  "  piper: 'Free and offline. Just run: run.bat tts  - it installs a private Python and a voice under F: and starts the server on port 5000. Voice is optional.',",
   "  openai_tts: 'Any OpenAI-compatible endpoint: api.openai.com/v1, Kokoro-FastAPI, LM Studio, ... Uses TTS model + voice + TTS API key.'",
   "};",
   "var TTS_PH = {",
