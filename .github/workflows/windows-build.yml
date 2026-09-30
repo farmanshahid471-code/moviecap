@@ -5,6 +5,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write   # needed to publish the zip to the public "windows-latest" release
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -57,3 +60,19 @@ jobs:
         with:
           name: AI-Movie-Shorts-Windows
           path: AI-Movie-Shorts-Windows.zip
+
+      - name: Publish to public release (direct download link)
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "windows-latest"
+          $notes = "Ready-to-run Windows build (x64) from commit ${{ github.sha }}.`n`nNeeds FFmpeg: winget install Gyan.FFmpeg`nPut your API keys in config.json, then double-click run.bat."
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag AI-Movie-Shorts-Windows.zip --title "AI-Movie-Shorts for Windows (latest build)" --notes $notes --target ${{ github.sha }} --latest
+          } else {
+            gh release upload $tag AI-Movie-Shorts-Windows.zip --clobber
+            gh release edit $tag --notes $notes
+          }
