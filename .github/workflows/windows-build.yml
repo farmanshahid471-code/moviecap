@@ -110,28 +110,25 @@ jobs:
           Write-Host "install_tools.ps1 OK -> $dest"
 
       - name: Test run.bat (finds the FFmpeg the installer put on disk)
-        shell: cmd
+        shell: pwsh
         run: |
-          REM Proves run.bat and install_tools.ps1 agree on the folder layout:
-          REM with no ffmpeg on PATH, run.bat must locate the portable copy.
-          set "PATH=C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0"
-          set "MOVIECAP_TOOLS=%CD%\ci-tools"
-          echo workspace = %CD%
-          echo tools dir = %MOVIECAP_TOOLS%
-          if not exist "%MOVIECAP_TOOLS%\ffmpeg\bin\ffmpeg.exe" echo ::error title=run.bat::the installer did not leave ffmpeg.exe in %MOVIECAP_TOOLS%\ffmpeg\bin
-          dir "%MOVIECAP_TOOLS%\ffmpeg\bin"
+          # Proves run.bat and install_tools.ps1 agree on the folder layout:
+          # with no ffmpeg on PATH, run.bat must locate the portable copy.
+          $env:Path = "C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0"
+          $env:MOVIECAP_TOOLS = Join-Path (Get-Location) "ci-tools"
+          Write-Host "tools dir = $($env:MOVIECAP_TOOLS)"
+          Write-Host "ffmpeg on PATH? $([bool](Get-Command ffmpeg -ErrorAction SilentlyContinue))"
 
-          call run.bat setup > runbat.log 2>&1
-          set RC=%errorlevel%
-          type runbat.log
-          if not "%RC%"=="0" echo ::error title=run.bat::run.bat setup exited with code %RC%
+          & cmd /c "run.bat setup" *> runbat.log
+          $rc = $LASTEXITCODE
+          Get-Content runbat.log | ForEach-Object { Write-Host "::notice title=runbat.log:: $_" }
+          Write-Host "run.bat setup exit code: $rc"
+          if ($rc -ne 0) { Write-Host "::error title=run.bat::run.bat setup exited with code $rc" }
 
-          findstr /C:"Using the portable FFmpeg" runbat.log >nul
-          if errorlevel 1 echo ::error title=run.bat::run.bat did not report the portable FFmpeg
-
-          if not "%RC%"=="0" exit /b 1
-          findstr /C:"Using the portable FFmpeg" runbat.log >nul || exit /b 1
-          echo run.bat OK
+          $hit = Select-String -Path runbat.log -Pattern "Using the portable FFmpeg" -Quiet
+          if (-not $hit) { Write-Host "::error title=run.bat::run.bat did not report the portable FFmpeg" }
+          if ($rc -ne 0 -or -not $hit) { exit 1 }
+          Write-Host "run.bat OK"
 
       - name: Smoke test the web control panel
         shell: pwsh
