@@ -1,0 +1,59 @@
+name: Windows build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache fetched dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps/*-subbuild
+          key: deps-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Build (MSVC, via build.bat)
+        shell: cmd
+        run: build.bat
+
+      - name: Install FFmpeg for smoke test
+        shell: pwsh
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Smoke test (unicode + apostrophe file name, fake keys)
+        shell: pwsh
+        run: |
+          $env:Path = "C:\ProgramData\chocolatey\bin;" + $env:Path
+          New-Item -ItemType Directory -Force smoke\movies | Out-Null
+          Copy-Item build\Release\movie_summary_cli.exe smoke\
+          Copy-Item -Recurse resources smoke\resources
+          '{"open_api_key":"sk-fake","elevenlabs_api_key":"el-fake"}' | Set-Content smoke\config.json
+          ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc=size=640x360:duration=5 -c:v libx264 "smoke\movies\Amélie's Test (2001).mp4"
+          Push-Location smoke
+          .\movie_summary_cli.exe 2>&1 | Tee-Object -FilePath ..\smoke.log
+          $rc = $LASTEXITCODE
+          Pop-Location
+          Write-Host "exit code: $rc"
+          if ($rc -ne 0) { throw "CLI returned $rc" }
+          if (-not (Select-String -Path smoke.log -Pattern "Processing: Amélie's Test \(2001\)" -Quiet)) { throw "unicode movie was not picked up" }
+          if (-not (Select-String -Path smoke.log -Pattern "All done" -Quiet)) { throw "run did not finish" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $pkg = "AI-Movie-Shorts-Windows"
+          New-Item -ItemType Directory -Force $pkg | Out-Null
+          Copy-Item build\Release\movie_summary_bot.exe, build\Release\movie_summary_cli.exe $pkg\
+          Copy-Item -Recurse resources, backgroundmusic $pkg\
+          Copy-Item config.json, README.md, run.bat, setup.ps1 $pkg\
+          Compress-Archive -Path $pkg\* -DestinationPath "$pkg.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AI-Movie-Shorts-Windows
+          path: AI-Movie-Shorts-Windows.zip
