@@ -139,17 +139,30 @@ jobs:
           $env:MOVIECAP_TOOLS = "Z:\definitely-not-here\tools"
           if (Test-Path "tools\ffmpeg\bin") { Remove-Item -Recurse -Force "tools\ffmpeg" }
 
+          # First run: Z: does not exist, so the installer must fall back to <app>\tools.
           & cmd /c "run.bat setup" *> runbat2.log
-          $rc = $LASTEXITCODE
-          Get-Content runbat2.log | ForEach-Object { Write-Host "::notice title=runbat2.log:: $_" }
-          Write-Host "run.bat setup exit code: $rc"
-          if ($rc -ne 0) { Write-Host "::error title=run.bat::the no-F: fallback exited with code $rc" }
+          $rc1 = $LASTEXITCODE
+          Write-Host "::notice title=install-run::exit=$rc1 ffmpeg=$(Test-Path 'tools\ffmpeg\bin\ffmpeg.exe') ffprobe=$(Test-Path 'tools\ffmpeg\bin\ffprobe.exe')"
+          if ($rc1 -ne 0) { Write-Host "::error title=run.bat::the no-F: fallback exited with code $rc1" }
           if (-not (Test-Path "tools\ffmpeg\bin\ffmpeg.exe")) {
             Write-Host "::error title=run.bat::nothing was installed into the app folder"
           }
-          $hit = Select-String -Path runbat2.log -Pattern "Using the portable FFmpeg" -Quiet
-          if (-not $hit) { Write-Host "::error title=run.bat::run.bat did not find the fallback copy" }
-          if ($rc -ne 0 -or -not $hit -or -not (Test-Path "tools\ffmpeg\bin\ffmpeg.exe")) { exit 1 }
+
+          # Second run: must find that copy on its own and must NOT download again.
+          & cmd /c "run.bat setup" *> runbat3.log
+          $rc2 = $LASTEXITCODE
+          Get-Content runbat3.log | ForEach-Object { Write-Host "::notice title=second-run:: $_" }
+          Write-Host "::notice title=second-run::exit=$rc2"
+
+          $bad = $false
+          if ($rc2 -ne 0) { Write-Host "::error title=run.bat::the second run exited with code $rc2"; $bad = $true }
+          if (-not (Select-String -Path runbat3.log -Pattern "Using the portable FFmpeg" -Quiet)) {
+            Write-Host "::error title=run.bat::the second run did not report the fallback copy"; $bad = $true
+          }
+          if (Select-String -Path runbat3.log -Pattern "Downloading" -Quiet) {
+            Write-Host "::error title=run.bat::the second run downloaded FFmpeg again"; $bad = $true
+          }
+          if ($rc1 -ne 0 -or -not (Test-Path "tools\ffmpeg\bin\ffmpeg.exe") -or $bad) { exit 1 }
           Write-Host "no-F: fallback OK"
 
       - name: Smoke test the web control panel
