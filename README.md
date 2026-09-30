@@ -482,6 +482,8 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
   graphics drivers do not provide. Nothing is wrong with your videos: use
   **`run.bat web`** instead. The browser control panel has every control the desktop
   window has and needs no graphics card. Updating your graphics driver also fixes it.
+  `run.bat` now detects this and starts the browser panel for you automatically,
+  opening <http://127.0.0.1:8080> in your default browser.
 - If you see "plan count = 0" / "No plan returned" or missing clips, check:
   - your OpenAI key (the exact error from OpenAI is shown in the log)
   - network connectivity

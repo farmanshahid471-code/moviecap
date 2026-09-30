@@ -77,7 +77,31 @@ if not defined EXEPATH goto :no_exe
 
 "%EXEPATH%" %2 %3 %4 %5
 set "RC=%errorlevel%"
-if not "%RC%"=="0" pause
+
+REM Exit code 2 from the desktop UI means "this machine has no OpenGL context"
+REM (Remote Desktop, a VM without GPU acceleration, or an old graphics driver).
+REM Fall back to the browser control panel: same controls, no graphics card.
+if not "%RC%"=="2" goto :after_exe
+if /i not "%~1"=="" goto :after_exe
+call :find_web
+if not defined WEBPATH goto :after_exe
+echo.
+echo ============================================================
+echo  The desktop window needs OpenGL, which this machine does
+echo  not provide. Starting the browser control panel instead -
+echo  it has the same controls and needs no graphics card.
+echo ============================================================
+echo.
+start "AI Movie Shorts - control panel" "%WEBPATH%"
+ping -n 4 127.0.0.1 >nul
+start "" http://127.0.0.1:8080
+echo The control panel is running in its own window.
+echo If your browser did not open, go to  http://127.0.0.1:8080
+echo Close that window to stop the server.
+exit /b 0
+
+:after_exe
+if not "%RC%"=="0" if not defined CI pause
 exit /b %RC%
 
 :no_exe
@@ -149,6 +173,15 @@ exit /b 0
 
 REM --------------------------------------------------------------------------
 REM  Pick the tools folder. Everything stays on F: whenever that is possible.
+REM  Locate the web control panel exe in whichever build layout is present.
+:find_web
+set "WEBPATH="
+if exist "build\Release\movie_summary_web.exe" set "WEBPATH=build\Release\movie_summary_web.exe"
+if not defined WEBPATH if exist "build\movie_summary_web.exe" set "WEBPATH=build\movie_summary_web.exe"
+if not defined WEBPATH if exist "movie_summary_web.exe" set "WEBPATH=movie_summary_web.exe"
+exit /b 0
+
+REM --------------------------------------------------------------------------
 :resolve_tools
 if not exist "%MOVIECAP_TOOLS%" goto :rt_appdrive
 set "TOOLSDIR=%MOVIECAP_TOOLS%"
