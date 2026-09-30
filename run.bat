@@ -49,7 +49,7 @@ echo  You can also install FFmpeg yourself with:
 echo      winget install Gyan.FFmpeg
 echo  then reopen this folder and run run.bat again.
 echo ============================================================
-pause
+if not defined CI pause
 exit /b 1
 
 :tools_ready
@@ -83,7 +83,7 @@ exit /b %RC%
 :no_exe
 echo [ERROR] %EXE% was not found in this folder.
 echo         If you are building from source, run build.bat first.
-pause
+if not defined CI pause
 exit /b 1
 
 REM --------------------------------------------------------------------------
@@ -108,7 +108,7 @@ if not errorlevel 1 goto :tts_ready
 echo.
 echo [ERROR] Piper could not be installed. Check your internet connection
 echo         and run "run.bat tts" again.
-pause
+if not defined CI pause
 exit /b 1
 
 :tts_ready
@@ -121,7 +121,7 @@ exit /b 0
 :tts_serve
 if exist "%PIPERPY%" goto :tts_go
 echo [ERROR] "%PIPERPY%" is missing - run "run.bat tts install" first.
-pause
+if not defined CI pause
 exit /b 1
 
 :tts_go
@@ -144,7 +144,7 @@ echo.
 "%PIPERPY%" -m piper.http_server --host 127.0.0.1 --port %PIPER_PORT% -m %PIPER_VOICE% --data-dir "%PIPERVOICES%"
 echo.
 echo The Piper server has stopped.
-pause
+if not defined CI pause
 exit /b 0
 
 REM --------------------------------------------------------------------------

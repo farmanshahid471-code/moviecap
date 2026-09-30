@@ -14,6 +14,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Syntax-check the PowerShell installers
+        shell: pwsh
+        run: |
+          # setup.ps1 is never executed in CI (it would install the ~4 GB C++
+          # toolchain), so at least prove it parses.
+          $bad = $false
+          foreach ($f in @("setup.ps1", "install_tools.ps1", "install_piper.ps1")) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$errs)
+            if ($errs -and $errs.Count) {
+              $bad = $true
+              foreach ($e in $errs) {
+                Write-Host "::error title=$f::$($e.Message) (line $($e.Extent.StartLineNumber))"
+              }
+            } else {
+              Write-Host "$f parses OK"
+            }
+          }
+          if ($bad) { exit 1 }
+
       - name: Build (MSVC, via build.bat)
         shell: pwsh
         run: |

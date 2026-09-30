@@ -186,7 +186,7 @@ executable and in up to 5 parent folders, then switches to it.
 - `tools\mock_api_server.py` — offline stand-in for the OpenAI + ElevenLabs APIs
   and for the three free narration contracts (XTTS `/tts_to_audio/`, Piper
   `/synthesize`, OpenAI-compatible `/audio/speech`) — for testing
-- `setup.ps1`, `build.bat`, `run.bat` — Windows helper scripts
+- `setup.ps1`, `build.bat`, `run.bat` — Windows helper scripts (all of them stay open so you can read the result)
 
 The runtime folders are created automatically.
 
@@ -194,14 +194,26 @@ The runtime folders are created automatically.
 
 ## Requirements
 
+**Running the app** (the ready-made zip) needs nothing but FFmpeg, and `run.bat`
+installs that for you — portable, into `F:\AI-Movie-Shorts\tools`, nothing on `C:`.
+
+**Building from source** additionally needs:
+
 | What | Why | Install |
 |---|---|---|
-| **FFmpeg + ffprobe** (on PATH) | cutting / encoding / mixing | `winget install Gyan.FFmpeg` |
-| **CMake ≥ 3.20** | build system | `winget install Kitware.CMake` |
+| **FFmpeg + ffprobe** | cutting / encoding / mixing | `run.bat setup` (portable, on `F:`) |
+| **CMake ≥ 3.20** | build system | `setup.ps1` → `winget install Kitware.CMake` |
 | **Visual Studio 2022/2026** or **Build Tools** with *Desktop development with C++*, **or** MinGW-w64 gcc | C compiler | `setup.ps1` installs Build Tools |
 | Internet access during the first build | downloads the libraries | — |
 
-`setup.ps1` installs all of these for you.
+`setup.ps1` installs the build tools for you and stays open at the end so you can
+read the result. It uses the portable FFmpeg installer rather than
+`winget install Gyan.FFmpeg`, so `C:` is left alone.
+
+> Every helper script (`run.bat`, `build.bat`, `setup.ps1`) now ends with a pause,
+> so double-clicking one shows you the outcome instead of flashing shut. If a
+> window still closes instantly, open a terminal in the folder and run it from
+> there — the full output stays on screen.
 
 **You do NOT need** vcpkg, OpenSSL, Git, `curl.exe`, `unzip` or `pkg-config`. The build downloads and compiles
 everything into one static `.exe`:
