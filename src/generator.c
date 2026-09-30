@@ -2400,13 +2400,19 @@ int run_generation(void) {
   plat_getcwd(cwd, sizeof(cwd));
   logi("Working directory: %s", cwd);
 
-  /* FFmpeg must be installed and on PATH (winget install Gyan.FFmpeg). */
+  /* FFmpeg is installed on demand by run.bat into a portable tools folder. */
   if (!plat_have_tool("ffmpeg") || !plat_have_tool("ffprobe")) {
 #if defined(_WIN32)
-    die("ffmpeg/ffprobe not found in PATH. Install with:  winget install Gyan.FFmpeg  "
-        "(then restart this app / open a new terminal)");
+    die("ffmpeg/ffprobe not found.\n"
+        "  Start the app with run.bat (or run.bat web) - it downloads a portable\n"
+        "  FFmpeg into the tools folder for you, with no admin rights and nothing\n"
+        "  written to C:.\n"
+        "  If you launched the .exe directly, close it and use run.bat instead.\n"
+        "  Manual alternative: winget install Gyan.FFmpeg, then reopen this app.");
 #else
-    die("ffmpeg/ffprobe not found in PATH. Install FFmpeg and try again.");
+    die("ffmpeg/ffprobe not found in PATH. Install FFmpeg and try again.\n"
+        "  A bundled copy in ./tools/ffmpeg/bin or ./ffmpeg/bin is picked up\n"
+        "  automatically, or set MOVIECAP_TOOLS to the folder that contains it.");
 #endif
   }
   logok("ffmpeg + ffprobe found.");
