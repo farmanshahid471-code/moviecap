@@ -14,12 +14,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache fetched dependencies
-        uses: actions/cache@v4
-        with:
-          path: build/_deps/*-subbuild
-          key: deps-${{ hashFiles('CMakeLists.txt') }}
-
       - name: Build (MSVC, via build.bat)
         shell: cmd
         run: build.bat
