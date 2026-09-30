@@ -130,7 +130,7 @@ jobs:
           if ($rc -ne 0 -or -not $hit) { exit 1 }
           Write-Host "run.bat OK"
 
-      - name: Test run.bat with no F: drive (falls back to the app folder)
+      - name: "Test run.bat with no F drive (tools fall back to the app folder)"
         shell: pwsh
         run: |
           # The runner has no F:, which is exactly the fallback case: the tools
