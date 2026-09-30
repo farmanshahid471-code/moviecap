@@ -92,7 +92,7 @@ jobs:
         shell: pwsh
         run: |
           # Really downloads and unpacks FFmpeg, exactly like run.bat does for a user.
-          $dest = Join-Path $env:RUNNER_TEMP "moviecap-tools"
+          $dest = Join-Path (Get-Location) "ci-tools"
           powershell -NoProfile -ExecutionPolicy Bypass -File .\install_tools.ps1 -ToolsDir $dest
           if ($LASTEXITCODE -ne 0) { throw "install_tools.ps1 returned $LASTEXITCODE" }
 
@@ -114,20 +114,23 @@ jobs:
         run: |
           REM Proves run.bat and install_tools.ps1 agree on the folder layout:
           REM with no ffmpeg on PATH, run.bat must locate the portable copy.
-          set "PATH=C:\Windows\System32;C:\Windows"
-          set "MOVIECAP_TOOLS=%RUNNER_TEMP%\moviecap-tools"
+          set "PATH=C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0"
+          set "MOVIECAP_TOOLS=%CD%\ci-tools"
+          echo workspace = %CD%
+          echo tools dir = %MOVIECAP_TOOLS%
+          if not exist "%MOVIECAP_TOOLS%\ffmpeg\bin\ffmpeg.exe" echo ::error title=run.bat::the installer did not leave ffmpeg.exe in %MOVIECAP_TOOLS%\ffmpeg\bin
+          dir "%MOVIECAP_TOOLS%\ffmpeg\bin"
+
           call run.bat setup > runbat.log 2>&1
-          if errorlevel 1 (
-            type runbat.log
-            exit /b 1
-          )
-          findstr /C:"Using the portable FFmpeg" runbat.log >nul
-          if errorlevel 1 (
-            echo run.bat did not report the portable FFmpeg:
-            type runbat.log
-            exit /b 1
-          )
+          set RC=%errorlevel%
           type runbat.log
+          if not "%RC%"=="0" echo ::error title=run.bat::run.bat setup exited with code %RC%
+
+          findstr /C:"Using the portable FFmpeg" runbat.log >nul
+          if errorlevel 1 echo ::error title=run.bat::run.bat did not report the portable FFmpeg
+
+          if not "%RC%"=="0" exit /b 1
+          findstr /C:"Using the portable FFmpeg" runbat.log >nul || exit /b 1
           echo run.bat OK
 
       - name: Smoke test the web control panel
