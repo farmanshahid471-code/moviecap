@@ -617,13 +617,18 @@ static cJSON *config_read_json(void) {
   const cJSON *k1 = cJSON_GetObjectItemCaseSensitive(root, "open_api_key");
   const cJSON *k2 = cJSON_GetObjectItemCaseSensitive(root, "elevenlabs_api_key");
 
-  char m1[128], m2[128];
+  const cJSON *k3 = cJSON_GetObjectItemCaseSensitive(root, "tts_api_key");
+
+  char m1[128], m2[128], m3[128];
   mask_key(cJSON_IsString(k1) ? k1->valuestring : "", m1, sizeof(m1));
   mask_key(cJSON_IsString(k2) ? k2->valuestring : "", m2, sizeof(m2));
+  mask_key(cJSON_IsString(k3) ? k3->valuestring : "", m3, sizeof(m3));
 
   const cJSON *s;
   json_str(o, "open_api_key_masked", m1);
   json_str(o, "elevenlabs_api_key_masked", m2);
+  json_str(o, "tts_api_key_masked", m3);
+  cJSON_AddBoolToObject(o, "tts_key_set", cJSON_IsString(k3) && k3->valuestring[0]);
   cJSON_AddBoolToObject(o, "openai_key_set",
                         cJSON_IsString(k1) && k1->valuestring[0] && strcmp(k1->valuestring, "OpenAIAPI") != 0);
   cJSON_AddBoolToObject(o, "elevenlabs_key_set",
@@ -647,6 +652,12 @@ static cJSON *config_read_json(void) {
   ADD_STR("openai_model",    "openai_model",    "gpt-5.2");
   ADD_STR("openai_base_url", "openai_base_url", "https://api.openai.com/v1");
   ADD_STR("elevenlabs_base_url", "elevenlabs_base_url", "https://api.elevenlabs.io/v1");
+
+  ADD_STR("tts_provider", "tts_provider", "elevenlabs");
+  ADD_STR("tts_base_url", "tts_base_url", "");
+  ADD_STR("tts_voice",    "tts_voice",    "");
+  ADD_STR("tts_language", "tts_language", "en");
+  ADD_STR("tts_model",    "tts_model",    "tts-1");
 
   ADD_NUM("min_clips",         "min_clips",         20);
   ADD_NUM("max_clips",         "max_clips",         30);
@@ -679,7 +690,8 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
 
   const char *str_keys[] = {
     "eleven_voice_id", "eleven_model_id", "openai_model",
-    "openai_base_url", "elevenlabs_base_url", NULL
+    "openai_base_url", "elevenlabs_base_url",
+    "tts_provider", "tts_base_url", "tts_voice", "tts_language", "tts_model", NULL
   };
   for (int i = 0; str_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, str_keys[i]);
@@ -693,6 +705,7 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
   const char *key_pairs[][2] = {
     { "open_api_key",       "open_api_key"       },
     { "elevenlabs_api_key", "elevenlabs_api_key" },
+    { "tts_api_key",        "tts_api_key"        },
     { NULL, NULL }
   };
   for (int i = 0; key_pairs[i][0]; i++) {
@@ -896,8 +909,16 @@ static const char *PAGE_HTML[] = {
   "      <h2>Settings <span class='hint'>written to config.json</span></h2>",
   "      <label class='f'>OpenAI API key <span id='k1state' class='hint'></span></label>",
   "      <input type='password' id='open_api_key' placeholder='sk-...  (leave empty to keep current)'>",
+  "      <label class='f'>Narration engine</label>",
+  "      <select id='tts_provider'>",
+  "        <option value='elevenlabs'>ElevenLabs - cloud, needs an API key</option>",
+  "        <option value='xtts'>XTTS v2 - free, local, clones a voice sample</option>",
+  "        <option value='piper'>Piper - free, offline, very fast</option>",
+  "        <option value='openai_tts'>OpenAI-compatible /audio/speech (OpenAI, Kokoro, ...)</option>",
+  "      </select>",
+  "      <div id='ttsHint' class='hint'></div>",
   "      <label class='f'>ElevenLabs API key <span id='k2state' class='hint'></span></label>",
-  "      <input type='password' id='elevenlabs_api_key' placeholder='leave empty to keep current'>",
+  "      <input type='password' id='elevenlabs_api_key' placeholder='only needed when the engine is ElevenLabs'>",
   "      <div class='grid2'>",
   "        <div><label class='f'>OpenAI model</label><input type='text' id='openai_model'></div>",
   "        <div><label class='f'>Voice id</label><input type='text' id='eleven_voice_id'></div>",
@@ -910,6 +931,15 @@ static const char *PAGE_HTML[] = {
   "      </div>",
   "      <label class='f'>OpenAI base URL</label><input type='text' id='openai_base_url'>",
   "      <label class='f'>ElevenLabs base URL</label><input type='text' id='elevenlabs_base_url'>",
+  "      <label class='f'>TTS server URL <span class='hint'>xtts / piper / openai-compatible</span></label>",
+  "      <input type='text' id='tts_base_url' placeholder='http://127.0.0.1:8020'>",
+  "      <div class='grid2'>",
+  "        <div><label class='f'>TTS voice / speaker</label><input type='text' id='tts_voice'></div>",
+  "        <div><label class='f'>TTS language</label><input type='text' id='tts_language'></div>",
+  "      </div>",
+  "      <label class='f'>TTS model</label><input type='text' id='tts_model'>",
+  "      <label class='f'>TTS API key <span id='k3state' class='hint'></span></label>",
+  "      <input type='password' id='tts_api_key' placeholder='optional - leave empty to keep current'>",
   "      <label class='chk'><input type='checkbox' id='bgm_enabled'> Background music</label>",
   "      <label class='chk'><input type='checkbox' id='make_vertical'> Also render vertical 9:16</label>",
   "      <label class='chk'><input type='checkbox' id='retire_movies'> Move processed movies to movies_retired</label>",
@@ -1034,7 +1064,8 @@ static const char *PAGE_HTML[] = {
   "function fillConfig(c){",
   "  if (cfgLoaded) return;",
   "  cfgLoaded = true;",
-  "  var texts = ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url'];",
+  "  var texts = ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
+  "               'tts_base_url','tts_voice','tts_language','tts_model'];",
   "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume'];",
   "  var bools = ['bgm_enabled','make_vertical','retire_movies'];",
   "  texts.forEach(function(k){ el(k).value = c[k] || ''; });",
@@ -1044,7 +1075,28 @@ static const char *PAGE_HTML[] = {
   "  el('k2state').textContent = c.elevenlabs_key_set ? '(' + c.elevenlabs_api_key_masked + ')' : '(not set)';",
   "  el('k1state').style.color = c.openai_key_set ? '' : '#ff8d86';",
   "  el('k2state').style.color = c.elevenlabs_key_set ? '' : '#ff8d86';",
+  "  el('k3state').textContent = c.tts_key_set ? '(' + c.tts_api_key_masked + ')' : '(not set)';",
+  "  var prov = c.tts_provider || 'elevenlabs';",
+  "  var sel = el('tts_provider');",
+  "  for (var i = 0; i < sel.options.length; i++){ if (sel.options[i].value === prov) sel.selectedIndex = i; }",
+  "  syncTtsUi();",
   "}",
+  "",
+  "var TTS_HELP = {",
+  "  elevenlabs: 'Needs an ElevenLabs API key. Voice id and TTS model above are used.',",
+  "  xtts: 'Free. Run: pip install xtts-api-server && python -m xtts_api_server  (port 8020). Voice = a .wav in the servers speakers folder. Language: en, hi, ur, es, ...',",
+  "  piper: 'Free and offline. Run: pip install piper-tts flask && python -m piper.http_server --port 5000 -m en_US-lessac-medium.onnx  Voice is optional.',",
+  "  openai_tts: 'Any OpenAI-compatible endpoint: api.openai.com/v1, Kokoro-FastAPI, LM Studio, ... Uses TTS model + voice + TTS API key.'",
+  "};",
+  "var TTS_PH = {",
+  "  elevenlabs: '', xtts: 'http://127.0.0.1:8020', piper: 'http://127.0.0.1:5000', openai_tts: 'https://api.openai.com/v1'",
+  "};",
+  "function syncTtsUi(){",
+  "  var p = el('tts_provider').value;",
+  "  el('ttsHint').textContent = TTS_HELP[p] || '';",
+  "  el('tts_base_url').placeholder = TTS_PH[p] || '';",
+  "}",
+  "el('tts_provider').onchange = syncTtsUi;",
   "",
   "/* ---------------- files ---------------- */",
   "function setTab(d){",
@@ -1125,11 +1177,14 @@ static const char *PAGE_HTML[] = {
   "};",
   "el('btnSave').onclick = function(){",
   "  var body = {};",
-  "  ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url'].forEach(function(k){ body[k] = el(k).value; });",
+  "  ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
+  "   'tts_base_url','tts_voice','tts_language','tts_model'].forEach(function(k){ body[k] = el(k).value; });",
+  "  body.tts_provider = el('tts_provider').value;",
   "  ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume'].forEach(function(k){ body[k] = Number(el(k).value); });",
   "  ['bgm_enabled','make_vertical','retire_movies'].forEach(function(k){ body[k] = el(k).checked; });",
   "  if (el('open_api_key').value) body.open_api_key = el('open_api_key').value;",
   "  if (el('elevenlabs_api_key').value) body.elevenlabs_api_key = el('elevenlabs_api_key').value;",
+  "  if (el('tts_api_key').value) body.tts_api_key = el('tts_api_key').value;",
   "  el('saveMsg').textContent = 'saving...';",
   "  api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(function(c){",
   "    if (!c) { el('saveMsg').textContent = 'failed'; return; }",
@@ -1138,6 +1193,7 @@ static const char *PAGE_HTML[] = {
   "    fillConfig(c);",
   "    el('open_api_key').value = '';",
   "    el('elevenlabs_api_key').value = '';",
+  "    el('tts_api_key').value = '';",
   "    el('saveMsg').textContent = 'saved';",
   "    setTimeout(function(){ el('saveMsg').textContent = ''; }, 2500);",
   "  });",

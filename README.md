@@ -42,7 +42,8 @@ Given a movie file, AI-Movie-Shorts will:
 1. **Fetch subtitles (SRT)** automatically (and convert timestamps to seconds)
 2. **Optionally fetch a script** (used only as extra story context)
 3. Ask **OpenAI** to generate a **clip plan** (timestamps + narration per clip)
-4. Use **ElevenLabs** to generate voiceover audio for each clip
+4. Generate voiceover audio for each clip (ElevenLabs by default, or a free
+   local engine — XTTS / Piper / any OpenAI-compatible server)
 5. Use **FFmpeg** to:
    - cut each clip
    - time-stretch video to match narration length (speed-up capped at 1.75×)
@@ -146,7 +147,9 @@ executable and in up to 5 parent folders, then switches to it.
   - `ui.png` — UI screenshot (for README)
   - `app.ico`, `app.rc` — Windows icon + version info embedded into the `.exe`
 - `src\` — C source (see *Source layout* below)
-- `tools\mock_api_server.py` — offline stand-in for the OpenAI + ElevenLabs APIs (testing)
+- `tools\mock_api_server.py` — offline stand-in for the OpenAI + ElevenLabs APIs
+  and for the three free narration contracts (XTTS `/tts_to_audio/`, Piper
+  `/synthesize`, OpenAI-compatible `/audio/speech`) — for testing
 - `setup.ps1`, `build.bat`, `run.bat` — Windows helper scripts
 
 The runtime folders are created automatically.
@@ -183,12 +186,21 @@ Edit `config.json` in the project root (or use the **Settings** card in the web 
 ```json
 {
   "open_api_key": "YOUR_OPENAI_KEY",
+  "openai_model": "gpt-5.2",
+  "openai_base_url": "https://api.openai.com/v1",
+
+  "tts_provider": "elevenlabs",
   "elevenlabs_api_key": "YOUR_ELEVENLABS_KEY",
   "eleven_voice_id": "JBFqnCBsd6RMkjVDRZzb",
   "eleven_model_id": "eleven_multilingual_v2",
-  "openai_model": "gpt-5.2",
-  "openai_base_url": "https://api.openai.com/v1",
   "elevenlabs_base_url": "https://api.elevenlabs.io/v1",
+
+  "tts_base_url": "",
+  "tts_voice": "",
+  "tts_language": "en",
+  "tts_model": "tts-1",
+  "tts_api_key": "",
+
   "min_clips": 20,
   "max_clips": 30,
   "max_video_speedup": 1.75,
@@ -203,12 +215,18 @@ Edit `config.json` in the project root (or use the **Settings** card in the web 
 | Key | Default | Meaning |
 |---|---|---|
 | `open_api_key` | — (required) | OpenAI key. The run stops with a clear message while the placeholder is there |
-| `elevenlabs_api_key` | — (required) | ElevenLabs key |
-| `eleven_voice_id` | `JBFqnCBsd6RMkjVDRZzb` | ElevenLabs voice |
-| `eleven_model_id` | `eleven_multilingual_v2` | ElevenLabs TTS model |
 | `openai_model` | `gpt-5.2` | model used for the clip plan |
 | `openai_base_url` | `https://api.openai.com/v1` | swap for a proxy/gateway/mock that speaks the Responses API |
+| `tts_provider` | `elevenlabs` | narration engine: `elevenlabs`, `xtts`, `piper` or `openai_tts` (see *Free narration*) |
+| `elevenlabs_api_key` | — (required only when `tts_provider` is `elevenlabs`) | ElevenLabs key |
+| `eleven_voice_id` | `JBFqnCBsd6RMkjVDRZzb` | ElevenLabs voice |
+| `eleven_model_id` | `eleven_multilingual_v2` | ElevenLabs TTS model |
 | `elevenlabs_base_url` | `https://api.elevenlabs.io/v1` | swap for a proxy/mock that speaks `/text-to-speech/<voice>` |
+| `tts_base_url` | per engine | server URL for `xtts` / `piper` / `openai_tts` (defaults to `http://127.0.0.1:8020`, `http://127.0.0.1:5000`, `https://api.openai.com/v1`) |
+| `tts_voice` | — | `xtts`: speaker file name · `piper`: voice id (optional) · `openai_tts`: voice name |
+| `tts_language` | `en` | `xtts` only (`en`, `hi`, `ur`, `es`, `fr`, ...) |
+| `tts_model` | `tts-1` | `openai_tts` only |
+| `tts_api_key` | empty | optional bearer token for `openai_tts`; falls back to `open_api_key` |
 | `min_clips` / `max_clips` | `20` / `30` | a random clip count in this range is requested per run (1-200) |
 | `max_video_speedup` | `1.75` | cap for the video speed-up when the narration is short |
 | `narration_volume` | `2.5` | narration gain when mixing |
@@ -216,6 +234,38 @@ Edit `config.json` in the project root (or use the **Settings** card in the web 
 | `bgm_enabled` | `true` | set `false` for narration-only output |
 | `make_vertical` | `true` | set `false` to skip the 9:16 render |
 | `retire_movies` | `true` | set `false` to leave processed files in `movies\` |
+
+### Free narration (no ElevenLabs key)
+
+`tts_provider` swaps the narration engine without touching anything else in the
+pipeline. Whatever audio comes back is converted to MP3 with FFmpeg when needed,
+so clipping, concatenation and mixing behave exactly the same.
+
+| `tts_provider` | Cost | What you run | Request |
+|---|---|---|---|
+| `elevenlabs` | paid (default) | nothing, it is the ElevenLabs cloud API | `POST {elevenlabs_base_url}/text-to-speech/{voice}` |
+| `xtts` | **free** | `pip install xtts-api-server` then `python -m xtts_api_server` (port 8020) | `POST {tts_base_url}/tts_to_audio/` → WAV |
+| `piper` | **free** | `pip install piper-tts flask` then `python -m piper.http_server --port 5000 -m en_US-lessac-medium.onnx` | `POST {tts_base_url}/synthesize` → WAV |
+| `openai_tts` | paid or free | OpenAI, or a local OpenAI-compatible server such as Kokoro-FastAPI | `POST {tts_base_url}/audio/speech` → MP3 |
+
+Example — free XTTS narration with your own voice sample (drop a `.wav` in the
+server's `speakers` folder and use its file name):
+
+```json
+{
+  "tts_provider": "xtts",
+  "tts_base_url": "http://127.0.0.1:8020",
+  "tts_voice": "my_voice.wav",
+  "tts_language": "en"
+}
+```
+
+- With any provider other than `elevenlabs` the ElevenLabs key is **not**
+  required, so a missing or placeholder `elevenlabs_api_key` no longer stops the run.
+- If the local server is not reachable the clip is skipped with a
+  `[WARN] XTTS TTS HTTP -1: no response` line instead of aborting the queue.
+- The **Settings** card in the web panel has a *Narration engine* dropdown with
+  the exact command to run for each engine.
 
 Notes:
 - Every optional key falls back to the default above when missing, so an old
@@ -386,16 +436,22 @@ You can run the **entire** pipeline — plan, narration, clipping, concat, backg
 music, vertical render — without spending a cent, using the bundled mock API server:
 
 ```bash
-# 1. start the fake OpenAI + ElevenLabs endpoints
-python tools/mock_api_server.py --openai-port 9100 --eleven-port 9101
+# 1. start the fake OpenAI + ElevenLabs endpoints, and the free-TTS ones
+python tools/mock_api_server.py --openai-port 9100 --eleven-port 9101 --tts-port 8020
 ```
 
 Then point `config.json` (or the Settings card) at them and start a run as usual:
 
 ```json
 "openai_base_url":     "http://127.0.0.1:9100/v1",
-"elevenlabs_base_url": "http://127.0.0.1:9101/v1"
+"elevenlabs_base_url": "http://127.0.0.1:9101/v1",
+"tts_base_url":        "http://127.0.0.1:8020",
+"tts_voice":           "demo_speaker.wav"
 ```
+
+Port 8020 answers all three free-narration contracts at once, so setting
+`"tts_provider"` to `xtts`, `piper` or `openai_tts` works against the same mock.
+XTTS and Piper return WAV, which also exercises the MP3 conversion path.
 
 The mock derives its clip timestamps from the subtitle text it is handed and returns
 real MP3 tones of varying length, so the speed cap, the BGM builder and the FFmpeg

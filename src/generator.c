@@ -303,9 +303,11 @@ static MemBuf http_post_json_to_mem(const char *url, const char *bearer_key, con
   struct curl_slist *headers = NULL;
   headers = curl_slist_append(headers, "Content-Type: application/json");
 
-  char auth[1024];
-  snprintf(auth, sizeof(auth), "Authorization: Bearer %s", bearer_key);
-  headers = curl_slist_append(headers, auth);
+  if (bearer_key && bearer_key[0]) {
+    char auth[1024];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", bearer_key);
+    headers = curl_slist_append(headers, auth);
+  }
 
   curl_easy_setopt(curl, CURLOPT_URL, url);
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
@@ -431,6 +433,13 @@ static double ffprobe_duration_seconds(const char *path) {
   return d;
 }
 
+typedef enum {
+  TTS_ELEVENLABS = 0,  /* api.elevenlabs.io (needs a key)                     */
+  TTS_XTTS,            /* Coqui XTTS v2 server, POST /tts_to_audio/ (free)    */
+  TTS_PIPER,           /* piper http_server, POST /synthesize (free, local)   */
+  TTS_OPENAI           /* OpenAI-compatible POST /audio/speech (e.g. Kokoro)  */
+} TtsProvider;
+
 typedef struct {
   /* required */
   char openai_key[512];
@@ -444,6 +453,15 @@ typedef struct {
   /* optional API base URLs (proxies, Azure-style gateways, local mocks) */
   char openai_base_url[256]; /* default https://api.openai.com/v1     */
   char eleven_base_url[256]; /* default https://api.elevenlabs.io/v1  */
+
+  /* narration engine: "elevenlabs" (default), "xtts", "piper" or "openai_tts" */
+  int  tts_provider;          /* TtsProvider */
+  char tts_provider_name[32];
+  char tts_base_url[256];     /* local server for xtts / piper / openai_tts */
+  char tts_voice[256];        /* xtts: speaker_wav, piper: voice, openai_tts: voice */
+  char tts_language[16];      /* xtts only, default "en" */
+  char tts_model[64];         /* openai_tts only, default "tts-1" */
+  char tts_api_key[512];      /* optional bearer for openai_tts */
 
   /* optional pipeline tuning */
   int    min_clips;          /* default 20   */
@@ -517,6 +535,41 @@ static Config load_config_json(const char *path) {
   cfg_set_str(c.eleven_base_url, sizeof(c.eleven_base_url),
               cJSON_GetObjectItemCaseSensitive(root, "elevenlabs_base_url"));
 
+  /* ---- narration engine ---- */
+  cfg_set_str(c.tts_provider_name, sizeof(c.tts_provider_name),
+              cJSON_GetObjectItemCaseSensitive(root, "tts_provider"));
+  cfg_set_str(c.tts_base_url, sizeof(c.tts_base_url),
+              cJSON_GetObjectItemCaseSensitive(root, "tts_base_url"));
+  cfg_set_str(c.tts_voice, sizeof(c.tts_voice),
+              cJSON_GetObjectItemCaseSensitive(root, "tts_voice"));
+  cfg_set_str(c.tts_language, sizeof(c.tts_language),
+              cJSON_GetObjectItemCaseSensitive(root, "tts_language"));
+  cfg_set_str(c.tts_model, sizeof(c.tts_model),
+              cJSON_GetObjectItemCaseSensitive(root, "tts_model"));
+  cfg_set_str(c.tts_api_key, sizeof(c.tts_api_key),
+              cJSON_GetObjectItemCaseSensitive(root, "tts_api_key"));
+
+  if (c.tts_provider_name[0] == 0) snprintf(c.tts_provider_name, sizeof(c.tts_provider_name), "elevenlabs");
+  if (str_icmp(c.tts_provider_name, "elevenlabs") == 0)      c.tts_provider = TTS_ELEVENLABS;
+  else if (str_icmp(c.tts_provider_name, "xtts") == 0)       c.tts_provider = TTS_XTTS;
+  else if (str_icmp(c.tts_provider_name, "coqui") == 0)      c.tts_provider = TTS_XTTS;
+  else if (str_icmp(c.tts_provider_name, "piper") == 0)      c.tts_provider = TTS_PIPER;
+  else if (str_icmp(c.tts_provider_name, "openai_tts") == 0) c.tts_provider = TTS_OPENAI;
+  else if (str_icmp(c.tts_provider_name, "openai") == 0)     c.tts_provider = TTS_OPENAI;
+  else die("config.json: unknown tts_provider \"%s\" (use elevenlabs, xtts, piper or openai_tts)",
+           c.tts_provider_name);
+
+  if (c.tts_base_url[0] == 0) {
+    const char *dflt = (c.tts_provider == TTS_XTTS)  ? "http://127.0.0.1:8020" :
+                       (c.tts_provider == TTS_PIPER) ? "http://127.0.0.1:5000" :
+                       (c.tts_provider == TTS_OPENAI) ? "https://api.openai.com/v1" : "";
+    snprintf(c.tts_base_url, sizeof(c.tts_base_url), "%s", dflt);
+  }
+  if (c.tts_language[0] == 0) snprintf(c.tts_language, sizeof(c.tts_language), "en");
+  if (c.tts_model[0] == 0)    snprintf(c.tts_model, sizeof(c.tts_model), "tts-1");
+  if (c.tts_provider == TTS_XTTS && c.tts_voice[0] == 0)
+    die("config.json: tts_voice must name an XTTS speaker (a .wav in the server's speakers folder)");
+
   c.min_clips         = cfg_get_int(cJSON_GetObjectItemCaseSensitive(root, "min_clips"), MIN_NUM_CLIPS, 1, 200);
   c.max_clips         = cfg_get_int(cJSON_GetObjectItemCaseSensitive(root, "max_clips"), MAX_NUM_CLIPS, 1, 200);
   c.max_video_speedup = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "max_video_speedup"), MAX_VIDEO_SPEEDUP, 1.0, 8.0);
@@ -531,10 +584,15 @@ static Config load_config_json(const char *path) {
   if (c.openai_key[0] == 0) die("config.json: open_api_key missing");
   if (strcmp(c.openai_key, "OpenAIAPI") == 0)
     die("config.json: replace the placeholder \"OpenAIAPI\" with your real OpenAI API key");
-  if (strcmp(c.eleven_key, "ElevenLabsAPI") == 0)
-    die("config.json: replace the placeholder \"ElevenLabsAPI\" with your real ElevenLabs API key");
   if (c.openai_model[0] == 0) strncpy(c.openai_model, "gpt-5.2", sizeof(c.openai_model) - 1);
-  if (c.eleven_key[0] == 0) die("config.json: elevenlabs_api_key missing");
+
+  /* The ElevenLabs key is only needed when ElevenLabs is the narration engine. */
+  if (c.tts_provider == TTS_ELEVENLABS) {
+    if (strcmp(c.eleven_key, "ElevenLabsAPI") == 0)
+      die("config.json: replace the placeholder \"ElevenLabsAPI\" with your real ElevenLabs API key "
+          "(or set \"tts_provider\": \"xtts\" / \"piper\" to narrate for free)");
+    if (c.eleven_key[0] == 0) die("config.json: elevenlabs_api_key missing");
+  }
   if (c.eleven_voice_id[0] == 0) strncpy(c.eleven_voice_id, "JBFqnCBsd6RMkjVDRZzb", sizeof(c.eleven_voice_id) - 1);
   if (c.eleven_model_id[0] == 0) strncpy(c.eleven_model_id, "eleven_multilingual_v2", sizeof(c.eleven_model_id) - 1);
   if (c.openai_base_url[0] == 0) strncpy(c.openai_base_url, "https://api.openai.com/v1", sizeof(c.openai_base_url) - 1);
@@ -1562,6 +1620,125 @@ static bool elevenlabs_tts_to_mp3(const Config *cfg, const char *text, const cha
   return file_exists(out_mp3_path);
 }
 
+/* ============================================ free / local narration engines */
+
+/* MP3 frame sync (0xFFEx) or an ID3 tag; WAV/OGG/FLAC payloads need ffmpeg. */
+static bool looks_like_mp3(const unsigned char *d, size_t n) {
+  if (n >= 3 && d[0] == 'I' && d[1] == 'D' && d[2] == '3') return true;
+  if (n >= 2 && d[0] == 0xFF && (d[1] & 0xE0) == 0xE0) return true;
+  return false;
+}
+
+/*
+ * Everything downstream (the concat demuxer, the duration probe, the mixer)
+ * expects MP3. ElevenLabs and OpenAI already return MP3; XTTS and Piper return
+ * WAV, so convert those with ffmpeg. This keeps the rest of the pipeline
+ * completely unaware of which engine spoke.
+ */
+static bool save_audio_as_mp3(const void *data, size_t len, const char *out_mp3_path) {
+  if (!data || len < 64) return false;
+  if (looks_like_mp3((const unsigned char *)data, len))
+    return write_entire_file(out_mp3_path, data, len);
+
+  char tmp[PATH_MAX];
+  snprintf(tmp, sizeof(tmp), "%s.in", out_mp3_path);
+  if (!write_entire_file(tmp, data, len)) return false;
+
+  char *in_esc  = sh_escape(tmp);
+  char *out_esc = sh_escape(out_mp3_path);
+  int rc = run_cmd("ffmpeg -y -hide_banner -loglevel error -i %s -vn -c:a libmp3lame -b:a 192k %s",
+                   in_esc, out_esc);
+  free(in_esc);
+  free(out_esc);
+  plat_unlink(tmp);
+
+  if (rc != 0) { logw("ffmpeg could not convert the narration audio to MP3"); return false; }
+  return file_exists(out_mp3_path);
+}
+
+/* POST a JSON synthesis request, then store whatever audio comes back as MP3. */
+static bool tts_post_audio(const char *url, const char *json_body, const char *bearer,
+                           const char *out_mp3_path, const char *what) {
+  long code = 0;
+  MemBuf r = http_post_json_to_mem(url, bearer, json_body, &code, 300);
+
+  if (code < 200 || code >= 300) {
+    logw("%s HTTP %ld: %.600s", what, code, (r.data && r.data[0]) ? r.data : "no response");
+    free(r.data);
+    return false;
+  }
+  if (!r.data || r.size < 64) {
+    logw("%s returned no audio", what);
+    free(r.data);
+    return false;
+  }
+  bool ok = save_audio_as_mp3(r.data, r.size, out_mp3_path);
+  free(r.data);
+  return ok;
+}
+
+/* Coqui XTTS v2 (daswer123/xtts-api-server): POST /tts_to_audio/ -> audio/wav */
+static bool tts_xtts(const Config *cfg, const char *text, const char *out_mp3_path) {
+  char url[1024];
+  snprintf(url, sizeof(url), "%s/tts_to_audio/", cfg->tts_base_url);
+
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "text", text);
+  cJSON_AddStringToObject(root, "speaker_wav", cfg->tts_voice);
+  cJSON_AddStringToObject(root, "language", cfg->tts_language);
+  char *body = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+
+  bool ok = tts_post_audio(url, body, NULL, out_mp3_path, "XTTS TTS");
+  free(body);
+  return ok;
+}
+
+/* Piper (python -m piper.http_server): POST /synthesize -> audio/wav */
+static bool tts_piper(const Config *cfg, const char *text, const char *out_mp3_path) {
+  char url[1024];
+  snprintf(url, sizeof(url), "%s/synthesize", cfg->tts_base_url);
+
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "text", text);
+  if (cfg->tts_voice[0]) cJSON_AddStringToObject(root, "voice", cfg->tts_voice);
+  char *body = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+
+  bool ok = tts_post_audio(url, body, NULL, out_mp3_path, "Piper TTS");
+  free(body);
+  return ok;
+}
+
+/* Any OpenAI-compatible /v1/audio/speech endpoint: OpenAI, Kokoro-FastAPI, ... */
+static bool tts_openai_compat(const Config *cfg, const char *text, const char *out_mp3_path) {
+  char url[1024];
+  snprintf(url, sizeof(url), "%s/audio/speech", cfg->tts_base_url);
+
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "model", cfg->tts_model);
+  cJSON_AddStringToObject(root, "input", text);
+  cJSON_AddStringToObject(root, "voice", cfg->tts_voice[0] ? cfg->tts_voice : "alloy");
+  cJSON_AddStringToObject(root, "response_format", "mp3");
+  char *body = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+
+  const char *key = cfg->tts_api_key[0] ? cfg->tts_api_key : cfg->openai_key;
+  bool ok = tts_post_audio(url, body, key, out_mp3_path, "OpenAI-compatible TTS");
+  free(body);
+  return ok;
+}
+
+/* Single entry point used by the pipeline. */
+static bool tts_synthesize(const Config *cfg, const char *text, const char *out_mp3_path) {
+  switch (cfg->tts_provider) {
+    case TTS_XTTS:  return tts_xtts(cfg, text, out_mp3_path);
+    case TTS_PIPER: return tts_piper(cfg, text, out_mp3_path);
+    case TTS_OPENAI: return tts_openai_compat(cfg, text, out_mp3_path);
+    default:        return elevenlabs_tts_to_mp3(cfg, text, out_mp3_path);
+  }
+}
+
 static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
                                       int start_s, int end_s,
                                       const char *narration_mp3, double narration_dur,
@@ -1978,7 +2155,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
 
     report_progress(GEN_STAGE_TTS, movie_index, movie_total, (int)(i + 1), (int)plan.count, movie_title);
     logi("TTS clip %zu/%zu -> %s", i + 1, plan.count, nar_mp3);
-    if (!elevenlabs_tts_to_mp3(cfg, plan.items[i].narration, nar_mp3)) {
+    if (!tts_synthesize(cfg, plan.items[i].narration, nar_mp3)) {
       logw("TTS failed clip %zu for %s", i + 1, movie_title);
       continue;
     }
@@ -2238,6 +2415,18 @@ int run_generation(void) {
   g_curl_inited = true;
 
   Config cfg = load_config_json("config.json");
+
+  if (cfg.tts_provider == TTS_ELEVENLABS)
+    logi("Narration engine: ElevenLabs (model %s)", cfg.eleven_model_id);
+  else if (cfg.tts_provider == TTS_XTTS)
+    logi("Narration engine: XTTS at %s (speaker %s, language %s)",
+         cfg.tts_base_url, cfg.tts_voice, cfg.tts_language);
+  else if (cfg.tts_provider == TTS_PIPER)
+    logi("Narration engine: Piper at %s (voice %s)", cfg.tts_base_url,
+         cfg.tts_voice[0] ? cfg.tts_voice : "server default");
+  else
+    logi("Narration engine: OpenAI-compatible %s/audio/speech (model %s)",
+         cfg.tts_base_url, cfg.tts_model);
 
   ensure_dir("movies");
   ensure_dir("output");

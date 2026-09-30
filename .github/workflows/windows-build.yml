@@ -88,6 +88,16 @@ jobs:
             if ($cfg.min_clips -ne 3) { throw "config write did not stick" }
             if (-not $cfg.openai_key_set) { throw "API key was not saved" }
 
+            # free / local narration engines must survive a round trip through config.json
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8123/api/config" `
+              -ContentType "application/json" `
+              -Body '{"tts_provider":"xtts","tts_base_url":"http://127.0.0.1:8020","tts_voice":"me.wav","tts_language":"en"}' | Out-Null
+            $cfg = Invoke-RestMethod "http://127.0.0.1:8123/api/config"
+            if ($cfg.tts_provider -ne "xtts") { throw "tts_provider write did not stick" }
+            if ($cfg.tts_voice -ne "me.wav") { throw "tts_voice write did not stick" }
+            if ($page.Content -notmatch "tts_provider") { throw "engine picker missing from the page" }
+            Write-Host "TTS provider switch OK ($($cfg.tts_provider) / $($cfg.tts_base_url))"
+
             Set-Content -Path smoke\hello.srt -Value "1`n00:00:01,000 --> 00:00:02,000`nhi"
             Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8123/api/upload?dir=srt&name=hello.srt" `
               -InFile smoke\hello.srt -ContentType "text/plain" | Out-Null
