@@ -63,6 +63,23 @@ function Get-File([string]$url, [string]$dest) {
     Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -TimeoutSec 1800
 }
 
+# Python and pip write their progress to stderr. With $ErrorActionPreference set
+# to "Stop", PowerShell turns that into a terminating error and aborts the whole
+# script, so every external command runs through here instead.
+function Invoke-Tool {
+    param([string]$Exe, [string[]]$ToolArgs = @(), [switch]$Show)
+
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        if ($Show) { & $Exe @ToolArgs 2>&1 | ForEach-Object { Write-Host "    $_" } }
+        else       { & $Exe @ToolArgs 2>&1 | Out-Null }
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return $LASTEXITCODE
+}
+
 # --------------------------------------------------------------------------
 $tools  = Resolve-ToolsDir -requested $ToolsDir
 $root   = Join-Path $tools  "piper"
@@ -104,35 +121,29 @@ if ((Test-Path $py) -and -not $Force) {
 }
 
 # ---------------------------------------------------------------- 2. pip
-$hasPip = $false
-try {
-    & $py -m pip --version *> $null
-    $hasPip = ($LASTEXITCODE -eq 0)
-} catch { $hasPip = $false }
+$hasPip = ((Invoke-Tool -Exe $py -ToolArgs @("-m", "pip", "--version")) -eq 0)
 
 if (-not $hasPip) {
     Say "[..] Installing pip..."
     $getPip = Join-Path $root "get-pip.py"
     Get-File "https://bootstrap.pypa.io/get-pip.py" $getPip
-    & $py $getPip --no-warn-script_LOCATION 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "pip bootstrap failed" }
+    $code = Invoke-Tool -Exe $py -Show -ToolArgs @($getPip, "--no-warn-script-location", "--disable-pip-version-check")
+    if ($code -ne 0) { throw "pip bootstrap failed (exit $code)" }
     Remove-Item $getPip -Force -ErrorAction SilentlyContinue
 }
 
 # ------------------------------------------------------------ 3. piper-tts
-$hasPiper = $false
-try {
-    & $py -c "import piper, flask" *> $null
-    $hasPiper = ($LASTEXITCODE -eq 0)
-} catch { $hasPiper = $false }
+$hasPiper = ((Invoke-Tool -Exe $py -ToolArgs @("-c", "import piper, flask")) -eq 0)
 
 if ((-not $hasPiper) -or $Force) {
     # flask is an *extra* of piper-tts, so the [http] part is required for the
     # HTTP server that this app talks to.
     Say "[..] Installing piper-tts[http] + onnxruntime (this can take a minute)..."
-    & $py -m pip install --no-warn-script-location --upgrade "piper-tts[http]" 2>&1 |
-        ForEach-Object { Write-Host "    $_" }
-    if ($LASTEXITCODE -ne 0) { throw "pip install piper-tts[http] failed" }
+    $code = Invoke-Tool -Exe $py -Show -ToolArgs @(
+        "-m", "pip", "install", "--no-warn-script-location", "--disable-pip-version-check",
+        "--upgrade", "piper-tts[http]"
+    )
+    if ($code -ne 0) { throw "pip install piper-tts[http] failed (exit $code)" }
 }
 Say "[OK] piper-tts ready." "Green"
 
@@ -142,16 +153,17 @@ if ((Test-Path $onnx) -and -not $Force) {
     Say "[OK] Voice already downloaded." "Green"
 } else {
     Say "[..] Downloading the voice model $Voice (about 60 MB)..."
-    & $py -m piper.download_voices $Voice --download-dir $voices 2>&1 |
-        ForEach-Object { Write-Host "    $_" }
-    if ($LASTEXITCODE -ne 0) { throw "downloading the voice failed" }
+    $code = Invoke-Tool -Exe $py -Show -ToolArgs @(
+        "-m", "piper.download_voices", $Voice, "--download-dir", $voices
+    )
+    if ($code -ne 0) { throw "downloading the voice failed (exit $code)" }
     if (-not (Test-Path $onnx)) { throw "the voice model did not arrive at $onnx" }
 }
 
 # ------------------------------------------------------------- 5. smoke test
 Say "[..] Loading the voice to make sure it really works..."
-& $py -c "from piper import PiperVoice; PiperVoice.load(r'$onnx'); print('voice loads OK')"
-if ($LASTEXITCODE -ne 0) { throw "the voice model could not be loaded" }
+$code = Invoke-Tool -Exe $py -Show -ToolArgs @("-c", "from piper import PiperVoice; PiperVoice.load(r'$onnx'); print('voice loads OK')")
+if ($code -ne 0) { throw "the voice model could not be loaded (exit $code)" }
 
 Say ""
 Say "[OK] Piper is installed and working." "Green"
