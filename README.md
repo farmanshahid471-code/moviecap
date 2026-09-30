@@ -476,6 +476,12 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
 - **Filename matters**: `movies\My Movie.mp4` → treated as title `My Movie`
 - **"ffmpeg/ffprobe not found in PATH"** → start the app with `run.bat`; it installs a portable FFmpeg into `F:\AI-Movie-Shorts\tools\ffmpeg\bin` and puts it on PATH for that session. If the download is blocked, run `install_tools.ps1` yourself or `winget install Gyan.FFmpeg`, then **close and reopen** the app/terminal. Check with `ffmpeg -version`.
 - **Windows SmartScreen** may warn about an unsigned `.exe` you built or downloaded. Click *More info → Run anyway*.
+- **"The desktop window could not be opened: no usable OpenGL context"** (GLFW error
+  `65543`, `WGL_ARB_create_context_profile is unavailable`) → the desktop UI needs
+  OpenGL 3.3, which Remote Desktop sessions, VMs without GPU acceleration and old
+  graphics drivers do not provide. Nothing is wrong with your videos: use
+  **`run.bat web`** instead. The browser control panel has every control the desktop
+  window has and needs no graphics card. Updating your graphics driver also fixes it.
 - If you see "plan count = 0" / "No plan returned" or missing clips, check:
   - your OpenAI key (the exact error from OpenAI is shown in the log)
   - network connectivity

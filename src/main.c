@@ -150,6 +150,36 @@ int main(void) {
 
   SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
   InitWindow(940, 620, "C-AI Movie Shorts");
+
+  if (!IsWindowReady()) {
+    /*
+     * No usable OpenGL context. That happens on Remote Desktop sessions, on VMs
+     * without GPU acceleration, or with a graphics driver too old for OpenGL 3.3
+     * (GLFW error 65543, WGL_ARB_create_context_profile unavailable). Nothing is
+     * wrong with the project itself - the browser control panel does everything
+     * this window does and needs no graphics card at all.
+     */
+    printf("\n");
+    printf("============================================================\n");
+    printf(" The desktop window could not be opened: this machine has no\n");
+    printf(" usable OpenGL context.\n");
+    printf("\n");
+    printf(" That is normal on a Remote Desktop session, in a virtual\n");
+    printf(" machine without GPU acceleration, or with an old graphics\n");
+    printf(" driver. Your videos are not affected by it.\n");
+    printf("\n");
+    printf("\n");
+    printf(" Use the browser control panel instead - same controls, and\n");
+    printf(" it needs no graphics card:\n");
+    printf("\n");
+    printf("     run.bat web\n");
+    printf("\n");
+    printf(" then open   http://127.0.0.1:8080   in your browser.\n");
+    printf("============================================================\n");
+    fflush(stdout);
+    return 2;
+  }
+
   SetWindowMinSize(700, 480);
   SetTargetFPS(60);
 
