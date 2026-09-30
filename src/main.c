@@ -149,8 +149,8 @@ int main(void) {
   plat_mkdir("scripts/srt_files");
 
   SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
-  InitWindow(920, 560, "C-AI Movie Shorts");
-  SetWindowMinSize(700, 420);
+  InitWindow(940, 620, "C-AI Movie Shorts");
+  SetWindowMinSize(700, 480);
   SetTargetFPS(60);
 
   // Load Inter Regular from resources/
@@ -203,15 +203,22 @@ int main(void) {
       g_log_count = 0;
       log_unlock();
 
+      generator_clear_cancel();
       start_generation_thread();
+    }
+
+    /* STOP asks the pipeline to finish the current step and then stop. */
+    if (draw_button(g_uiFont, (Rectangle){30, 360, 260, 40}, "STOP", !canStart, 18)) {
+      generator_request_cancel();
+      ui_log_hook("[WARN] Stop requested - finishing the current step, then stopping.");
     }
 
     char status[256];
     snprintf(status, sizeof(status),
              "Status: %s   (last exit code: %d)",
-             (g_running ? "RUNNING" : "IDLE"),
+             (g_running ? (generator_cancel_requested() ? "STOPPING" : "RUNNING") : "IDLE"),
              (int)g_last_rc);
-    DrawTextEx(g_uiFont, status, (Vector2){30, 370}, 18, g_uiSpacing, (Color){220, 220, 220, 255});
+    DrawTextEx(g_uiFont, status, (Vector2){30, 415}, 18, g_uiSpacing, (Color){220, 220, 220, 255});
 
     DrawTextEx(g_uiFont, "Log", (Vector2){320, 20}, 24, g_uiSpacing, RAYWHITE);
     /* log panel stretches with the window */

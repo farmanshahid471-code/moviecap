@@ -20,6 +20,7 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 # ---------------- options: which apps to build ----------------
 option(BUILD_CLI_APP       "Build CLI app (src/cli.c)"                         ON)
 option(BUILD_RAYLIB_UI     "Build Raylib UI (src/main.c)"                      ON)
+option(BUILD_WEB_UI        "Build the browser control panel (src/web_ui.c)"    ON)
 option(BUILD_SIMPLE_UI     "Build the old simple Raylib UI (src/ui_main.c)"    OFF)
 option(BUILD_WINDOWS_GUI   "Windows: build the UI without a console window"    OFF)
 
@@ -169,6 +170,16 @@ endif()
 if(BUILD_CLI_APP)
   add_executable(movie_summary_cli src/cli.c ${APP_RC})
   target_link_libraries(movie_summary_cli PRIVATE movie_core)
+endif()
+
+# ---------------- Web control panel executable ----------------
+# Plain HTTP server + embedded single page UI: no raylib, no extra dependency.
+if(BUILD_WEB_UI)
+  add_executable(movie_summary_web src/web_ui.c ${APP_RC})
+  target_link_libraries(movie_summary_web PRIVATE movie_core)
+  if(WIN32)
+    target_link_libraries(movie_summary_web PRIVATE ws2_32)
+  endif()
 endif()
 
 # helper: UI target common settings

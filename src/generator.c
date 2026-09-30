@@ -75,6 +75,55 @@ void generator_set_log_hook(GeneratorLogHook hook) {
   g_log_hook = hook;
 }
 
+/* --------------------- Progress + cancel plumbing (for UI) --------------------- */
+static GeneratorProgressHook g_progress_hook = NULL;
+static volatile int g_cancel = 0;
+
+void generator_set_progress_hook(GeneratorProgressHook hook) {
+  g_progress_hook = hook;
+}
+
+void generator_request_cancel(void) { g_cancel = 1; }
+void generator_clear_cancel(void)   { g_cancel = 0; }
+bool generator_cancel_requested(void) { return g_cancel != 0; }
+
+const char *generator_stage_name(int stage) {
+  switch (stage) {
+    case GEN_STAGE_IDLE:      return "Idle";
+    case GEN_STAGE_SETUP:     return "Starting up";
+    case GEN_STAGE_SUBTITLES: return "Subtitles";
+    case GEN_STAGE_SCRIPT:    return "Script context";
+    case GEN_STAGE_PLANNING:  return "AI clip plan";
+    case GEN_STAGE_TTS:       return "Narration (TTS)";
+    case GEN_STAGE_CLIP:      return "Building clip";
+    case GEN_STAGE_CONCAT:    return "Concatenating";
+    case GEN_STAGE_BGM:       return "Background music";
+    case GEN_STAGE_VERTICAL:  return "Vertical render";
+    case GEN_STAGE_DONE:      return "Done";
+    case GEN_STAGE_FAILED:    return "Failed";
+    case GEN_STAGE_CANCELLED: return "Cancelled";
+    default:                  return "Working";
+  }
+}
+
+/* Reports the current step to the UI. Called from the generation thread. */
+static void report_progress(int stage, int movie_index, int movie_total,
+                            int clip_index, int clip_total, const char *movie_title) {
+  if (!g_progress_hook) return;
+
+  GeneratorProgress p;
+  p.stage       = stage;
+  p.movie_index = movie_index;
+  p.movie_total = movie_total;
+  p.clip_index  = clip_index;
+  p.clip_total  = clip_total;
+  p.movie_title[0] = 0;
+  if (movie_title && movie_title[0])
+    snprintf(p.movie_title, sizeof(p.movie_title), "%s", movie_title);
+
+  g_progress_hook(&p);
+}
+
 static void emit_line(const char *line) {
   fprintf(stderr, "%s\n", line);
   fflush(stderr);
@@ -192,8 +241,13 @@ static size_t curl_file_write_cb(void *contents, size_t size, size_t nmemb, void
 }
 
 static MemBuf http_get_to_mem_ex(const char *url, long *http_code_out) {
+  if (http_code_out) *http_code_out = -1;
+
   CURL *curl = curl_easy_init();
-  if (!curl) die("curl_easy_init failed");
+  if (!curl) {
+    logw("curl_easy_init failed (out of memory?)");
+    return (MemBuf){0};
+  }
 
   MemBuf buf = (MemBuf){0};
 
@@ -218,9 +272,17 @@ static MemBuf http_get_to_mem_ex(const char *url, long *http_code_out) {
 
   curl_easy_cleanup(curl);
 
+  /*
+   * A transport error (DNS failure, no internet, TLS problem, timeout) must not
+   * abort the whole run: the callers treat "no usable response" as a normal
+   * failure of this one step (subtitle download / script scrape / plan) and
+   * continue with the rest. Only the message is reported.
+   */
   if (res != CURLE_OK) {
+    logw("GET failed: %s (%s)", url, curl_easy_strerror(res));
     if (buf.data) free(buf.data);
-    die("GET failed: %s (%s)", url, curl_easy_strerror(res));
+    if (http_code_out) *http_code_out = -1;
+    return (MemBuf){0};
   }
 
   return buf;
@@ -228,8 +290,13 @@ static MemBuf http_get_to_mem_ex(const char *url, long *http_code_out) {
 
 static MemBuf http_post_json_to_mem(const char *url, const char *bearer_key, const char *json_body,
                                    long *http_code_out, long timeout_s) {
+  if (http_code_out) *http_code_out = -1;
+
   CURL *curl = curl_easy_init();
-  if (!curl) die("curl init failed");
+  if (!curl) {
+    logw("curl init failed (out of memory?)");
+    return (MemBuf){0};
+  }
 
   MemBuf buf = (MemBuf){0};
 
@@ -267,8 +334,11 @@ static MemBuf http_post_json_to_mem(const char *url, const char *bearer_key, con
   curl_easy_cleanup(curl);
 
   if (res != CURLE_OK) {
+    /* Transport error: report and let the caller retry / skip, never abort. */
+    logw("POST failed: %s (%s)", url, curl_easy_strerror(res));
     if (buf.data) free(buf.data);
-    die("POST failed: %s", curl_easy_strerror(res));
+    if (http_code_out) *http_code_out = -1;
+    return (MemBuf){0};
   }
 
   return buf;
@@ -294,13 +364,19 @@ static void run_cmd_line_cb(const char *line, void *user) {
  * tool's output is forwarded into the UI log.
  */
 static int run_cmd(const char *fmt, ...) {
-  char cmd[8192];
+  char cmd[16384];
   va_list ap;
   va_start(ap, fmt);
-  vsnprintf(cmd, sizeof(cmd), fmt, ap);
+  int need = vsnprintf(cmd, sizeof(cmd), fmt, ap);
   va_end(ap);
 
-  char line[8300];
+  if (need < 0) return -1;
+  if ((size_t)need >= sizeof(cmd)) {
+    logw("Command line too long (%d chars) - it was truncated and will fail.", need);
+    return -1;
+  }
+
+  char line[sizeof(cmd) + 32];
   snprintf(line, sizeof(line), "[cmd] %s", cmd);
   emit_line(line);
   return plat_run(cmd, run_cmd_line_cb, NULL);
@@ -356,12 +432,64 @@ static double ffprobe_duration_seconds(const char *path) {
 }
 
 typedef struct {
+  /* required */
   char openai_key[512];
   char eleven_key[512];
+
+  /* optional, with defaults */
   char eleven_voice_id[128];
   char eleven_model_id[128];
-  char openai_model[128]; /* optional "openai_model" in config.json, default gpt-5.2 */
+  char openai_model[128];   /* "openai_model",   default gpt-5.2 */
+
+  /* optional API base URLs (proxies, Azure-style gateways, local mocks) */
+  char openai_base_url[256]; /* default https://api.openai.com/v1     */
+  char eleven_base_url[256]; /* default https://api.elevenlabs.io/v1  */
+
+  /* optional pipeline tuning */
+  int    min_clips;          /* default 20   */
+  int    max_clips;          /* default 30   */
+  double max_video_speedup;  /* default 1.75 */
+  double narration_volume;   /* default 2.5  */
+  double bgm_volume;         /* default 0.1  */
+  bool   bgm_enabled;        /* default true */
+  bool   make_vertical;      /* default true */
+  bool   retire_movies;      /* default true */
 } Config;
+
+static void cfg_set_str(char *dst, size_t dstsz, const cJSON *node) {
+  if (cJSON_IsString(node) && node->valuestring) {
+    strncpy(dst, node->valuestring, dstsz - 1);
+    dst[dstsz - 1] = 0;
+  }
+}
+
+static bool cfg_get_bool(const cJSON *node, bool def) {
+  if (cJSON_IsBool(node)) return cJSON_IsTrue(node) ? true : false;
+  if (cJSON_IsNumber(node)) return node->valuedouble != 0.0;
+  return def;
+}
+
+static int cfg_get_int(const cJSON *node, int def, int lo, int hi) {
+  if (!cJSON_IsNumber(node)) return def;
+  int v = (int)(node->valuedouble + (node->valuedouble >= 0 ? 0.5 : -0.5));
+  if (v < lo) v = lo;
+  if (v > hi) v = hi;
+  return v;
+}
+
+static double cfg_get_dbl(const cJSON *node, double def, double lo, double hi) {
+  if (!cJSON_IsNumber(node)) return def;
+  double v = node->valuedouble;
+  if (v < lo) v = lo;
+  if (v > hi) v = hi;
+  return v;
+}
+
+/* Strip a trailing '/' so "<base>/responses" never becomes "//responses". */
+static void cfg_trim_trailing_slash(char *s) {
+  size_t n = strlen(s);
+  while (n > 0 && s[n - 1] == '/') s[--n] = 0;
+}
 
 static Config load_config_json(const char *path) {
   Config c = {0};
@@ -378,22 +506,41 @@ static Config load_config_json(const char *path) {
   const cJSON *mid = cJSON_GetObjectItemCaseSensitive(root, "eleven_model_id");
   const cJSON *oam = cJSON_GetObjectItemCaseSensitive(root, "openai_model");
 
-  if (cJSON_IsString(ok)  && ok->valuestring)  strncpy(c.openai_key, ok->valuestring, sizeof(c.openai_key)-1);
-  if (cJSON_IsString(ek)  && ek->valuestring)  strncpy(c.eleven_key, ek->valuestring, sizeof(c.eleven_key)-1);
-  if (cJSON_IsString(vid) && vid->valuestring) strncpy(c.eleven_voice_id, vid->valuestring, sizeof(c.eleven_voice_id)-1);
-  if (cJSON_IsString(mid) && mid->valuestring) strncpy(c.eleven_model_id, mid->valuestring, sizeof(c.eleven_model_id)-1);
+  cfg_set_str(c.openai_key,     sizeof(c.openai_key),     ok);
+  cfg_set_str(c.eleven_key,     sizeof(c.eleven_key),     ek);
+  cfg_set_str(c.eleven_voice_id, sizeof(c.eleven_voice_id), vid);
+  cfg_set_str(c.eleven_model_id, sizeof(c.eleven_model_id), mid);
+  cfg_set_str(c.openai_model,   sizeof(c.openai_model),   oam);
 
-  if (cJSON_IsString(oam) && oam->valuestring) strncpy(c.openai_model, oam->valuestring, sizeof(c.openai_model)-1);
+  cfg_set_str(c.openai_base_url, sizeof(c.openai_base_url),
+              cJSON_GetObjectItemCaseSensitive(root, "openai_base_url"));
+  cfg_set_str(c.eleven_base_url, sizeof(c.eleven_base_url),
+              cJSON_GetObjectItemCaseSensitive(root, "elevenlabs_base_url"));
+
+  c.min_clips         = cfg_get_int(cJSON_GetObjectItemCaseSensitive(root, "min_clips"), MIN_NUM_CLIPS, 1, 200);
+  c.max_clips         = cfg_get_int(cJSON_GetObjectItemCaseSensitive(root, "max_clips"), MAX_NUM_CLIPS, 1, 200);
+  c.max_video_speedup = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "max_video_speedup"), MAX_VIDEO_SPEEDUP, 1.0, 8.0);
+  c.narration_volume  = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "narration_volume"), 2.5, 0.0, 10.0);
+  c.bgm_volume        = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "bgm_volume"), 0.1, 0.0, 10.0);
+  c.bgm_enabled       = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "bgm_enabled"), true);
+  c.make_vertical     = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "make_vertical"), true);
+  c.retire_movies     = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "retire_movies"), true);
+
+  if (c.min_clips > c.max_clips) c.min_clips = c.max_clips;
 
   if (c.openai_key[0] == 0) die("config.json: open_api_key missing");
   if (strcmp(c.openai_key, "OpenAIAPI") == 0)
     die("config.json: replace the placeholder \"OpenAIAPI\" with your real OpenAI API key");
   if (strcmp(c.eleven_key, "ElevenLabsAPI") == 0)
     die("config.json: replace the placeholder \"ElevenLabsAPI\" with your real ElevenLabs API key");
-  if (c.openai_model[0] == 0) strncpy(c.openai_model, "gpt-5.2", sizeof(c.openai_model)-1);
+  if (c.openai_model[0] == 0) strncpy(c.openai_model, "gpt-5.2", sizeof(c.openai_model) - 1);
   if (c.eleven_key[0] == 0) die("config.json: elevenlabs_api_key missing");
-  if (c.eleven_voice_id[0] == 0) strncpy(c.eleven_voice_id, "JBFqnCBsd6RMkjVDRZzb", sizeof(c.eleven_voice_id)-1);
-  if (c.eleven_model_id[0] == 0) strncpy(c.eleven_model_id, "eleven_multilingual_v2", sizeof(c.eleven_model_id)-1);
+  if (c.eleven_voice_id[0] == 0) strncpy(c.eleven_voice_id, "JBFqnCBsd6RMkjVDRZzb", sizeof(c.eleven_voice_id) - 1);
+  if (c.eleven_model_id[0] == 0) strncpy(c.eleven_model_id, "eleven_multilingual_v2", sizeof(c.eleven_model_id) - 1);
+  if (c.openai_base_url[0] == 0) strncpy(c.openai_base_url, "https://api.openai.com/v1", sizeof(c.openai_base_url) - 1);
+  if (c.eleven_base_url[0] == 0) strncpy(c.eleven_base_url, "https://api.elevenlabs.io/v1", sizeof(c.eleven_base_url) - 1);
+  cfg_trim_trailing_slash(c.openai_base_url);
+  cfg_trim_trailing_slash(c.eleven_base_url);
 
   cJSON_Delete(root);
   return c;
@@ -648,8 +795,13 @@ static bool download_subtitle_srt(const char *movie_title, const char *dest_srt_
   char slug[512];
   parse_movie_title_slug(movie_title, slug, sizeof(slug));
 
-  char list_url[1024];
-  snprintf(list_url, sizeof(list_url), "https://subf2m.co/subtitles/%s/english", slug);
+  /* The slug can contain non-ASCII characters (e.g. "amelie" with an accent),
+     which must be percent-encoded before they go into a URL. */
+  char slug_enc[1024];
+  url_encode_component(slug, slug_enc, sizeof(slug_enc));
+
+  char list_url[1536];
+  snprintf(list_url, sizeof(list_url), "https://subf2m.co/subtitles/%s/english", slug_enc);
 
   long code = 0;
   MemBuf page = http_get_to_mem_ex(list_url, &code);
@@ -661,10 +813,10 @@ static bool download_subtitle_srt(const char *movie_title, const char *dest_srt_
     return false;
   }
 
-  char want_subpage_prefix[768];
-  snprintf(want_subpage_prefix, sizeof(want_subpage_prefix), "/subtitles/%s/english/", slug);
+  char want_subpage_prefix[1280];
+  snprintf(want_subpage_prefix, sizeof(want_subpage_prefix), "/subtitles/%s/english/", slug_enc);
 
-  char subpage_url[1024] = {0};
+  char subpage_url[2112] = {0};
 
   {
     const char *p = page.data;
@@ -686,7 +838,7 @@ static bool download_subtitle_srt(const char *movie_title, const char *dest_srt_
     while (href_next(&p, href, sizeof(href))) {
       if (strncmp(href, "/u/", 3) != 0) continue;
 
-      char profile_url[1024];
+      char profile_url[2112];
       snprintf(profile_url, sizeof(profile_url), "https://subf2m.co%s", href);
 
       long pcode = 0;
@@ -726,7 +878,7 @@ static bool download_subtitle_srt(const char *movie_title, const char *dest_srt_
     return false;
   }
 
-  char download_url[1024] = {0};
+  char download_url[2112] = {0};
   {
     const char *p = subpage.data;
     char href[2048];
@@ -917,15 +1069,26 @@ static bool download_imsdb_script_ex(const char *movie_title,
   char enc_title[1024];
   url_encode_component(movie_title, enc_title, sizeof(enc_title));
 
-  char url0[1024], url1[1024], url2[1024], url3[1024], url4[1024], url5[1024], url6[1024];
+  /* Every title variant is percent-encoded: raw spaces, apostrophes and
+     accented characters are not valid inside a URL path. */
+  char a_enc[1024], b_enc[1024], c_enc[1024];
+  char a_lo_enc[1024], b_lo_enc[1024], c_lo_enc[1024];
+  url_encode_component(a,    a_enc,    sizeof(a_enc));
+  url_encode_component(b,    b_enc,    sizeof(b_enc));
+  url_encode_component(c,    c_enc,    sizeof(c_enc));
+  url_encode_component(a_lo, a_lo_enc, sizeof(a_lo_enc));
+  url_encode_component(b_lo, b_lo_enc, sizeof(b_lo_enc));
+  url_encode_component(c_lo, c_lo_enc, sizeof(c_lo_enc));
 
-  snprintf(url0, sizeof(url0), "https://imsdb.com/scripts/%s.html", a);
-  snprintf(url1, sizeof(url1), "https://imsdb.com/scripts/%s.html", b);
-  snprintf(url2, sizeof(url2), "https://imsdb.com/scripts/%s.html", c);
+  char url0[1536], url1[1536], url2[1536], url3[1536], url4[1536], url5[1536], url6[1536];
 
-  snprintf(url3, sizeof(url3), "https://imsdb.com/scripts/%s.html", a_lo);
-  snprintf(url4, sizeof(url4), "https://imsdb.com/scripts/%s.html", b_lo);
-  snprintf(url5, sizeof(url5), "https://imsdb.com/scripts/%s.html", c_lo);
+  snprintf(url0, sizeof(url0), "https://imsdb.com/scripts/%s.html", a_enc);
+  snprintf(url1, sizeof(url1), "https://imsdb.com/scripts/%s.html", b_enc);
+  snprintf(url2, sizeof(url2), "https://imsdb.com/scripts/%s.html", c_enc);
+
+  snprintf(url3, sizeof(url3), "https://imsdb.com/scripts/%s.html", a_lo_enc);
+  snprintf(url4, sizeof(url4), "https://imsdb.com/scripts/%s.html", b_lo_enc);
+  snprintf(url5, sizeof(url5), "https://imsdb.com/scripts/%s.html", c_lo_enc);
 
   snprintf(url6, sizeof(url6), "https://imsdb.com/Movie%%20Scripts/%s%%20Script.html", enc_title);
 
@@ -937,8 +1100,7 @@ static bool download_imsdb_script_ex(const char *movie_title,
     char why[256];
     if (imsdb_fetch_script_to_file(attempts[i], dest_txt_path, why, sizeof(why))) {
       if (used_url && used_url_sz) {
-        strncpy(used_url, attempts[i], used_url_sz - 1);
-        used_url[used_url_sz - 1] = 0;
+        snprintf(used_url, used_url_sz, "%s", attempts[i]);
       }
       return true;
     }
@@ -1076,6 +1238,8 @@ static ClipPlanList parse_clip_plan_json(const char *json_text) {
   }
 
   size_t n = (size_t)cJSON_GetArraySize(clips);
+  if (n == 0) { cJSON_Delete(root); return out; }
+
   out.items = (ClipPlan *)calloc(n, sizeof(ClipPlan));
   if (!out.items) die("OOM");
   out.count = 0;
@@ -1294,8 +1458,10 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   bool has_script = (optional_script_text && optional_script_text[0] != 0);
   long timeout_s = has_script ? 14400L : 3600L;
 
-  MemBuf resp = http_post_json_to_mem("https://api.openai.com/v1/responses",
-                                      cfg->openai_key, body, &http_code, timeout_s);
+  char endpoint[512];
+  snprintf(endpoint, sizeof(endpoint), "%s/responses", cfg->openai_base_url);
+
+  MemBuf resp = http_post_json_to_mem(endpoint, cfg->openai_key, body, &http_code, timeout_s);
   free(body);
 
   if (http_code < 200 || http_code >= 300) {
@@ -1334,8 +1500,8 @@ static ClipPlanList openai_make_plan(const Config *cfg,
 static bool elevenlabs_tts_to_mp3(const Config *cfg, const char *text, const char *out_mp3_path) {
   char url[1024];
   snprintf(url, sizeof(url),
-           "https://api.elevenlabs.io/v1/text-to-speech/%s?output_format=mp3_44100_128",
-           cfg->eleven_voice_id);
+           "%s/text-to-speech/%s?output_format=mp3_44100_128",
+           cfg->eleven_base_url, cfg->eleven_voice_id);
 
   cJSON *root = cJSON_CreateObject();
   cJSON_AddStringToObject(root, "text", text);
@@ -1396,9 +1562,12 @@ static bool elevenlabs_tts_to_mp3(const Config *cfg, const char *text, const cha
   return file_exists(out_mp3_path);
 }
 
-static bool ffmpeg_make_adjusted_clip(const char *input_mp4, int start_s, int end_s,
+static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
+                                      int start_s, int end_s,
                                       const char *narration_mp3, double narration_dur,
                                       const char *out_mp4) {
+  const double max_speedup = cfg->max_video_speedup;
+
   double orig_seg_dur = (double)(end_s - start_s);
   if (orig_seg_dur <= 0.1 || narration_dur <= 0.1) return false;
 
@@ -1407,8 +1576,8 @@ static bool ffmpeg_make_adjusted_clip(const char *input_mp4, int start_s, int en
 
   double speed = orig_seg_dur / narration_dur;
 
-  if (speed > MAX_VIDEO_SPEEDUP) {
-    double desired_src_dur = narration_dur * MAX_VIDEO_SPEEDUP;
+  if (speed > max_speedup) {
+    double desired_src_dur = narration_dur * max_speedup;
 
     if (desired_src_dur > orig_seg_dur) desired_src_dur = orig_seg_dur;
     if (desired_src_dur < 1.0) desired_src_dur = 1.0;
@@ -1431,7 +1600,7 @@ static bool ffmpeg_make_adjusted_clip(const char *input_mp4, int start_s, int en
 
     double new_seg_dur = (double)(use_end - use_start);
     speed = new_seg_dur / narration_dur;
-    if (speed > MAX_VIDEO_SPEEDUP) speed = MAX_VIDEO_SPEEDUP;
+    if (speed > max_speedup) speed = max_speedup;
 
     logi("Speed-cap applied: planned %d-%d (%.2fs) vs narr %.2fs => %.2fx. Using %d-%d (%.2fs) => %.2fx.",
          start_s, end_s, orig_seg_dur,
@@ -1511,7 +1680,8 @@ static bool ffmpeg_concat_audio(const char *list_txt, const char *out_m4a) {
   return rc == 0 && file_exists(out_m4a);
 }
 
-static bool ffmpeg_mix_bgm(const char *video_in, const char *bgm_in, const char *video_out) {
+static bool ffmpeg_mix_bgm(const Config *cfg, const char *video_in, const char *bgm_in,
+                           const char *video_out) {
   char *v_esc = sh_escape(video_in);
   char *b_esc = sh_escape(bgm_in);
   char *o_esc = sh_escape(video_out);
@@ -1519,11 +1689,11 @@ static bool ffmpeg_mix_bgm(const char *video_in, const char *bgm_in, const char 
   int rc = run_cmd(
     "ffmpeg -y -hide_banner -loglevel error "
     "-i %s -i %s "
-    "-filter_complex \"[0:a]volume=2.5[a0];[1:a]volume=0.1[a1];"
+    "-filter_complex \"[0:a]volume=%.3f[a0];[1:a]volume=%.3f[a1];"
     "[a0][a1]amix=inputs=2:duration=first:dropout_transition=2[a]\" "
     "-map 0:v -map \"[a]\" "
     "-c:v copy -c:a aac -b:a 192k -movflags +faststart %s",
-    v_esc, b_esc, o_esc
+    v_esc, b_esc, cfg->narration_volume, cfg->bgm_volume, o_esc
   );
 
   free(v_esc);
@@ -1677,7 +1847,7 @@ static bool clear_directory_contents(const char *dir_path) {
 /* ----------------------- Movie pipeline ----------------------- */
 
 static bool process_movie(const Config *cfg, const char *movie_path, const char *movie_title,
-                          int num_clips) {
+                          int num_clips, int movie_index, int movie_total) {
   ensure_dir("clips");
   ensure_dir("clips/audio");
   ensure_dir("output");
@@ -1691,6 +1861,8 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   snprintf(srt_mod, sizeof(srt_mod), "scripts/srt_files/%s_modified.srt", movie_title);
   snprintf(script_txt, sizeof(script_txt), "scripts/srt_files/%s_summary.txt", movie_title);
 
+  report_progress(GEN_STAGE_SUBTITLES, movie_index, movie_total, 0, 0, movie_title);
+
   if (!file_exists(srt_in)) {
     logi("No SRT found for %s; attempting download...", movie_title);
     if (!download_subtitle_srt(movie_title, srt_in)) {
@@ -1701,6 +1873,8 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   } else {
     logok("Found SRT: %s", srt_in);
   }
+
+  if (generator_cancel_requested()) return false;
 
   if (!file_exists(srt_mod)) {
     logi("Converting SRT timestamps -> seconds: %s -> %s", srt_in, srt_mod);
@@ -1719,7 +1893,9 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     plat_unlink(script_txt);
   }
 
-  char imsdb_url[1024] = {0};
+  report_progress(GEN_STAGE_SCRIPT, movie_index, movie_total, 0, 0, movie_title);
+
+  char imsdb_url[1600] = {0};
   if (file_exists(script_txt)) {
     logok("Found cached IMSDb script: %s (%ld bytes)", script_txt, file_size_bytes(script_txt));
   } else {
@@ -1751,6 +1927,9 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     logi("No IMSDb script available; using subtitles only.");
   }
 
+  if (generator_cancel_requested()) return false;
+
+  report_progress(GEN_STAGE_PLANNING, movie_index, movie_total, 0, 0, movie_title);
   logi("Requesting OpenAI clip plan (%d clips target)...", num_clips);
   bool retry_no_script = false;
   ClipPlanList plan = openai_make_plan(cfg, movie_title, subs_seconds,
@@ -1784,6 +1963,11 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
 
   size_t made = 0;
   for (size_t i = 0; i < plan.count; i++) {
+    if (generator_cancel_requested()) {
+      logw("Cancel requested - stopping after clip %zu of %zu.", i, plan.count);
+      break;
+    }
+
     int start_s = plan.items[i].start;
     int end_s   = plan.items[i].end;
     if (start_s <= 0) { logw("Skipping clip %zu (start<=0)", i + 1); continue; }
@@ -1792,6 +1976,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     char nar_mp3[PATH_MAX];
     snprintf(nar_mp3, sizeof(nar_mp3), "clips/audio/%s_audio_%zu.mp3", movie_title, i + 1);
 
+    report_progress(GEN_STAGE_TTS, movie_index, movie_total, (int)(i + 1), (int)plan.count, movie_title);
     logi("TTS clip %zu/%zu -> %s", i + 1, plan.count, nar_mp3);
     if (!elevenlabs_tts_to_mp3(cfg, plan.items[i].narration, nar_mp3)) {
       logw("TTS failed clip %zu for %s", i + 1, movie_title);
@@ -1810,8 +1995,9 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     char out_clip[PATH_MAX];
     snprintf(out_clip, sizeof(out_clip), "clips/%s", out_clip_name);
 
+    report_progress(GEN_STAGE_CLIP, movie_index, movie_total, (int)(i + 1), (int)plan.count, movie_title);
     logi("Building clip %zu: %d -> %d sec (narr=%.2fs) => %s", i + 1, start_s, end_s, nar_dur, out_clip);
-    if (!ffmpeg_make_adjusted_clip(movie_path, start_s, end_s, nar_mp3, nar_dur, out_clip)) {
+    if (!ffmpeg_make_adjusted_clip(cfg, movie_path, start_s, end_s, nar_mp3, nar_dur, out_clip)) {
       logw("Failed to build adjusted clip %zu", i + 1);
       continue;
     }
@@ -1833,6 +2019,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   char tmp_concat[PATH_MAX];
   snprintf(tmp_concat, sizeof(tmp_concat), "clips/%s_concat_tmp.mp4", movie_title);
 
+  report_progress(GEN_STAGE_CONCAT, movie_index, movie_total, 0, (int)made, movie_title);
   logi("Concatenating clips -> %s", tmp_concat);
   if (!ffmpeg_concat_videos(concat_list_path, tmp_concat)) {
     logw("Concat failed for %s", movie_title);
@@ -1847,10 +2034,28 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   }
   logok("Final duration: %.2f seconds", final_dur);
 
+  /* Cancelled after the clips were joined: keep the recap we already have and
+     skip the optional BGM / vertical steps instead of burning more time. */
+  if (generator_cancel_requested()) {
+    char out_partial[PATH_MAX];
+    snprintf(out_partial, sizeof(out_partial), "output/%s.mp4", movie_title);
+    logw("Cancel requested - keeping the narration-only recap and skipping BGM/vertical.");
+    plat_rename(tmp_concat, out_partial);
+    return true;
+  }
+
   size_t song_n = 0;
-  char **songs = list_files_with_ext("backgroundmusic", ".mp3", ".m4a", &song_n);
+  char **songs = NULL;
+  if (cfg->bgm_enabled) {
+    report_progress(GEN_STAGE_BGM, movie_index, movie_total, 0, 0, movie_title);
+    songs = list_files_with_ext("backgroundmusic", ".mp3", ".m4a", &song_n);
+  } else {
+    logi("Background music disabled in config (bgm_enabled=false).");
+  }
+
   if (!songs || song_n == 0) {
-    logw("No backgroundmusic files found; output will be narration-only.");
+    if (cfg->bgm_enabled) logw("No backgroundmusic files found; output will be narration-only.");
+    else logi("Output will be narration-only (bgm_enabled=false).");
     char out_final_only[PATH_MAX];
     snprintf(out_final_only, sizeof(out_final_only), "output/%s.mp4", movie_title);
     plat_rename(tmp_concat, out_final_only);
@@ -1869,6 +2074,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     int part = 0;
     int misses = 0;
     while (covered + 0.01 < final_dur) {
+      if (generator_cancel_requested()) { logw("Cancel requested - stopping BGM build."); break; }
       if (misses > 50) { logw("Too many unusable BGM tracks (need > 60s long); stopping BGM build."); break; }
       const char *song = songs[rand() % song_n];
       double sd = ffprobe_duration_seconds(song);
@@ -1898,6 +2104,18 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
 
     logok("BGM parts created: %d (covered %.2fs / %.2fs)", part, covered, final_dur);
 
+    if (part == 0) {
+      /* Nothing usable (or the run was cancelled): do not feed ffmpeg an empty list.
+         (bgml was already closed above.) */
+      logw("No usable BGM parts; output stays narration-only.");
+      char out_final_only[PATH_MAX];
+      snprintf(out_final_only, sizeof(out_final_only), "output/%s.mp4", movie_title);
+      plat_rename(tmp_concat, out_final_only);
+      logok("Wrote output (no BGM): %s", out_final_only);
+      free_str_list(songs, song_n);
+      goto after_bgm;
+    }
+
     char bgm_out[PATH_MAX];
     snprintf(bgm_out, sizeof(bgm_out), "clips/%s_bgm.m4a", movie_title);
 
@@ -1915,7 +2133,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
       snprintf(out_final_only, sizeof(out_final_only), "output/%s.mp4", movie_title);
 
       logi("Mixing narration + BGM -> %s", out_final_only);
-      if (!ffmpeg_mix_bgm(tmp_concat, bgm_out, out_final_only)) {
+      if (!ffmpeg_mix_bgm(cfg, tmp_concat, bgm_out, out_final_only)) {
         logw("Mix failed; output narration-only.");
         plat_rename(tmp_concat, out_final_only);
       } else {
@@ -1927,23 +2145,39 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     free_str_list(songs, song_n);
   }
 
+after_bgm:
+  if (generator_cancel_requested()) {
+    logw("Cancel requested - skipping the remaining steps for %s.", movie_title);
+  }
+
   char out_final[PATH_MAX], out_vert[PATH_MAX];
   snprintf(out_final, sizeof(out_final), "output/%s.mp4", movie_title);
   snprintf(out_vert,  sizeof(out_vert),  "tiktok_output/%s_vertical.mp4", movie_title);
 
-  logi("Rendering vertical -> %s", out_vert);
-  if (!ffmpeg_make_vertical(out_final, out_vert)) {
-    logw("Vertical render failed for %s", movie_title);
+  if (generator_cancel_requested()) {
+    logw("Cancel requested - skipping the vertical render for %s.", movie_title);
+  } else if (cfg->make_vertical) {
+    report_progress(GEN_STAGE_VERTICAL, movie_index, movie_total, 0, 0, movie_title);
+    logi("Rendering vertical -> %s", out_vert);
+    if (!ffmpeg_make_vertical(out_final, out_vert)) {
+      logw("Vertical render failed for %s", movie_title);
+    } else {
+      logok("Vertical render OK: %s", out_vert);
+    }
   } else {
-    logok("Vertical render OK: %s", out_vert);
+    logi("Vertical render disabled in config (make_vertical=false).");
   }
 
-  char retired[PATH_MAX];
-  snprintf(retired, sizeof(retired), "movies_retired/%s.mp4", movie_title);
-  if (plat_rename(movie_path, retired) == 0) {
-    logok("Retired source movie -> %s", retired);
+  if (cfg->retire_movies) {
+    char retired[PATH_MAX];
+    snprintf(retired, sizeof(retired), "movies_retired/%s.mp4", movie_title);
+    if (plat_rename(movie_path, retired) == 0) {
+      logok("Retired source movie -> %s", retired);
+    } else {
+      logw("Could not move %s -> %s (is the file open in another program?)", movie_path, retired);
+    }
   } else {
-    logw("Could not move %s -> %s (is the file open in another program?)", movie_path, retired);
+    logi("Leaving %s in movies/ (retire_movies=false).", movie_path);
   }
 
   return true;
@@ -1977,10 +2211,13 @@ int run_generation(void) {
     g_die_armed = false;
     if (g_movies_dir) { plat_closedir(g_movies_dir); g_movies_dir = NULL; }
     if (g_curl_inited) { curl_global_cleanup(); g_curl_inited = false; }
+    report_progress(GEN_STAGE_FAILED, 0, 0, 0, 0, NULL);
     emit_line("Generation aborted (see FATAL message above).");
     return -1;
   }
   g_die_armed = true;
+
+  report_progress(GEN_STAGE_SETUP, 0, 0, 0, 0, NULL);
 
   char cwd[PATH_MAX];
   plat_getcwd(cwd, sizeof(cwd));
@@ -2022,7 +2259,10 @@ int run_generation(void) {
   ensure_dir("clips/audio");
 
   srand((unsigned)time(NULL));
-  int num_clips = MIN_NUM_CLIPS + (rand() % (MAX_NUM_CLIPS - MIN_NUM_CLIPS + 1));
+  int span = cfg.max_clips - cfg.min_clips;
+  if (span < 0) span = 0;
+  int num_clips = cfg.min_clips + (span > 0 ? (rand() % (span + 1)) : 0);
+  logi("Clip plan target: %d clips (config allows %d-%d).", num_clips, cfg.min_clips, cfg.max_clips);
 
   /* Collect the movie list first: process_movie() moves files out of movies/,
      and modifying a directory while enumerating it is unreliable on Windows. */
@@ -2054,6 +2294,11 @@ int run_generation(void) {
 
   int processed = 0;
   for (size_t i = 0; i < n_names; i++) {
+    if (generator_cancel_requested()) {
+      logw("Cancel requested - %zu of %zu movies left unprocessed.", n_names - i, n_names);
+      break;
+    }
+
     char title[PATH_MAX];
     strip_ext(names[i], title, sizeof(title));
 
@@ -2069,7 +2314,11 @@ int run_generation(void) {
     snprintf(banner, sizeof(banner), "=== Processing: %s ===", title);
     emit_line("");
     emit_line(banner);
-    if (process_movie(&cfg, path, title, num_clips)) {
+    if (generator_cancel_requested()) { free_str_list(names, n_names); break; }
+
+    report_progress(GEN_STAGE_SETUP, (int)(i + 1), (int)n_names, 0, 0, title);
+
+    if (process_movie(&cfg, path, title, num_clips, (int)(i + 1), (int)n_names)) {
       processed++;
       snprintf(banner, sizeof(banner), "DONE: %s", title);
     } else {
@@ -2078,6 +2327,9 @@ int run_generation(void) {
     emit_line(banner);
   }
   free_str_list(names, n_names);
+
+  if (generator_cancel_requested()) report_progress(GEN_STAGE_CANCELLED, 0, 0, 0, 0, NULL);
+  else report_progress(GEN_STAGE_DONE, 0, 0, 0, 0, NULL);
 
   char done[128];
   snprintf(done, sizeof(done), "All done. Processed: %d", processed);

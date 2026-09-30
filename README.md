@@ -19,9 +19,13 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 # 2. open a NEW terminal, then build
 build.bat
 
-# 3. add your API keys to config.json, then start the app
-run.bat
+# 3. add your API keys to config.json (or do it in the web panel), then start the app
+run.bat web
 ```
+
+`run.bat web` starts the **browser control panel** on <http://127.0.0.1:8080> — that is where you
+set the API keys, drop movies in, watch the live log and preview the result.
+(`run.bat` opens the desktop window instead, `run.bat cli` runs headless.)
 
 Then put a movie in `movies\` (e.g. `movies\Citizen Kane.mp4`) and click **START GENERATION**.
 
@@ -53,7 +57,57 @@ It also **clears generated files in `clips\` each run** (while preserving the `c
 
 ---
 
-## UI (raylib)
+## User interfaces
+
+There are **three** ways to drive the pipeline — pick whichever fits:
+
+| App | Start with | Best for |
+|---|---|---|
+| **Web control panel** (`movie_summary_web.exe`) | `run.bat web` → open <http://127.0.0.1:8080> | full control: settings, uploads, live progress, preview |
+| **Desktop window** (`movie_summary_bot.exe`, raylib) | `run.bat` | quick one-button runs |
+| **Headless CLI** (`movie_summary_cli.exe`) | `run.bat cli` | servers, scheduled jobs |
+
+### Web control panel (recommended)
+
+```bat
+run.bat web                       :: http://127.0.0.1:8080
+run.bat web --port 9000           :: another port
+run.bat web --host 0.0.0.0        :: reachable from other machines on your LAN
+```
+
+It is a small HTTP server with the whole UI embedded in the binary — no Node, no Python,
+no browser extension, nothing to install. The page gives you:
+
+- **START GENERATION** / **CANCEL** (the run stops at the next step boundary)
+- a live **stage + progress bar** (movie 2 of 5 · clip 7 of 24 · "Narration (TTS)")
+- a **live log** with colour-coded `[INFO] / [OK] / [WARN] / [FATAL] / [ffmpeg]` lines
+- **every setting** in `config.json` editable in the form (API keys, models, voice,
+  clip count, speed cap, music/narration volume, BGM on/off, vertical render on/off,
+  auto-retire on/off, API base URLs) — keys are shown masked and are never echoed back
+- **file management** for `movies\`, `scripts\srt_files\`, `backgroundmusic\`,
+  `output\`, `tiktok_output\`, `movies_retired\`, `clips\`:
+  drag-and-drop **upload**, **delete**, **download**
+- **in-browser video preview** of the finished recaps (HTTP range requests, so seeking works)
+- a health line showing whether `ffmpeg` / `ffprobe` are on PATH
+
+Everything the page does is a plain HTTP call, so you can also script it:
+
+| Endpoint | What it does |
+|---|---|
+| `GET  /` | the control panel page |
+| `GET  /api/status` | running flag, exit code, stage/clip progress, folder counts, ffmpeg check (`?cfg=1` adds the settings) |
+| `GET  /api/logs?since=<cursor>` | new log lines since the cursor |
+| `GET  /api/list?dir=movies` | files in one of the known folders |
+| `GET  /api/config` / `POST /api/config` | read / write `config.json` (keys masked, other keys preserved) |
+| `POST /api/upload?dir=movies&name=Foo.mp4` | save a file (raw body) |
+| `POST /api/delete` `{"dir":"movies","name":"Foo.mp4"}` | delete a file |
+| `POST /api/generate` / `POST /api/cancel` | start / stop a run |
+| `GET  /media/<dir>/<file>` | stream or download a file |
+
+> The server has **no authentication** — it is meant for `127.0.0.1`. Only use
+> `--host 0.0.0.0` on a network you trust.
+
+### Desktop window (raylib)
 
 The app (`movie_summary_bot.exe`) includes a simple **desktop UI window** (raylib) that lets you:
 
@@ -62,7 +116,7 @@ The app (`movie_summary_bot.exe`) includes a simple **desktop UI window** (rayli
   - `movies_retired\`
   - `output\`
   - `scripts\srt_files\` (subtitles/scripts cache)
-- Start generation with a **START GENERATION** button
+- Start generation with a **START GENERATION** button, and stop it with **STOP**
 - View generation output in an in-app **log panel**, including FFmpeg errors (it is also printed to the console window)
 - The window is **resizable** (the log panel grows with it)
 
@@ -92,6 +146,7 @@ executable and in up to 5 parent folders, then switches to it.
   - `ui.png` — UI screenshot (for README)
   - `app.ico`, `app.rc` — Windows icon + version info embedded into the `.exe`
 - `src\` — C source (see *Source layout* below)
+- `tools\mock_api_server.py` — offline stand-in for the OpenAI + ElevenLabs APIs (testing)
 - `setup.ps1`, `build.bat`, `run.bat` — Windows helper scripts
 
 The runtime folders are created automatically.
@@ -123,22 +178,51 @@ everything into one static `.exe`:
 
 ## Config
 
-Edit `config.json` in the project root:
+Edit `config.json` in the project root (or use the **Settings** card in the web panel):
 
 ```json
 {
   "open_api_key": "YOUR_OPENAI_KEY",
   "elevenlabs_api_key": "YOUR_ELEVENLABS_KEY",
-  "eleven_voice_id": "OPTIONAL_VOICE_ID",
-  "eleven_model_id": "OPTIONAL_MODEL_ID"
+  "eleven_voice_id": "JBFqnCBsd6RMkjVDRZzb",
+  "eleven_model_id": "eleven_multilingual_v2",
+  "openai_model": "gpt-5.2",
+  "openai_base_url": "https://api.openai.com/v1",
+  "elevenlabs_base_url": "https://api.elevenlabs.io/v1",
+  "min_clips": 20,
+  "max_clips": 30,
+  "max_video_speedup": 1.75,
+  "narration_volume": 2.5,
+  "bgm_volume": 0.1,
+  "bgm_enabled": true,
+  "make_vertical": true,
+  "retire_movies": true
 }
 ```
 
+| Key | Default | Meaning |
+|---|---|---|
+| `open_api_key` | — (required) | OpenAI key. The run stops with a clear message while the placeholder is there |
+| `elevenlabs_api_key` | — (required) | ElevenLabs key |
+| `eleven_voice_id` | `JBFqnCBsd6RMkjVDRZzb` | ElevenLabs voice |
+| `eleven_model_id` | `eleven_multilingual_v2` | ElevenLabs TTS model |
+| `openai_model` | `gpt-5.2` | model used for the clip plan |
+| `openai_base_url` | `https://api.openai.com/v1` | swap for a proxy/gateway/mock that speaks the Responses API |
+| `elevenlabs_base_url` | `https://api.elevenlabs.io/v1` | swap for a proxy/mock that speaks `/text-to-speech/<voice>` |
+| `min_clips` / `max_clips` | `20` / `30` | a random clip count in this range is requested per run (1-200) |
+| `max_video_speedup` | `1.75` | cap for the video speed-up when the narration is short |
+| `narration_volume` | `2.5` | narration gain when mixing |
+| `bgm_volume` | `0.1` | background-music gain when mixing |
+| `bgm_enabled` | `true` | set `false` for narration-only output |
+| `make_vertical` | `true` | set `false` to skip the 9:16 render |
+| `retire_movies` | `true` | set `false` to leave processed files in `movies\` |
+
 Notes:
-- `eleven_voice_id` defaults to `JBFqnCBsd6RMkjVDRZzb` if omitted.
-- `eleven_model_id` defaults to `eleven_multilingual_v2` if omitted.
-- Optional (new): `"openai_model"`. Defaults to `gpt-5.2`, the same model the original uses.
-- If the placeholder values (`OpenAIAPI` / `ElevenLabsAPI`) are still there, the app stops with a clear message.
+- Every optional key falls back to the default above when missing, so an old
+  `config.json` keeps working.
+- Numbers are clamped to sane ranges, so a typo cannot produce a 0-second recap.
+- `openai_base_url` / `elevenlabs_base_url` are also how you test offline — see
+  *Testing without API keys* below.
 
 > `config.json` is committed with placeholders only. After you add real keys, run
 > `git update-index --skip-worktree config.json` so you never commit them by accident.
@@ -159,7 +243,8 @@ cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 Outputs:
-- `build\Release\movie_summary_bot.exe` — UI
+- `build\Release\movie_summary_bot.exe` — desktop UI
+- `build\Release\movie_summary_web.exe` — web control panel
 - `build\Release\movie_summary_cli.exe` — CLI
 
 With MinGW: `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build` puts the executables in `build\`.
@@ -168,6 +253,7 @@ With MinGW: `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --
 | Option | Default | Meaning |
 |---|---|---|
 | `BUILD_RAYLIB_UI` | ON | build `movie_summary_bot.exe` |
+| `BUILD_WEB_UI` | ON | build `movie_summary_web.exe` (browser control panel) |
 | `BUILD_CLI_APP` | ON | build `movie_summary_cli.exe` |
 | `BUILD_SIMPLE_UI` | OFF | build the original's older light-theme UI (`src\ui_main.c`) |
 | `BUILD_WINDOWS_GUI` | OFF | build the UI with no console window (logs are still shown in the in-app panel) |
@@ -180,13 +266,16 @@ Use *File → Open → Folder…* on this project. VS detects `CMakeLists.txt` a
 
 ## Usage
 
-1. Put movie files in `movies\`:
+1. Start the control panel: `run.bat web`, then open <http://127.0.0.1:8080>
+2. Paste your OpenAI + ElevenLabs keys into **Settings** and press **SAVE SETTINGS**
+3. Drop your movie into the **Movies** tab (or copy it into `movies\` yourself):
    - Example: `movies\Sinners.mp4`
-2. Start the app: `run.bat` (or double-click the `.exe`)
-3. In the UI:
-   - Use the folder buttons to open `movies\`, `output\`, `scripts\srt_files\`, etc.
-   - Click **START GENERATION** to run.
-   - Watch progress in the in-app **Log** panel.
+4. Click **START GENERATION** and watch the stage / clip progress and the live log
+5. When it finishes, play the recap straight from the **Output** tab
+   (`CANCEL` stops the run at the next step boundary)
+
+Prefer the desktop window? `run.bat` gives you the same start/stop/log with folder
+buttons for `movies\`, `output\`, `scripts\srt_files\`.
 
 Outputs:
 - `output\Sinners.mp4`
@@ -249,13 +338,20 @@ Saved to `tiktok_output\`.
 | Filenames with `'` | broke FFmpeg concat lists | escaped properly |
 | Working directory | had to be started from the project root | finds the project folder automatically |
 | Console | — | UTF-8 console output, app icon + version info |
+| Controlling a run | start only | **web control panel** + desktop **STOP** button: cancel at the next step boundary |
+| Settings | hand-edit `config.json` | clip count, speed cap, volumes, BGM/vertical/retire toggles and API base URLs are read from `config.json` and editable in the web panel |
+| Network errors | any transport failure (DNS/TLS/timeout) aborted the whole run with `exit(1)` | logged as a warning; the movie is skipped and the rest of the queue continues |
+| URLs | raw titles pasted into subtitle/script URLs | percent-encoded, so `Amélie's Test (2001)` works |
+| Testing | needs real API keys | `tools\mock_api_server.py` + the base-URL settings run the whole pipeline offline |
 
 The pipeline logic itself is unchanged: prompt, clip counts (20–30), durations, speed cap, FFmpeg filters,
 BGM mixing and vertical crop all match the original.
 
 ### Source layout
-- `src\generator.c/.h` — the pipeline (subtitles → OpenAI → ElevenLabs → FFmpeg)
+- `src\generator.c/.h` — the pipeline (subtitles → OpenAI → ElevenLabs → FFmpeg),
+  plus the progress hook and the cancel flag the UIs use
 - `src\platform.c/.h` — Windows layer (UTF-8 file system, processes, threads, Explorer), plus a POSIX fallback
+- `src\web_ui.c` — web control panel: HTTP server + embedded page (`movie_summary_web`)
 - `src\main.c` — raylib UI (`movie_summary_bot`)
 - `src\cli.c` — CLI (`movie_summary_cli`)
 - `src\ui_main.c` — the original's older simple UI (optional)
@@ -283,6 +379,27 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
 - Build errors about downloads → the first build needs internet access to download raylib, curl, cJSON and miniz.
 
 ---
+
+## Testing without API keys
+
+You can run the **entire** pipeline — plan, narration, clipping, concat, background
+music, vertical render — without spending a cent, using the bundled mock API server:
+
+```bash
+# 1. start the fake OpenAI + ElevenLabs endpoints
+python tools/mock_api_server.py --openai-port 9100 --eleven-port 9101
+```
+
+Then point `config.json` (or the Settings card) at them and start a run as usual:
+
+```json
+"openai_base_url":     "http://127.0.0.1:9100/v1",
+"elevenlabs_base_url": "http://127.0.0.1:9101/v1"
+```
+
+The mock derives its clip timestamps from the subtitle text it is handed and returns
+real MP3 tones of varying length, so the speed cap, the BGM builder and the FFmpeg
+filters all get exercised. FFmpeg is still required.
 
 ## Legal
 

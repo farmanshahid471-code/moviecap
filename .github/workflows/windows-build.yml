@@ -40,12 +40,52 @@ jobs:
           if (-not (Select-String -Path smoke.log -Pattern "Processing: Amélie's Test \(2001\)" -Quiet)) { throw "unicode movie was not picked up" }
           if (-not (Select-String -Path smoke.log -Pattern "All done" -Quiet)) { throw "run did not finish" }
 
+      - name: Smoke test the web control panel
+        shell: pwsh
+        run: |
+          Copy-Item build\Release\movie_summary_web.exe smoke\
+          $p = Start-Process -FilePath "smoke\movie_summary_web.exe" `
+                 -ArgumentList "--host","127.0.0.1","--port","8123" `
+                 -WorkingDirectory smoke -PassThru -WindowStyle Hidden
+          try {
+            $s = $null
+            for ($i = 0; $i -lt 40; $i++) {
+              Start-Sleep -Milliseconds 500
+              try { $s = Invoke-RestMethod "http://127.0.0.1:8123/api/status"; break } catch {}
+            }
+            if (-not $s) { throw "web UI never answered on /api/status" }
+            if (-not $s.ffmpeg) { throw "web UI reports ffmpeg as missing" }
+
+            $page = Invoke-WebRequest "http://127.0.0.1:8123/" -UseBasicParsing
+            if ($page.StatusCode -ne 200 -or $page.Content -notmatch "START GENERATION") {
+              throw "control panel page is missing or incomplete"
+            }
+
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8123/api/config" `
+              -ContentType "application/json" `
+              -Body '{"open_api_key":"sk-fake","elevenlabs_api_key":"el-fake","min_clips":3}' | Out-Null
+            $cfg = Invoke-RestMethod "http://127.0.0.1:8123/api/config"
+            if ($cfg.min_clips -ne 3) { throw "config write did not stick" }
+            if (-not $cfg.openai_key_set) { throw "API key was not saved" }
+
+            Set-Content -Path smoke\hello.srt -Value "1`n00:00:01,000 --> 00:00:02,000`nhi"
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8123/api/upload?dir=srt&name=hello.srt" `
+              -InFile smoke\hello.srt -ContentType "text/plain" | Out-Null
+            $list = Invoke-RestMethod "http://127.0.0.1:8123/api/list?dir=srt"
+            if (-not ($list.files | Where-Object { $_.name -eq "hello.srt" })) { throw "upload failed" }
+
+            $logs = Invoke-RestMethod "http://127.0.0.1:8123/api/logs?since=0"
+            Write-Host "web UI smoke test OK ($($logs.lines.Count) log lines buffered)"
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Package
         shell: pwsh
         run: |
           $pkg = "AI-Movie-Shorts-Windows"
           New-Item -ItemType Directory -Force $pkg | Out-Null
-          Copy-Item build\Release\movie_summary_bot.exe, build\Release\movie_summary_cli.exe $pkg\
+          Copy-Item build\Release\movie_summary_bot.exe, build\Release\movie_summary_cli.exe, build\Release\movie_summary_web.exe $pkg\
           Copy-Item -Recurse resources, backgroundmusic $pkg\
           Copy-Item config.json, README.md, run.bat, setup.ps1 $pkg\
           Compress-Archive -Path $pkg\* -DestinationPath "$pkg.zip" -Force
