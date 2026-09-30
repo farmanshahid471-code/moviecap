@@ -130,6 +130,28 @@ jobs:
           if ($rc -ne 0 -or -not $hit) { exit 1 }
           Write-Host "run.bat OK"
 
+      - name: Test run.bat with no F: drive (falls back to the app folder)
+        shell: pwsh
+        run: |
+          # The runner has no F:, which is exactly the fallback case: the tools
+          # must land in <app>\tools and run.bat must still find them.
+          $env:Path = "C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0"
+          $env:MOVIECAP_TOOLS = "Z:\definitely-not-here\tools"
+          if (Test-Path "tools\ffmpeg\bin") { Remove-Item -Recurse -Force "tools\ffmpeg" }
+
+          & cmd /c "run.bat setup" *> runbat2.log
+          $rc = $LASTEXITCODE
+          Get-Content runbat2.log | ForEach-Object { Write-Host "::notice title=runbat2.log:: $_" }
+          Write-Host "run.bat setup exit code: $rc"
+          if ($rc -ne 0) { Write-Host "::error title=run.bat::the no-F: fallback exited with code $rc" }
+          if (-not (Test-Path "tools\ffmpeg\bin\ffmpeg.exe")) {
+            Write-Host "::error title=run.bat::nothing was installed into the app folder"
+          }
+          $hit = Select-String -Path runbat2.log -Pattern "Using the portable FFmpeg" -Quiet
+          if (-not $hit) { Write-Host "::error title=run.bat::run.bat did not find the fallback copy" }
+          if ($rc -ne 0 -or -not $hit -or -not (Test-Path "tools\ffmpeg\bin\ffmpeg.exe")) { exit 1 }
+          Write-Host "no-F: fallback OK"
+
       - name: Smoke test the web control panel
         shell: pwsh
         run: |
