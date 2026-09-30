@@ -93,6 +93,14 @@ if errorlevel 1 (
 )
 
 REM The installer falls back to <app folder>\tools when F: is not available.
-if exist "%FFBIN%\ffmpeg.exe" exit /b 0
-if exist "%~dp0tools\ffmpeg\bin\ffmpeg.exe" set "FFBIN=%~dp0tools\ffmpeg\bin"
-exit /b 0
+if exist "%FFBIN%\ffmpeg.exe" (
+  echo [OK] FFmpeg installed in %FFBIN%
+  exit /b 0
+)
+if exist "%~dp0tools\ffmpeg\bin\ffmpeg.exe" (
+  set "FFBIN=%~dp0tools\ffmpeg\bin"
+  echo [OK] FFmpeg installed in %~dp0tools\ffmpeg\bin
+  exit /b 0
+)
+echo [ERROR] The installer finished but no ffmpeg.exe was found afterwards.
+exit /b 1
