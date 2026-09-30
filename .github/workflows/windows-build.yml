@@ -15,8 +15,23 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build (MSVC, via build.bat)
-        shell: cmd
-        run: build.bat
+        shell: pwsh
+        run: |
+          cmd /c "build.bat > build.log 2>&1"
+          $code = $LASTEXITCODE
+          Get-Content build.log -Tail 150
+          if ($code -ne 0) {
+            # Surface the compiler errors in the job summary, where they can be
+            # read without downloading the raw logs.
+            $fence = '```'
+            Add-Content $env:GITHUB_STEP_SUMMARY "### MSVC build failed (exit $code)"
+            Add-Content $env:GITHUB_STEP_SUMMARY $fence
+            Select-String -Path build.log -Pattern 'error|LINK|fatal' |
+              Select-Object -First 80 |
+              ForEach-Object { Add-Content $env:GITHUB_STEP_SUMMARY $_.Line }
+            Add-Content $env:GITHUB_STEP_SUMMARY $fence
+            exit $code
+          }
 
       - name: Install FFmpeg for smoke test
         shell: pwsh
