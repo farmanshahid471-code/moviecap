@@ -1856,30 +1856,74 @@ static bool caption_font_available(void) {
   return cached == 1;
 }
 
-/* Prepare caption text for a single-quoted drawtext text='...' value.
- * Inside single quotes the filtergraph takes EVERYTHING literally except a
- * raw apostrophe, and the ffmpeg argv splitter chokes on double quotes and
- * backslashes inside our outer double-quoted argument.  So the content must
- * contain none of ' " \ : everything else (spaces, : , [ ] %, newlines) is
- * safe verbatim.  Apostrophes become a typographic apostrophe. */
-static char *caption_prepare(const char *text) {
+/* Build a chain of up to three stacked drawtext filters for the caption.
+ * Each text='...' section is single-quoted; inside single quotes the
+ * filtergraph takes everything literally except a raw apostrophe, and the
+ * ffmpeg argv splitter chokes on double quotes and backslashes inside our
+ * outer double-quoted argument.  So the content keeps none of ' " \, and
+ * instead of newline characters (which break the graph too) every wrapped
+ * line gets its own drawtext filter. */
+static char *caption_filter_chain(const char *text) {
   if (!text || !text[0]) return NULL;
+
   size_t cap = strlen(text) * 3 + 8;
-  char *out = (char *)malloc(cap);
-  if (!out) die("OOM");
+  char *clean = (char *)malloc(cap);
+  if (!clean) die("OOM");
   size_t o = 0;
-  int line_len = 0;
-  for (const char *t = text; *t && o + 6 < cap; t++) {
+  for (const char *t = text; *t && o + 5 < cap; t++) {
     char c = *t;
-    if (c == '\'') { out[o++] = (char)0xE2; out[o++] = (char)0x80; out[o++] = (char)0x99; line_len++; continue; }
-    if (c == '"' || c == '\\') { out[o++] = ' '; line_len++; continue; }
-    if (c == '\n' || c == '\r') { out[o++] = '\n'; line_len = 0; continue; }
-    if (line_len >= 45 && c == ' ') { out[o++] = '\n'; line_len = 0; continue; }
-    out[o++] = c;
-    line_len++;
+    if (c == '\'') { clean[o++] = (char)0xE2; clean[o++] = (char)0x80; clean[o++] = (char)0x99; continue; }
+    if (c == '"' || c == '\\' || c == '\n' || c == '\r') { clean[o++] = ' '; continue; }
+    clean[o++] = c;
   }
-  out[o] = '\0';
-  return out;
+  clean[o] = '\0';
+
+  char lines[3][64];
+  int nl = 0;
+  char *p = clean;
+  while (*p == ' ') p++;
+  while (*p && nl < 3) {
+    size_t l = strlen(p);
+    while (l && p[l - 1] == ' ') p[--l] = '\0';
+    if (l == 0) break;
+    if (l <= 45) {
+      memcpy(lines[nl], p, l + 1);
+      nl++;
+      break;
+    }
+    size_t cut = 45;
+    while (cut > 20 && p[cut] != ' ') cut--;
+    if (cut <= 20) cut = 45;
+    memcpy(lines[nl], p, cut);
+    lines[nl][cut] = '\0';
+    nl++;
+    p += cut;
+    while (*p == ' ') p++;
+  }
+  free(clean);
+  if (nl == 0) return NULL;
+
+  if (*p) {
+    size_t l = strlen(lines[nl - 1]);
+    if (l > 41) { l = 41; lines[nl - 1][l] = '\0'; }
+    memcpy(lines[nl - 1] + l, "...", 4);
+  }
+
+  char *chain = (char *)malloc(1600);
+  if (!chain) die("OOM");
+  chain[0] = '\0';
+  size_t off = 0;
+  for (int i = 0; i < nl; i++) {
+    int k = (nl - 1) - i;
+    int w = snprintf(chain + off, 1600 - off,
+                     ",drawtext=fontfile='resources/Inter-Regular.ttf':expansion=none:"
+                     "text='%s':fontcolor=white:borderw=2:bordercolor=black:"
+                     "fontsize=h*0.035:x=(w-text_w)/2:y=h-h*0.07-th-%d*h*0.045",
+                     lines[i], k);
+    if (w < 0 || (size_t)w >= 1600 - off) break;
+    off += (size_t)w;
+  }
+  return chain;
 }
 
 static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
@@ -1938,7 +1982,7 @@ static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
 
   char *cap_esc = NULL;
   if (cfg->captions && caption && caption[0] && caption_font_available())
-    cap_esc = caption_prepare(caption);
+    cap_esc = caption_filter_chain(caption);
 
   int rc;
   if (cap_esc) {
@@ -1946,7 +1990,7 @@ static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
       "ffmpeg -y -hide_banner -loglevel error "
       "-ss %d -to %d -i %s "
       "-i %s "
-      "-filter_complex \"[0:v]setpts=PTS/%.10f,drawtext=fontfile='resources/Inter-Regular.ttf':expansion=none:text='%s':fontcolor=white:borderw=2:bordercolor=black:fontsize=h*0.035:x=(w-text_w)/2:y=h-th-h*0.06[v]\" "
+      "-filter_complex \"[0:v]setpts=PTS/%.10f%s[v]\" "
       "-map \"[v]\" -map 1:a "
       "-c:v libx264 -pix_fmt yuv420p -preset veryfast -crf 22 "
       "-c:a aac -b:a 192k "
