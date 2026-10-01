@@ -307,6 +307,29 @@ jobs:
           }
           Write-Host "Piper end to end OK"
 
+          # Full FREE generation, exactly the user scenario: Piper selected, no
+          # server running, no working OpenAI key. The app must auto-start the
+          # Piper server it just installed, and the fallback subtitles plus the
+          # local planner must carry the run all the way to a finished video.
+          $free = Join-Path (Get-Location) "pfree"
+          New-Item -ItemType Directory -Force "$free\movies" | Out-Null
+          Copy-Item build\Release\movie_summary_cli.exe $free\
+          '{"open_api_key":"sk-fake","tts_provider":"piper","min_clips":3,"max_clips":4}' | Set-Content "$free\config.json"
+          & "C:\ProgramData\chocolatey\bin\ffmpeg.exe" -hide_banner -loglevel error -f lavfi `            -i testsrc=size=640x360:duration=60 -c:v libx264 "$free\movies\Free Run (2026).mp4"
+          $env:Path = "C:\ProgramData\chocolatey\bin;C:\Windows\System32;C:\Windows"
+          Push-Location $free
+          .\movie_summary_cli.exe 2>&1 | Tee-Object -FilePath ..\pfree.log
+          $rc = $LASTEXITCODE
+          Pop-Location
+          Get-Content pfree.log | ForEach-Object { Write-Host "::notice title=pfree:: $_" }
+          Write-Host "pfree exit code: $rc"
+          if ($rc -ne 0) { Write-Host "::error title=pfree::cli exited $rc"; exit 1 }
+          if (-not (Select-String -Path pfree.log -Pattern "Piper server started automatically" -Quiet)) {
+            Write-Host "::error title=pfree::the app did not auto-start the Piper server"; exit 1 }
+          if (-not (Select-String -Path pfree.log -Pattern "Processed: 1" -Quiet)) {
+            Write-Host "::error title=pfree::the free keyless generation did not finish"; exit 1 }
+          Write-Host "free keyless generation OK (auto-started Piper, fallback SRT, local plan)"
+
       - name: "Test run.bat web brings the control panel up"
         shell: pwsh
         run: |
