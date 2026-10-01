@@ -41,6 +41,8 @@ run.bat tts
 Installs the free **Piper** engine (private Python + voice, all under
 `F:\AI-Movie-Shorts\tools\piper`) and starts it on <http://127.0.0.1:5000>.
 Then set *Narration engine* → **Piper** in the panel. No API key, no `C:` usage.
+A bare `run.bat` installs Piper too, and when you press **Generate** the app
+starts the Piper server by itself if it is not already running.
 
 **Building from source:**
 

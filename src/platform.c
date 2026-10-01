@@ -774,3 +774,60 @@ void plat_mutex_lock(PlatMutex *m)   { if (m) pthread_mutex_lock(&m->m); }
 void plat_mutex_unlock(PlatMutex *m) { if (m) pthread_mutex_unlock(&m->m); }
 
 #endif
+
+/* ======================================================================== */
+/*  sleep + detached spawn, both platforms                                   */
+/* ======================================================================== */
+#if defined(_WIN32)
+
+void plat_sleep_ms(int ms) {
+  Sleep(ms < 0 ? 0 : (DWORD)ms);
+}
+
+bool plat_spawn_detached(const char *cmdline) {
+  if (!cmdline || !cmdline[0]) return false;
+  wchar_t *wcmd = u8_to_w(cmdline);
+  if (!wcmd) return false;
+
+  STARTUPINFOW si;
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&pi, sizeof(pi));
+
+  BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, FALSE,
+                           CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT,
+                           NULL, NULL, &si, &pi);
+  free(wcmd);
+  if (!ok) return false;
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  return true;
+}
+
+#else
+
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+
+void plat_sleep_ms(int ms) {
+  if (ms <= 0) return;
+  usleep((useconds_t)ms * 1000u);
+}
+
+bool plat_spawn_detached(const char *cmdline) {
+  if (!cmdline || !cmdline[0]) return false;
+  pid_t pid = fork();
+  if (pid < 0) return false;
+  if (pid == 0) {
+    setsid();
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) { dup2(devnull, 0); dup2(devnull, 1); dup2(devnull, 2); close(devnull); }
+    execl("/bin/sh", "sh", "-c", cmdline, (char *)NULL);
+    _exit(127);
+  }
+  return true;
+}
+
+#endif

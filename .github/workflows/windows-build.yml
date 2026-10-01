@@ -152,6 +152,10 @@ jobs:
           if ($rc -ne 0 -or -not $hit) { exit 1 }
           Write-Host "run.bat OK"
 
+          # A placeholder voice file keeps the bare run from re-downloading Piper in CI.
+          New-Item -ItemType Directory -Force "ci-tools\piper\voices" | Out-Null
+          Set-Content "ci-tools\piper\voices\en_US-lessac-medium.onnx" "placeholder"
+
           # Bare double-click: must confirm the tools and start no exe at all.
           & cmd /c "run.bat" *> runbat-bare.log
           $rcb = $LASTEXITCODE
@@ -259,6 +263,7 @@ jobs:
           $env:Path = "C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0"
           $tools = Join-Path (Get-Location) "ci-tools"
           $env:MOVIECAP_TOOLS = $tools
+          Remove-Item -Recurse -Force (Join-Path $tools "piper") -ErrorAction SilentlyContinue
 
           & cmd /c "run.bat tts install" *> piper-install.log
           $rc = $LASTEXITCODE

@@ -1729,6 +1729,84 @@ static bool tts_openai_compat(const Config *cfg, const char *text, const char *o
   return ok;
 }
 
+/* ---------------------------------------------------------------------------
+ * Piper auto-start: when the narration engine is Piper but nothing is
+ * listening on its port, launch the already-installed portable server so a
+ * second window is no longer needed.
+ * ------------------------------------------------------------------------ */
+static bool piper_server_reachable(const char *base_url) {
+  char url[1200];
+  snprintf(url, sizeof(url), "%s/info", base_url);
+  long code = 0;
+  MemBuf m = http_get_to_mem_ex(url, &code);
+  bool ok = (m.data != NULL) && code >= 200 && code < 300;
+  free(m.data);
+  return ok;
+}
+
+static void piper_ensure_server(const Config *cfg) {
+  if (cfg->tts_provider != TTS_PIPER) return;
+  const char *base = cfg->tts_base_url;
+  if (!base || !base[0]) base = "http://127.0.0.1:5000";
+  if (piper_server_reachable(base)) return;
+
+  logi("Piper server not reachable at %s - trying to start the installed one...", base);
+
+  int port = 5000;
+  const char *colon = strrchr(base, ':');
+  if (colon) {
+    int pv = atoi(colon + 1);
+    if (pv > 0) port = pv;
+  }
+
+  const char *voice = getenv("PIPER_VOICE");
+  if (!voice || !voice[0]) voice = "en_US-lessac-medium";
+
+  char cwd[PATH_MAX] = "";
+  plat_getcwd(cwd, sizeof(cwd));
+  const char *envtools = getenv("MOVIECAP_TOOLS");
+
+  char roots[3][PATH_MAX];
+  int nroots = 0;
+  if (envtools && envtools[0]) snprintf(roots[nroots++], sizeof(roots[0]), "%s", envtools);
+  snprintf(roots[nroots++], sizeof(roots[0]), "F:/AI-Movie-Shorts/tools");
+  if (cwd[0]) snprintf(roots[nroots++], sizeof(roots[0]), "%s/tools", cwd);
+
+  char py[PATH_MAX], voices[PATH_MAX], onnx[PATH_MAX];
+  bool found = false;
+  for (int i = 0; i < nroots && !found; i++) {
+    snprintf(py, sizeof(py), "%s/piper/python/python.exe", roots[i]);
+    snprintf(voices, sizeof(voices), "%s/piper/voices", roots[i]);
+    snprintf(onnx, sizeof(onnx), "%s/%s.onnx", voices, voice);
+    if (file_exists(py) && file_exists(onnx)) found = true;
+  }
+
+  if (!found) {
+    logw("Piper is not installed yet. Double-click run.bat once (it downloads Piper),");
+    logw("or run \"run.bat tts\" in a second window, then press Generate again.");
+    return;
+  }
+
+  char cmd[PATH_MAX * 2 + 256];
+  snprintf(cmd, sizeof(cmd),
+           "\"%s\" -m piper.http_server --host 127.0.0.1 --port %d -m %s --data-dir \"%s\"",
+           py, port, voice, voices);
+  if (!plat_spawn_detached(cmd)) {
+    logw("Could not start the Piper server automatically. Run \"run.bat tts\" in a second window.");
+    return;
+  }
+
+  for (int i = 0; i < 60; i++) {
+    plat_sleep_ms(500);
+    if (piper_server_reachable(base)) {
+      logok("Piper server started automatically at %s", base);
+      return;
+    }
+  }
+  logw("Piper server was started but is not answering at %s yet.", base);
+  logw("If TTS keeps failing, run \"run.bat tts\" in a second window to see its output.");
+}
+
 /* Single entry point used by the pipeline. */
 static bool tts_synthesize(const Config *cfg, const char *text, const char *out_mp3_path) {
   switch (cfg->tts_provider) {
@@ -2648,6 +2726,8 @@ int run_generation(void) {
   else
     logi("Narration engine: OpenAI-compatible %s/audio/speech (model %s)",
          cfg.tts_base_url, cfg.tts_model);
+
+  piper_ensure_server(&cfg);
 
   ensure_dir("movies");
   ensure_dir("output");

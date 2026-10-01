@@ -2,8 +2,9 @@
 REM ==========================================================================
 REM  AI-Movie-Shorts (Windows)
 REM
-REM    run.bat              -> download + check every required tool, then stop.
-REM                            You open the app yourself afterwards.
+REM    run.bat              -> download + check every required tool (FFmpeg and
+REM                            the free Piper voice), then stop. You open the
+REM                            app yourself afterwards.
 REM    run.bat web          -> browser control panel (http://127.0.0.1:8080)
 REM    run.bat cli          -> headless (console only) generation
 REM    run.bat setup        -> install/check FFmpeg only, do not start the app
@@ -34,6 +35,12 @@ if not defined MOVIECAP_TOOLS set "MOVIECAP_TOOLS=F:\AI-Movie-Shorts\tools"
 call :resolve_tools
 set "FFBIN=%TOOLSDIR%\ffmpeg\bin"
 
+if not defined PIPER_VOICE set "PIPER_VOICE=en_US-lessac-medium"
+if not defined PIPER_PORT  set "PIPER_PORT=5000"
+set "PIPERDIR=%TOOLSDIR%\piper"
+set "PIPERPY=%PIPERDIR%\python\python.exe"
+set "PIPERVOICES=%PIPERDIR%\voices"
+
 if /i "%~1"=="tts" goto :tts
 
 call :ensure_tools
@@ -55,7 +62,7 @@ exit /b 1
 
 :tools_ready
 if /i "%~1"=="setup" goto :confirm
-if /i "%~1"==""     goto :confirm
+if /i "%~1"==""     goto :bare
 if /i "%~1"=="web"  goto :launch
 if /i "%~1"=="cli"  goto :launch
 echo.
@@ -65,14 +72,25 @@ if not defined CI pause
 exit /b 1
 
 REM --------------------------------------------------------------------------
-REM  A bare double-click (and "setup") only installs and checks the tools,
+REM  A bare double-click installs and checks the tools (FFmpeg + Piper),
 REM  prints the confirmation below and stops. You open the app yourself.
+:bare
+call :piper_install
+if errorlevel 1 echo [WARN] Piper could not be installed now - run "run.bat tts" later to retry.
+goto :confirm
+
 :confirm
 echo.
 echo ============================================================
 echo  [OK] Everything the app needs is downloaded and installed.
 echo.
 echo   FFmpeg : "%FFBIN%"
+if exist "%PIPERPY%" goto :confirm_piper
+echo   Piper  : not installed yet - double-click run.bat once more to add it
+goto :confirm_piper_done
+:confirm_piper
+echo   Piper  : ready in "%PIPERDIR%"
+:confirm_piper_done
 echo.
 echo  run.bat does not start the app on its own any more.
 echo  Open it yourself from this folder:
@@ -115,23 +133,22 @@ if not defined CI pause
 exit /b 1
 
 REM --------------------------------------------------------------------------
-REM  Free narration: install (once) and then run the Piper HTTP server.
-:tts
-if not defined PIPER_VOICE set "PIPER_VOICE=en_US-lessac-medium"
-if not defined PIPER_PORT  set "PIPER_PORT=5000"
-set "PIPERDIR=%TOOLSDIR%\piper"
-set "PIPERPY=%PIPERDIR%\python\python.exe"
-set "PIPERVOICES=%PIPERDIR%\voices"
-
-if exist "%PIPERVOICES%\%PIPER_VOICE%.onnx" goto :tts_ready
-
+REM  Free narration: install (once) with the Piper HTTP server.
+:piper_install
+if exist "%PIPERVOICES%\%PIPER_VOICE%.onnx" exit /b 0
 echo.
-echo [..] Piper is not installed yet - downloading it now.
+echo [..] Piper (free narration) is not installed yet - downloading it now.
 echo     Everything goes into "%PIPERDIR%"
 echo     Nothing is installed on C: and no admin rights are needed.
 echo     This is about 100 MB and can take a few minutes.
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install_piper.ps1" -ToolsDir "%TOOLSDIR%" -Voice "%PIPER_VOICE%"
+if errorlevel 1 exit /b 1
+if exist "%PIPERVOICES%\%PIPER_VOICE%.onnx" exit /b 0
+exit /b 1
+
+:tts
+call :piper_install
 if not errorlevel 1 goto :tts_ready
 echo.
 echo [ERROR] Piper could not be installed. Check your internet connection

@@ -70,6 +70,9 @@ char *plat_capture(const char *cmdline);
 /* True if `exe` (e.g. "ffmpeg") can be started from PATH. */
 bool plat_have_tool(const char *exe);
 
+void plat_sleep_ms(int ms);
+bool plat_spawn_detached(const char *cmdline); /* fire-and-forget child, no console */
+
 /* ---------- shell ---------- */
 void plat_open_folder(const char *path); /* Explorer / Finder / xdg-open */
 
