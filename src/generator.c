@@ -1856,24 +1856,25 @@ static bool caption_font_available(void) {
   return cached == 1;
 }
 
-/* Prepare caption text for an UNQUOTED drawtext text= value.
- * Two parsers see this string: the ffmpeg argv splitter (double quotes) and
- * the filtergraph tokenizer (backslash escapes, no quotes here).  So: drop
- * double quotes entirely, and backslash-escape every character the filter
- * level treats as special. */
+/* Prepare caption text for a single-quoted drawtext text='...' value.
+ * Inside single quotes the filtergraph takes EVERYTHING literally except a
+ * raw apostrophe, and the ffmpeg argv splitter chokes on double quotes and
+ * backslashes inside our outer double-quoted argument.  So the content must
+ * contain none of ' " \ : everything else (spaces, : , [ ] %, newlines) is
+ * safe verbatim.  Apostrophes become a typographic apostrophe. */
 static char *caption_prepare(const char *text) {
   if (!text || !text[0]) return NULL;
-  size_t cap = strlen(text) * 2 + 8;
+  size_t cap = strlen(text) * 3 + 8;
   char *out = (char *)malloc(cap);
   if (!out) die("OOM");
   size_t o = 0;
   int line_len = 0;
-  for (const char *t = text; *t && o + 4 < cap; t++) {
+  for (const char *t = text; *t && o + 6 < cap; t++) {
     char c = *t;
-    if (c == '"') { out[o++] = ' '; line_len++; continue; }
+    if (c == '\'') { out[o++] = (char)0xE2; out[o++] = (char)0x80; out[o++] = (char)0x99; line_len++; continue; }
+    if (c == '"' || c == '\\') { out[o++] = ' '; line_len++; continue; }
     if (c == '\n' || c == '\r') { out[o++] = '\n'; line_len = 0; continue; }
     if (line_len >= 45 && c == ' ') { out[o++] = '\n'; line_len = 0; continue; }
-    if (strchr("\\':,;[]", c)) out[o++] = '\\';
     out[o++] = c;
     line_len++;
   }
@@ -1945,7 +1946,7 @@ static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
       "ffmpeg -y -hide_banner -loglevel error "
       "-ss %d -to %d -i %s "
       "-i %s "
-      "-filter_complex \"[0:v]setpts=PTS/%.10f,drawtext=fontfile='resources/Inter-Regular.ttf':expansion=none:text=%s:fontcolor=white:borderw=2:bordercolor=black:fontsize=h*0.035:x=(w-text_w)/2:y=h-th-h*0.06[v]\" "
+      "-filter_complex \"[0:v]setpts=PTS/%.10f,drawtext=fontfile='resources/Inter-Regular.ttf':expansion=none:text='%s':fontcolor=white:borderw=2:bordercolor=black:fontsize=h*0.035:x=(w-text_w)/2:y=h-th-h*0.06[v]\" "
       "-map \"[v]\" -map 1:a "
       "-c:v libx264 -pix_fmt yuv420p -preset veryfast -crf 22 "
       "-c:a aac -b:a 192k "
