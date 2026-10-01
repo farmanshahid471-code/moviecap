@@ -336,12 +336,15 @@ jobs:
           .\movie_summary_cli.exe 2>&1 | Tee-Object -FilePath ..\pfree.log
           $rc = $LASTEXITCODE
           Pop-Location
-          Get-Content pfree.log | ForEach-Object { Write-Host "::notice title=pfree:: $_" }
+          Get-Content pfree.log -Tail 25 | ForEach-Object { Write-Host "::notice title=pfree:: $_" }
           Write-Host "pfree exit code: $rc"
-          if ($rc -ne 0) { Write-Host "::error title=pfree::cli exited $rc"; exit 1 }
+          if ($rc -ne 0) {
+            Get-Content pfree.log -Tail 30 | ForEach-Object { Write-Host "::error title=pfree-fail::$_" }
+            Write-Host "::error title=pfree::cli exited $rc"; exit 1 }
           if (-not (Select-String -Path pfree.log -Pattern "Piper server started automatically" -Quiet)) {
             Write-Host "::error title=pfree::the app did not auto-start the Piper server"; exit 1 }
           if (-not (Select-String -Path pfree.log -Pattern "Processed: 1" -Quiet)) {
+            Get-Content pfree.log -Tail 30 | ForEach-Object { Write-Host "::error title=pfree-fail::$_" }
             Write-Host "::error title=pfree::the free keyless generation did not finish"; exit 1 }
           if (-not (Select-String -Path pfree.log -Pattern "Target recap length" -Quiet)) {
             Write-Host "::error title=pfree::recap_minutes target was not applied"; exit 1 }
