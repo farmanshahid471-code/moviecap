@@ -467,6 +467,8 @@ typedef struct {
   int    min_clips;          /* default 20   */
   int    max_clips;          /* default 30   */
   double max_video_speedup;  /* default 1.75 */
+  double recap_minutes;     /* target recap length in minutes; 0 = auto */
+  bool   captions;          /* burn small subtitles into clips; default true */
   double narration_volume;   /* default 2.5  */
   double bgm_volume;         /* default 0.1  */
   bool   bgm_enabled;        /* default true */
@@ -573,6 +575,8 @@ static Config load_config_json(const char *path) {
   c.min_clips         = cfg_get_int(cJSON_GetObjectItemCaseSensitive(root, "min_clips"), MIN_NUM_CLIPS, 1, 200);
   c.max_clips         = cfg_get_int(cJSON_GetObjectItemCaseSensitive(root, "max_clips"), MAX_NUM_CLIPS, 1, 200);
   c.max_video_speedup = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "max_video_speedup"), MAX_VIDEO_SPEEDUP, 1.0, 8.0);
+  c.recap_minutes     = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "recap_minutes"), 0, 0, 180);
+  c.captions          = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "captions"), true);
   c.narration_volume  = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "narration_volume"), 2.5, 0.0, 10.0);
   c.bgm_volume        = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "bgm_volume"), 0.1, 0.0, 10.0);
   c.bgm_enabled       = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "bgm_enabled"), true);
@@ -1429,6 +1433,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
                                      const char *subs_seconds_text,
                                      const char *optional_script_text,
                                      int num_clips,
+                                     int per_clip_sec,
                                      bool *out_retry_without_script) {
   if (out_retry_without_script) *out_retry_without_script = false;
 
@@ -1445,6 +1450,29 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   free(subs_utf8);
   free(scr_utf8);
 
+  char range_line[220], words_line[220];
+  if (per_clip_sec >= 20) {
+    int lo  = per_clip_sec * 8 / 10;
+    int hi  = per_clip_sec * 12 / 10;
+    int wlo = per_clip_sec * 2;
+    int whi = per_clip_sec * 5 / 2;
+    int slo = per_clip_sec / 12;
+    int shi = per_clip_sec / 8;
+    if (slo < 3) slo = 3;
+    if (shi < slo + 2) shi = slo + 2;
+    snprintf(range_line, sizeof(range_line),
+             "Each time range should usually be %d-%d seconds long (end-start). "
+             "Do not go below %d seconds.", lo, hi, lo > 8 ? lo - 4 : 8);
+    snprintf(words_line, sizeof(words_line),
+             "Keep each narration about %d-%d words, in %d-%d sentences, so the "
+             "spoken audio fills the whole range.", wlo, whi, slo, shi);
+  } else {
+    snprintf(range_line, sizeof(range_line),
+             "Each time range should usually be 8-16 seconds long (end-start). Avoid >20 seconds.");
+    snprintf(words_line, sizeof(words_line),
+             "Keep narrations punchy but not tiny: about 20-35 words total, in 3-5 short sentences.");
+  }
+
   const char *prompt_fmt =
     "You are given TWO inputs.\n"
     "Movie: %s\n"
@@ -1458,8 +1486,8 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "TASK:\n"
     "- Choose %d non-overlapping time ranges that best cover the full plot arc.\n"
     "- ONLY use INPUT A for selecting start/end times (seconds). INPUT B is for story context.\n"
-    "- Each time range should usually be 8-16 seconds long (end-start). Avoid >20 seconds.\n"
-    "- Keep narrations punchy but not tiny: about 20-35 words total, in 3-5 short sentences.\n"
+    "- %s\n"
+    "- %s\n"
     "- Prefer ranges with clear visual action (reveals, confrontations, entrances, big moments).\n"
     "- Skip any range that starts at 0.\n"
     "- Return STRICT JSON with this shape ONLY:\n"
@@ -1468,11 +1496,13 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "- Each narration must be at least 3 full sentences, casual commentator vibe.\n"
     "- The first narration must start with: \"Here we go, let's go over the movie %s.\".\n";
 
-  int plen = snprintf(NULL, 0, prompt_fmt, title_utf8, subs_trim, scr_trim, num_clips, title_utf8);
+  int plen = snprintf(NULL, 0, prompt_fmt, title_utf8, subs_trim, scr_trim, num_clips,
+                      range_line, words_line, title_utf8);
   if (plen < 0) die("snprintf failed building prompt");
   char *prompt = (char *)malloc((size_t)plen + 1);
   if (!prompt) die("OOM");
-  snprintf(prompt, (size_t)plen + 1, prompt_fmt, title_utf8, subs_trim, scr_trim, num_clips, title_utf8);
+  snprintf(prompt, (size_t)plen + 1, prompt_fmt, title_utf8, subs_trim, scr_trim, num_clips,
+           range_line, words_line, title_utf8);
 
   free(title_utf8);
   free(subs_trim);
@@ -1817,10 +1847,39 @@ static bool tts_synthesize(const Config *cfg, const char *text, const char *out_
   }
 }
 
+/* ---------------------------------------------------------------------------
+ * Burnt-in subtitles: small, centred near the bottom of the frame.
+ * ------------------------------------------------------------------------ */
+static bool caption_font_available(void) {
+  static int cached = -1;
+  if (cached < 0) cached = file_exists("resources/Inter-Regular.ttf") ? 1 : 0;
+  return cached == 1;
+}
+
+/* Escape for a drawtext text='...' value and wrap at ~45 chars per line. */
+static char *caption_prepare(const char *text) {
+  if (!text || !text[0]) return NULL;
+  size_t cap = strlen(text) * 2 + 8;
+  char *out = (char *)malloc(cap);
+  if (!out) die("OOM");
+  size_t o = 0;
+  int line_len = 0;
+  for (const char *t = text; *t && o + 4 < cap; t++) {
+    char c = *t;
+    if (c == '\n' || c == '\r') { out[o++] = '\\'; out[o++] = 'n'; line_len = 0; continue; }
+    if (line_len >= 45 && c == ' ') { out[o++] = '\\'; out[o++] = 'n'; line_len = 0; continue; }
+    if (strchr("\\':,;[]%{}", c)) out[o++] = '\\';
+    out[o++] = c;
+    line_len++;
+  }
+  out[o] = '\0';
+  return out;
+}
+
 static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
                                       int start_s, int end_s,
                                       const char *narration_mp3, double narration_dur,
-                                      const char *out_mp4) {
+                                      const char *out_mp4, const char *caption) {
   const double max_speedup = cfg->max_video_speedup;
 
   double orig_seg_dur = (double)(end_s - start_s);
@@ -1871,18 +1930,38 @@ static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
   char *nar_esc = sh_escape(narration_mp3);
   char *out_esc = sh_escape(out_mp4);
 
-  int rc = run_cmd(
-    "ffmpeg -y -hide_banner -loglevel error "
-    "-ss %d -to %d -i %s "
-    "-i %s "
-    "-filter_complex \"[0:v]setpts=PTS/%.10f[v]\" "
-    "-map \"[v]\" -map 1:a "
-    "-c:v libx264 -pix_fmt yuv420p -preset veryfast -crf 22 "
-    "-c:a aac -b:a 192k "
-    "-shortest %s",
-    use_start, use_end, in_esc, nar_esc, speed, out_esc
-  );
+  char *cap_esc = NULL;
+  if (cfg->captions && caption && caption[0] && caption_font_available())
+    cap_esc = caption_prepare(caption);
 
+  int rc;
+  if (cap_esc) {
+    rc = run_cmd(
+      "ffmpeg -y -hide_banner -loglevel error "
+      "-ss %d -to %d -i %s "
+      "-i %s "
+      "-filter_complex \"[0:v]setpts=PTS/%.10f,drawtext=fontfile='resources/Inter-Regular.ttf':expansion=none:text='%s':fontcolor=white:borderw=2:bordercolor=black:fontsize=h*0.035:x=(w-text_w)/2:y=h-th-h*0.06[v]\" "
+      "-map \"[v]\" -map 1:a "
+      "-c:v libx264 -pix_fmt yuv420p -preset veryfast -crf 22 "
+      "-c:a aac -b:a 192k "
+      "-shortest %s",
+      use_start, use_end, in_esc, nar_esc, speed, cap_esc, out_esc
+    );
+  } else {
+    rc = run_cmd(
+      "ffmpeg -y -hide_banner -loglevel error "
+      "-ss %d -to %d -i %s "
+      "-i %s "
+      "-filter_complex \"[0:v]setpts=PTS/%.10f[v]\" "
+      "-map \"[v]\" -map 1:a "
+      "-c:v libx264 -pix_fmt yuv420p -preset veryfast -crf 22 "
+      "-c:a aac -b:a 192k "
+      "-shortest %s",
+      use_start, use_end, in_esc, nar_esc, speed, out_esc
+    );
+  }
+
+  free(cap_esc);
   free(in_esc);
   free(nar_esc);
   free(out_esc);
@@ -2208,7 +2287,7 @@ static bool line_is_digits(const char *t) {
 
 /* Build a clip plan without any API: sample the subtitle cues evenly across
  * the file and use the cue text itself as the narration. */
-static ClipPlanList local_make_plan(const char *subs_seconds_text, int num_clips) {
+static ClipPlanList local_make_plan(const char *subs_seconds_text, int num_clips, int per_clip_sec) {
   ClipPlanList out = {0};
   if (!subs_seconds_text || !*subs_seconds_text || num_clips <= 0) return out;
 
@@ -2280,8 +2359,12 @@ static ClipPlanList local_make_plan(const char *subs_seconds_text, int num_clips
     int st = cues[idx].start;
     int en = cues[idx].end;
     if (st <= 0) st = 1;
-    if (en <= st) en = st + 10;
-    if (en - st > 20) en = st + 16;
+    if (per_clip_sec > 0) {
+      en = st + per_clip_sec;
+    } else {
+      if (en <= st) en = st + 10;
+      if (en - st > 20) en = st + 16;
+    }
 
     const char *src = cues[idx].text;
     if (!src || !*src) src = "The story keeps moving, and the best is yet to come.";
@@ -2394,21 +2477,29 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
 
   if (generator_cancel_requested()) return false;
 
+  int per_clip_sec = 0;
+  if (cfg->recap_minutes >= 1.0) {
+    per_clip_sec = (int)((cfg->recap_minutes * 60.0) / (double)num_clips);
+    if (per_clip_sec > 0 && per_clip_sec < 8) per_clip_sec = 8;
+    if (per_clip_sec > 0)
+      logi("Target recap length ~%.0f min => about %d s per clip.", cfg->recap_minutes, per_clip_sec);
+  }
+
   report_progress(GEN_STAGE_PLANNING, movie_index, movie_total, 0, 0, movie_title);
   logi("Requesting OpenAI clip plan (%d clips target)...", num_clips);
   bool retry_no_script = false;
   ClipPlanList plan = openai_make_plan(cfg, movie_title, subs_seconds,
                                        imsdb_script ? imsdb_script : "",
-                                       num_clips, &retry_no_script);
+                                       num_clips, per_clip_sec, &retry_no_script);
 
   if (plan.count == 0 && retry_no_script && imsdb_script && imsdb_script[0]) {
     logw("OpenAI request failed with IMSDb context; retrying without IMSDb script for %s", movie_title);
-    plan = openai_make_plan(cfg, movie_title, subs_seconds, "", num_clips, NULL);
+    plan = openai_make_plan(cfg, movie_title, subs_seconds, "", num_clips, per_clip_sec, NULL);
   }
 
   if (plan.count == 0) {
     logi("No OpenAI plan available - building a free local clip plan from the subtitles.");
-    plan = local_make_plan(subs_seconds, num_clips);
+    plan = local_make_plan(subs_seconds, num_clips, per_clip_sec);
   }
 
   free(subs_seconds);
@@ -2430,6 +2521,9 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     free_clip_plan_list(&plan);
     return false;
   }
+
+  if (cfg->captions && !caption_font_available())
+    logw("Captions are on but resources/Inter-Regular.ttf is missing - skipping burnt-in subtitles.");
 
   size_t made = 0;
   for (size_t i = 0; i < plan.count; i++) {
@@ -2467,7 +2561,8 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
 
     report_progress(GEN_STAGE_CLIP, movie_index, movie_total, (int)(i + 1), (int)plan.count, movie_title);
     logi("Building clip %zu: %d -> %d sec (narr=%.2fs) => %s", i + 1, start_s, end_s, nar_dur, out_clip);
-    if (!ffmpeg_make_adjusted_clip(cfg, movie_path, start_s, end_s, nar_mp3, nar_dur, out_clip)) {
+    if (!ffmpeg_make_adjusted_clip(cfg, movie_path, start_s, end_s, nar_mp3, nar_dur, out_clip,
+                                     plan.items[i].narration)) {
       logw("Failed to build adjusted clip %zu", i + 1);
       continue;
     }

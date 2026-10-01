@@ -664,9 +664,11 @@ static cJSON *config_read_json(void) {
   ADD_NUM("max_video_speedup", "max_video_speedup", 1.75);
   ADD_NUM("narration_volume",  "narration_volume",  2.5);
   ADD_NUM("bgm_volume",        "bgm_volume",        0.1);
+  ADD_NUM("recap_minutes",     "recap_minutes",     0);
 
   ADD_BOOL("bgm_enabled",   "bgm_enabled",   true);
   ADD_BOOL("make_vertical", "make_vertical", true);
+  ADD_BOOL("captions",        "captions",        true);
   ADD_BOOL("retire_movies", "retire_movies", true);
 
 #undef ADD_STR
@@ -717,7 +719,8 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
   }
 
   const char *num_keys[] = {
-    "min_clips", "max_clips", "max_video_speedup", "narration_volume", "bgm_volume", NULL
+    "min_clips", "max_clips", "max_video_speedup", "narration_volume", "bgm_volume",
+    "recap_minutes", NULL
   };
   for (int i = 0; num_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, num_keys[i]);
@@ -727,7 +730,7 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
     else cJSON_AddNumberToObject(root, num_keys[i], v->valuedouble);
   }
 
-  const char *bool_keys[] = { "bgm_enabled", "make_vertical", "retire_movies", NULL };
+  const char *bool_keys[] = { "bgm_enabled", "make_vertical", "retire_movies", "captions", NULL };
   for (int i = 0; bool_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, bool_keys[i]);
     if (!cJSON_IsBool(v)) continue;
@@ -925,6 +928,7 @@ static const char *PAGE_HTML[] = {
   "        <div><label class='f'>TTS model</label><input type='text' id='eleven_model_id'></div>",
   "        <div><label class='f'>Clips (min)</label><input type='number' id='min_clips' min='1' max='200'></div>",
   "        <div><label class='f'>Clips (max)</label><input type='number' id='max_clips' min='1' max='200'></div>",
+  "        <div><label class='f'>Recap minutes (0=auto)</label><input type='number' id='recap_minutes' min='0' max='180'></div>",
   "        <div><label class='f'>Max speed-up</label><input type='number' id='max_video_speedup' step='0.05' min='1' max='8'></div>",
   "        <div><label class='f'>Narration vol</label><input type='number' id='narration_volume' step='0.1' min='0' max='10'></div>",
   "        <div><label class='f'>Music vol</label><input type='number' id='bgm_volume' step='0.05' min='0' max='10'></div>",
@@ -942,6 +946,7 @@ static const char *PAGE_HTML[] = {
   "      <input type='password' id='tts_api_key' placeholder='optional - leave empty to keep current'>",
   "      <label class='chk'><input type='checkbox' id='bgm_enabled'> Background music</label>",
   "      <label class='chk'><input type='checkbox' id='make_vertical'> Also render vertical 9:16</label>",
+  "      <label class='chk'><input type='checkbox' id='captions'> Burn-in small subtitles</label>",
   "      <label class='chk'><input type='checkbox' id='retire_movies'> Move processed movies to movies_retired</label>",
   "      <div class='row'>",
   "        <button id='btnSave' class='btn'>SAVE SETTINGS</button>",
@@ -1066,8 +1071,8 @@ static const char *PAGE_HTML[] = {
   "  cfgLoaded = true;",
   "  var texts = ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
   "               'tts_base_url','tts_voice','tts_language','tts_model'];",
-  "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume'];",
-  "  var bools = ['bgm_enabled','make_vertical','retire_movies'];",
+  "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes'];",
+  "  var bools = ['bgm_enabled','make_vertical','retire_movies','captions'];",
   "  texts.forEach(function(k){ el(k).value = c[k] || ''; });",
   "  nums.forEach(function(k){ el(k).value = c[k]; });",
   "  bools.forEach(function(k){ el(k).checked = !!c[k]; });",
@@ -1180,8 +1185,8 @@ static const char *PAGE_HTML[] = {
   "  ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
   "   'tts_base_url','tts_voice','tts_language','tts_model'].forEach(function(k){ body[k] = el(k).value; });",
   "  body.tts_provider = el('tts_provider').value;",
-  "  ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume'].forEach(function(k){ body[k] = Number(el(k).value); });",
-  "  ['bgm_enabled','make_vertical','retire_movies'].forEach(function(k){ body[k] = el(k).checked; });",
+  "  ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes'].forEach(function(k){ body[k] = Number(el(k).value); });",
+  "  ['bgm_enabled','make_vertical','retire_movies','captions'].forEach(function(k){ body[k] = el(k).checked; });",
   "  if (el('open_api_key').value) body.open_api_key = el('open_api_key').value;",
   "  if (el('elevenlabs_api_key').value) body.elevenlabs_api_key = el('elevenlabs_api_key').value;",
   "  if (el('tts_api_key').value) body.tts_api_key = el('tts_api_key').value;",

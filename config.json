@@ -19,6 +19,8 @@
   "min_clips": 20,
   "max_clips": 30,
   "max_video_speedup": 1.75,
+  "recap_minutes": 0,
+  "captions": true,
   "narration_volume": 2.5,
   "bgm_volume": 0.1,
   "bgm_enabled": true,

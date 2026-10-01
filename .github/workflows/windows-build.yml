@@ -314,7 +314,8 @@ jobs:
           $free = Join-Path (Get-Location) "pfree"
           New-Item -ItemType Directory -Force "$free\movies" | Out-Null
           Copy-Item build\Release\movie_summary_cli.exe $free\
-          '{"open_api_key":"sk-fake","tts_provider":"piper","min_clips":3,"max_clips":4}' | Set-Content "$free\config.json"
+          Copy-Item -Recurse resources $free\resources
+          '{"open_api_key":"sk-fake","tts_provider":"piper","min_clips":3,"max_clips":4,"recap_minutes":2}' | Set-Content "$free\config.json"
           & "C:\ProgramData\chocolatey\bin\ffmpeg.exe" -hide_banner -loglevel error -f lavfi `            -i testsrc=size=640x360:duration=60 -c:v libx264 "$free\movies\Free Run (2026).mp4"
           $env:Path = "C:\ProgramData\chocolatey\bin;C:\Windows\System32;C:\Windows"
           Push-Location $free
@@ -328,6 +329,8 @@ jobs:
             Write-Host "::error title=pfree::the app did not auto-start the Piper server"; exit 1 }
           if (-not (Select-String -Path pfree.log -Pattern "Processed: 1" -Quiet)) {
             Write-Host "::error title=pfree::the free keyless generation did not finish"; exit 1 }
+          if (-not (Select-String -Path pfree.log -Pattern "Target recap length" -Quiet)) {
+            Write-Host "::error title=pfree::recap_minutes target was not applied"; exit 1 }
           Write-Host "free keyless generation OK (auto-started Piper, fallback SRT, local plan)"
 
       - name: "Test run.bat web brings the control panel up"

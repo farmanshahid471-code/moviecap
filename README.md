@@ -122,6 +122,10 @@ no browser extension, nothing to install. The page gives you:
 - **every setting** in `config.json` editable in the form (API keys, models, voice,
   clip count, speed cap, music/narration volume, BGM on/off, vertical render on/off,
   auto-retire on/off, API base URLs) — keys are shown masked and are never echoed back
+- **target recap length** (`recap_minutes`, minutes, 0 = automatic): the planner makes
+  clip windows and narrations longer so the finished video lands near that length
+- **burnt-in subtitles** (`captions`, on by default): the narration as small centred
+  captions (~3.5% of frame height, thin outline) — readable, never huge
 - **file management** for `movies\`, `scripts\srt_files\`, `backgroundmusic\`,
   `output\`, `tiktok_output\`, `movies_retired\`, `clips\`:
   drag-and-drop **upload**, **delete**, **download**
