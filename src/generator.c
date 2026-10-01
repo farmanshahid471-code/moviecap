@@ -1857,12 +1857,13 @@ static bool caption_font_available(void) {
 }
 
 /* Build a chain of up to three stacked drawtext filters for the caption.
- * Each text='...' section is single-quoted; inside single quotes the
- * filtergraph takes everything literally except a raw apostrophe, and the
- * ffmpeg argv splitter chokes on double quotes and backslashes inside our
- * outer double-quoted argument.  So the content keeps none of ' " \, and
- * instead of newline characters (which break the graph too) every wrapped
- * line gets its own drawtext filter. */
+ * Two ffmpeg tokenizers see this string.  Level 1 (the filtergraph parser)
+ * copies single-quoted sections verbatim but ends them at a raw apostrophe;
+ * level 2 (the filter-args parser) splits options on ':' and honours
+ * backslash escapes.  So inside text='...' we keep no ' " \ (the argv
+ * splitter chokes on " and \ too), and every ':' is written \: so it
+ * survives level 2 as a literal colon.  Wrapped lines become separate
+ * drawtext filters - no newline characters anywhere. */
 static char *caption_filter_chain(const char *text) {
   if (!text || !text[0]) return NULL;
 
@@ -1909,18 +1910,29 @@ static char *caption_filter_chain(const char *text) {
     memcpy(lines[nl - 1] + l, "...", 4);
   }
 
-  char *chain = (char *)malloc(1600);
+  /* Escape the level-2 specials for the filter-args parser. */
+  char esc[3][128];
+  for (int i = 0; i < nl; i++) {
+    size_t eo = 0;
+    for (const char *q = lines[i]; *q && eo + 2 < sizeof(esc[0]); q++) {
+      if (*q == ':') esc[i][eo++] = '\\';
+      esc[i][eo++] = *q;
+    }
+    esc[i][eo] = '\0';
+  }
+
+  char *chain = (char *)malloc(2048);
   if (!chain) die("OOM");
   chain[0] = '\0';
   size_t off = 0;
   for (int i = 0; i < nl; i++) {
     int k = (nl - 1) - i;
-    int w = snprintf(chain + off, 1600 - off,
+    int w = snprintf(chain + off, 2048 - off,
                      ",drawtext=fontfile='resources/Inter-Regular.ttf':expansion=none:"
                      "text='%s':fontcolor=white:borderw=2:bordercolor=black:"
                      "fontsize=h*0.035:x=(w-text_w)/2:y=h-h*0.07-th-%d*h*0.045",
-                     lines[i], k);
-    if (w < 0 || (size_t)w >= 1600 - off) break;
+                     esc[i], k);
+    if (w < 0 || (size_t)w >= 2048 - off) break;
     off += (size_t)w;
   }
   return chain;
