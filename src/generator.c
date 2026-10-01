@@ -2023,6 +2023,210 @@ static bool clear_directory_contents(const char *dir_path) {
 
 /* ----------------------- Movie pipeline ----------------------- */
 
+/* ---------------------------------------------------------------------------
+ * Free / offline fallbacks.
+ *
+ * Some movies have no downloadable subtitles anywhere, and some machines have
+ * no working OpenAI key.  Instead of dead-ending, synthesize an evenly spaced
+ * subtitle track and/or build a clip plan locally from whatever cues exist,
+ * so the pipeline can finish with nothing but FFmpeg + Piper.
+ * ------------------------------------------------------------------------ */
+
+static void srt_write_cue(FILE *f, int idx, int start_s, int end_s, const char *text) {
+  fprintf(f, "%d\n%02d:%02d:%02d,000 --> %02d:%02d:%02d,000\n%s\n\n",
+          idx,
+          start_s / 3600, (start_s / 60) % 60, start_s % 60,
+          end_s / 3600, (end_s / 60) % 60, end_s % 60,
+          text);
+}
+
+static bool make_fallback_srt(const char *movie_path, const char *movie_title,
+                              const char *dest_srt_path, int num_clips) {
+  double dur = ffprobe_duration_seconds(movie_path);
+  if (dur < 40.0) {
+    logw("Movie is too short (%.0fs) to build a fallback subtitle track.", dur);
+    return false;
+  }
+  if (num_clips < 2) num_clips = 2;
+  if (num_clips > 60) num_clips = 60;
+
+  static const char *generic_lines[] = {
+    "The story wastes no time and throws our characters straight into trouble.",
+    "Right here the stakes get raised, and nobody walks away unchanged.",
+    "This moment quietly changes everything our heroes thought they knew.",
+    "Tensions boil over as old allies turn into brand new enemies.",
+    "A clever twist flips the whole plan completely on its head.",
+    "Our hero digs deep and finds one last burst of courage.",
+    "Everything collides at once in this unforgettable showdown.",
+    "The dust settles for a moment and the story catches its breath.",
+    "Secrets surface, and the real villain finally shows a face.",
+    "What looked like a dead end turns into the way forward.",
+    "Friendship is tested, and loyalty earns its keep.",
+    "The chase is on, and there is no turning back now.",
+  };
+  const size_t n_generic = sizeof(generic_lines) / sizeof(generic_lines[0]);
+
+  FILE *f = plat_fopen(dest_srt_path, "wb");
+  if (!f) return false;
+
+  double usable = dur - 30.0;
+  double seg = usable / (double)num_clips;
+
+  char line[1024];
+  for (int i = 0; i < num_clips; i++) {
+    int start_s = (int)(15.0 + (double)i * seg);
+    int end_s = start_s + 12;
+    if (end_s > (int)dur - 5) end_s = (int)dur - 5;
+    if (end_s <= start_s) end_s = start_s + 4;
+
+    if (i == 0) {
+      snprintf(line, sizeof(line),
+               "Here we go, let's go over the movie %s. "
+               "Today we cover the whole story from start to finish.", movie_title);
+    } else if (i == num_clips - 1) {
+      snprintf(line, sizeof(line),
+               "And that is how %s wraps up. Thanks for watching, "
+               "and see you in the next one.", movie_title);
+    } else {
+      snprintf(line, sizeof(line), "%s", generic_lines[(size_t)(i - 1) % n_generic]);
+    }
+    srt_write_cue(f, i + 1, start_s, end_s, line);
+  }
+
+  fclose(f);
+  return file_exists(dest_srt_path);
+}
+
+typedef struct {
+  int   start;
+  int   end;
+  char *text;
+} LocalCue;
+
+static void local_cue_push(LocalCue **arr, size_t *n, size_t *cap, int st, int en, char *text) {
+  if (*n + 1 > *cap) {
+    *cap = *cap ? *cap * 2 : 32;
+    *arr = (LocalCue *)realloc(*arr, *cap * sizeof(LocalCue));
+    if (!*arr) die("OOM");
+  }
+  (*arr)[*n].start = st;
+  (*arr)[*n].end   = en;
+  (*arr)[*n].text  = text;
+  (*n)++;
+}
+
+static char *trim_ws(char *t) {
+  while (*t == ' ' || *t == '\t') t++;
+  char *end = t + strlen(t);
+  while (end > t && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) *--end = '\0';
+  return t;
+}
+
+static bool line_is_digits(const char *t) {
+  if (!*t) return false;
+  for (; *t; t++) if (*t < '0' || *t > '9') return false;
+  return true;
+}
+
+/* Build a clip plan without any API: sample the subtitle cues evenly across
+ * the file and use the cue text itself as the narration. */
+static ClipPlanList local_make_plan(const char *subs_seconds_text, int num_clips) {
+  ClipPlanList out = {0};
+  if (!subs_seconds_text || !*subs_seconds_text || num_clips <= 0) return out;
+
+  char *work = str_dup(subs_seconds_text);
+  if (!work) return out;
+
+  LocalCue *cues = NULL;
+  size_t n = 0, cap = 0;
+
+  int  pend_s = 0, pend_e = 0;
+  bool pend = false;
+  char *pend_text = NULL;
+
+  char *cur = work;
+  while (cur) {
+    char *nl = strchr(cur, '\n');
+    if (nl) *nl = '\0';
+    char *ln = trim_ws(cur);
+    cur = nl ? nl + 1 : NULL;
+
+    int s1 = 0, s2 = 0;
+    if (sscanf(ln, "%d --> %d", &s1, &s2) == 2) {
+      if (pend && pend_text) local_cue_push(&cues, &n, &cap, pend_s, pend_e, pend_text);
+      else if (pend_text) free(pend_text);
+      pend = true; pend_s = s1; pend_e = s2; pend_text = NULL;
+      continue;
+    }
+
+    if (*ln == '\0') {
+      if (pend && pend_text) local_cue_push(&cues, &n, &cap, pend_s, pend_e, pend_text);
+      else if (pend_text) free(pend_text);
+      pend = false; pend_text = NULL;
+      continue;
+    }
+
+    if (pend && !line_is_digits(ln)) {
+      if (pend_text) {
+        size_t a = strlen(pend_text), b = strlen(ln);
+        char *m = (char *)realloc(pend_text, a + b + 2);
+        if (!m) die("OOM");
+        m[a] = ' ';
+        memcpy(m + a + 1, ln, b + 1);
+        pend_text = m;
+      } else {
+        pend_text = str_dup(ln);
+      }
+    }
+  }
+  if (pend && pend_text) local_cue_push(&cues, &n, &cap, pend_s, pend_e, pend_text);
+  else if (pend_text) free(pend_text);
+  free(work);
+
+  if (n == 0) { free(cues); return out; }
+
+  int want = num_clips;
+  if ((size_t)want > n) want = (int)n;
+
+  out.items = (ClipPlan *)calloc((size_t)want, sizeof(ClipPlan));
+  if (!out.items) die("OOM");
+  out.count = 0;
+
+  int last_idx = -1;
+  for (int i = 0; i < want; i++) {
+    int idx = (want == 1) ? 0
+              : (int)(((long long)i * (long long)(n - 1)) / (long long)(want - 1));
+    if (idx == last_idx) continue;
+    last_idx = idx;
+
+    int st = cues[idx].start;
+    int en = cues[idx].end;
+    if (st <= 0) st = 1;
+    if (en <= st) en = st + 10;
+    if (en - st > 20) en = st + 16;
+
+    const char *src = cues[idx].text;
+    if (!src || !*src) src = "The story keeps moving, and the best is yet to come.";
+    char narbuf[512];
+    size_t tl = strlen(src);
+    if (tl >= sizeof(narbuf)) {
+      tl = sizeof(narbuf) - 1;
+      while (tl > 200 && src[tl] != ' ') tl--;
+    }
+    memcpy(narbuf, src, tl);
+    narbuf[tl] = '\0';
+
+    out.items[out.count].start = st;
+    out.items[out.count].end   = en;
+    out.items[out.count].narration = str_dup(narbuf);
+    out.count++;
+  }
+
+  for (size_t i = 0; i < n; i++) free(cues[i].text);
+  free(cues);
+  return out;
+}
+
 static bool process_movie(const Config *cfg, const char *movie_path, const char *movie_title,
                           int num_clips, int movie_index, int movie_total) {
   ensure_dir("clips");
@@ -2043,10 +2247,16 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   if (!file_exists(srt_in)) {
     logi("No SRT found for %s; attempting download...", movie_title);
     if (!download_subtitle_srt(movie_title, srt_in)) {
-      logw("Subtitle download failed for %s. Place your SRT at: %s", movie_title, srt_in);
-      return false;
+      logw("Subtitle download failed for %s.", movie_title);
+      logi("No subtitles online - building a fallback subtitle track instead.");
+      if (!make_fallback_srt(movie_path, movie_title, srt_in, num_clips)) {
+        logw("Fallback SRT could not be built. You can still place your own SRT at: %s", srt_in);
+        return false;
+      }
+      logok("Fallback SRT written: %s", srt_in);
+    } else {
+      logok("Downloaded SRT: %s", srt_in);
     }
-    logok("Downloaded SRT: %s", srt_in);
   } else {
     logok("Found SRT: %s", srt_in);
   }
@@ -2118,6 +2328,11 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     plan = openai_make_plan(cfg, movie_title, subs_seconds, "", num_clips, NULL);
   }
 
+  if (plan.count == 0) {
+    logi("No OpenAI plan available - building a free local clip plan from the subtitles.");
+    plan = local_make_plan(subs_seconds, num_clips);
+  }
+
   free(subs_seconds);
   if (imsdb_script) free(imsdb_script);
 
@@ -2126,7 +2341,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     free_clip_plan_list(&plan);
     return false;
   }
-  logok("OpenAI plan received: %zu clips", plan.count);
+  logok("Clip plan ready: %zu clips", plan.count);
 
   char concat_list_path[PATH_MAX];
   snprintf(concat_list_path, sizeof(concat_list_path), "clips/%s_concat_list.txt", movie_title);

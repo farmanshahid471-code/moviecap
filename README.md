@@ -485,9 +485,15 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
   graphics drivers do not provide. Nothing is wrong with your videos: use
   **`run.bat web`** instead. The browser control panel has every control the desktop
   window has and needs no graphics card. Updating your graphics driver also fixes it.
-  `run.bat` now detects this and starts the browser panel for you automatically,
-  opening <http://127.0.0.1:8080> in your default browser.
-- If you see "plan count = 0" / "No plan returned" or missing clips, check:
+  A bare `run.bat` only installs the tools and stops, so double-clicking it can
+  never hit this error; open `movie_summary_web.exe` yourself for the panel.
+- **No subtitles online?** When the subtitle download fails, the app now writes a
+  fallback subtitle track (evenly spaced cues across the runtime) and continues.
+  **No working OpenAI key?** The planner then falls back to a free local plan built
+  from those cues, so generation still finishes with just FFmpeg + Piper. A real SRT
+  placed at `scripts\srt_files\<Title>.srt` and/or a real OpenAI key still give the
+  full-quality result.
+- If you still see "No plan returned", check:
   - your OpenAI key (the exact error from OpenAI is shown in the log)
   - network connectivity
   - that the SRT conversion output is not empty
