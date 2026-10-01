@@ -1474,6 +1474,30 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   }
 
   const char *prompt_fmt =
+    "You are a movie recap narrator for a YouTube recap channel. You retell the\n"
+    "STORY of the movie - what the characters do and why it matters - never what\n"
+    "the camera shows.\n"
+    "\n"
+    "NARRATION STYLE (follow exactly):\n"
+    "- Third person, present tense, like a movie recap video: follow the\n"
+    "characters through the plot beat by beat.\n"
+    "- Each narration continues the story from the previous clip, like the next\n"
+    "paragraph of one continuous retelling. Reveal cause and effect.\n"
+    "- Build tension and stakes. Short punchy sentences mixed with longer ones.\n"
+    "- Use the real character names and dialogue lines from the subtitles.\n"
+    "- NEVER describe the scene, the visuals, the camera, the lighting or the\n"
+    "editing. NEVER say things like \"in this scene\", \"we see\", \"the movie\n"
+    "shows\", \"the audience watches\".\n"
+    "\n"
+    "EXAMPLE of the exact style wanted (from a recap of a horror movie):\n"
+    "GOOD: \"The ice cream man rolls into town just as the sun sets. Kids line up\n"
+    "for his cursed treats, and the first boy who licks one goes quiet. By\n"
+    "midnight the adults start dropping one by one - and the kids just smile.\n"
+    "Sheriff Dan tries to warn the town, but nobody believes a word he says.\"\n"
+    "BAD (never write like this): \"In this scene, a man is selling ice cream.\n"
+    "The camera shows a small town. The lighting is dark and dramatic. This is\n"
+    "an important moment in the movie.\"\n"
+    "\n"
     "You are given TWO inputs.\n"
     "Movie: %s\n"
     "\n"
@@ -1493,7 +1517,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "- Return STRICT JSON with this shape ONLY:\n"
     "  {\"clips\":[{\"start\":120,\"end\":145,\"narration\":\"...\"}, ...]}\n"
     "- Clips must be increasing by start time.\n"
-    "- Each narration must be at least 3 full sentences, casual commentator vibe.\n"
+    "- Each narration must be at least 3 full sentences in the recap style above.\n"
     "- The first narration must start with: \"Here we go, let's go over the movie %s.\".\n";
 
   int plen = snprintf(NULL, 0, prompt_fmt, title_utf8, subs_trim, scr_trim, num_clips,
@@ -1518,7 +1542,10 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   cJSON *input = cJSON_CreateArray();
   cJSON *sys = cJSON_CreateObject();
   cJSON_AddStringToObject(sys, "role", "system");
-  cJSON_AddStringToObject(sys, "content", "You are a helpful assistant designed to output JSON.");
+  cJSON_AddStringToObject(sys, "content",
+      "You are a professional movie recap scriptwriter for a popular recap "
+      "channel. You retell movie plots as gripping present-tense stories that "
+      "follow the characters. You always answer with strict JSON only.");
   cJSON_AddItemToArray(input, sys);
 
   cJSON *usr = cJSON_CreateObject();
