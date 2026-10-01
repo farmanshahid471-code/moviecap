@@ -315,7 +315,21 @@ jobs:
           New-Item -ItemType Directory -Force "$free\movies" | Out-Null
           Copy-Item build\Release\movie_summary_cli.exe $free\
           Copy-Item -Recurse resources $free\resources
-          '{"open_api_key":"sk-fake","tts_provider":"piper","min_clips":3,"max_clips":4,"recap_minutes":2}' | Set-Content "$free\config.json"
+          '{"open_api_key":"sk-fake","tts_provider":"piper","min_clips":2,"max_clips":2,"recap_minutes":1}' | Set-Content "$free\config.json"
+          # Dense synthetic SRT whose lines torture the caption escaping
+          # (apostrophe, colon, comma, brackets, percent) so a regression in
+          # drawtext escaping fails the build instead of the user's video.
+          New-Item -ItemType Directory -Force "$free\scripts\srt_files" | Out-Null
+          $lines = @()
+          $idx = 1
+          for ($t = 0; $t -lt 58; $t += 1) {
+            $lines += "$idx"
+            $lines += ("00:00:{0:D2},000 --> 00:00:{1:D2},000" -f $t, ($t + 1))
+            $lines += "Scene $t it's a test, and the story moves forward: yes [really] 100%."
+            $lines += ""
+            $idx++
+          }
+          ($lines -join "`r`n") | Set-Content "$free\scripts\srt_files\Free Run (2026).srt"
           & "C:\ProgramData\chocolatey\bin\ffmpeg.exe" -hide_banner -loglevel error -f lavfi `            -i testsrc=size=640x360:duration=60 -c:v libx264 "$free\movies\Free Run (2026).mp4"
           $env:Path = "C:\ProgramData\chocolatey\bin;C:\Windows\System32;C:\Windows"
           Push-Location $free
@@ -331,6 +345,12 @@ jobs:
             Write-Host "::error title=pfree::the free keyless generation did not finish"; exit 1 }
           if (-not (Select-String -Path pfree.log -Pattern "Target recap length" -Quiet)) {
             Write-Host "::error title=pfree::recap_minutes target was not applied"; exit 1 }
+          $m = Select-String -Path pfree.log -Pattern "Final duration: ([0-9.]+) seconds"
+          if (-not $m) { Write-Host "::error title=pfree::no final duration in log"; exit 1 }
+          $dur = [double]$m.Matches[0].Groups[1].Value
+          Write-Host "pfree final duration: $dur s (target ~60 s)"
+          if ($dur -lt 40) {
+            Write-Host "::error title=pfree::recap collapsed to $dur s - the length target is broken"; exit 1 }
           Write-Host "free keyless generation OK (auto-started Piper, fallback SRT, local plan)"
 
       - name: "Test run.bat web brings the control panel up"

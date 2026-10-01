@@ -1856,7 +1856,11 @@ static bool caption_font_available(void) {
   return cached == 1;
 }
 
-/* Escape for a drawtext text='...' value and wrap at ~45 chars per line. */
+/* Prepare caption text for an UNQUOTED drawtext text= value.
+ * Two parsers see this string: the ffmpeg argv splitter (double quotes) and
+ * the filtergraph tokenizer (backslash escapes, no quotes here).  So: drop
+ * double quotes entirely, and backslash-escape every character the filter
+ * level treats as special. */
 static char *caption_prepare(const char *text) {
   if (!text || !text[0]) return NULL;
   size_t cap = strlen(text) * 2 + 8;
@@ -1866,9 +1870,10 @@ static char *caption_prepare(const char *text) {
   int line_len = 0;
   for (const char *t = text; *t && o + 4 < cap; t++) {
     char c = *t;
-    if (c == '\n' || c == '\r') { out[o++] = '\\'; out[o++] = 'n'; line_len = 0; continue; }
-    if (line_len >= 45 && c == ' ') { out[o++] = '\\'; out[o++] = 'n'; line_len = 0; continue; }
-    if (strchr("\\':,;[]%{}", c)) out[o++] = '\\';
+    if (c == '"') { out[o++] = ' '; line_len++; continue; }
+    if (c == '\n' || c == '\r') { out[o++] = '\n'; line_len = 0; continue; }
+    if (line_len >= 45 && c == ' ') { out[o++] = '\n'; line_len = 0; continue; }
+    if (strchr("\\':,;[]", c)) out[o++] = '\\';
     out[o++] = c;
     line_len++;
   }
@@ -1940,7 +1945,7 @@ static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
       "ffmpeg -y -hide_banner -loglevel error "
       "-ss %d -to %d -i %s "
       "-i %s "
-      "-filter_complex \"[0:v]setpts=PTS/%.10f,drawtext=fontfile='resources/Inter-Regular.ttf':expansion=none:text='%s':fontcolor=white:borderw=2:bordercolor=black:fontsize=h*0.035:x=(w-text_w)/2:y=h-th-h*0.06[v]\" "
+      "-filter_complex \"[0:v]setpts=PTS/%.10f,drawtext=fontfile='resources/Inter-Regular.ttf':expansion=none:text=%s:fontcolor=white:borderw=2:bordercolor=black:fontsize=h*0.035:x=(w-text_w)/2:y=h-th-h*0.06[v]\" "
       "-map \"[v]\" -map 1:a "
       "-c:v libx264 -pix_fmt yuv420p -preset veryfast -crf 22 "
       "-c:a aac -b:a 192k "
@@ -2349,38 +2354,85 @@ static ClipPlanList local_make_plan(const char *subs_seconds_text, int num_clips
   if (!out.items) die("OOM");
   out.count = 0;
 
-  int last_idx = -1;
-  for (int i = 0; i < want; i++) {
-    int idx = (want == 1) ? 0
-              : (int)(((long long)i * (long long)(n - 1)) / (long long)(want - 1));
-    if (idx == last_idx) continue;
-    last_idx = idx;
+  if (per_clip_sec > 0) {
+    /* Long-recap mode: each clip covers ~per_clip_sec of the timeline and its
+       narration is ALL the dialogue spoken in that stretch, so the spoken
+       audio actually fills the clip (a single cue would be 1-3 s of speech
+       and the speed cap would collapse the clip to match). */
+    int last_time = cues[n - 1].end;
+    if (last_time <= 0) last_time = (int)n * 10;
+    size_t max_chars = (size_t)per_clip_sec * 15 + 60;
+    if (max_chars > 900) max_chars = 900;
+    size_t next_min = 0;
+    for (int i = 0; i < want && next_min < n; i++) {
+      double target = ((double)i + 0.5) * (double)last_time / (double)want;
+      size_t idx0 = next_min;
+      while (idx0 + 1 < n && (double)cues[idx0].start < target) idx0++;
+      if ((double)cues[idx0].start > target && idx0 > next_min) idx0--;
 
-    int st = cues[idx].start;
-    int en = cues[idx].end;
-    if (st <= 0) st = 1;
-    if (per_clip_sec > 0) {
-      en = st + per_clip_sec;
-    } else {
+      size_t k = idx0;
+      size_t len = 0;
+      while (k < n && (cues[k].start - cues[idx0].start) < per_clip_sec && len < max_chars) {
+        len += strlen(cues[k].text);
+        k++;
+      }
+      if (k == idx0) k = idx0 + 1;
+
+      size_t total = (k - idx0);
+      for (size_t j = idx0; j < k; j++) total += strlen(cues[j].text);
+      char *txt = (char *)malloc(total + 2);
+      if (!txt) die("OOM");
+      size_t o = 0;
+      for (size_t j = idx0; j < k; j++) {
+        size_t l = strlen(cues[j].text);
+        if (o) txt[o++] = ' ';
+        memcpy(txt + o, cues[j].text, l);
+        o += l;
+      }
+      txt[o] = '\0';
+
+      int st = cues[idx0].start;
+      int en = cues[k - 1].end;
+      if (st <= 0) st = 1;
+      if (en <= st) en = st + 8;
+      if (en - st > per_clip_sec + 15) en = st + per_clip_sec + 15;
+
+      out.items[out.count].start = st;
+      out.items[out.count].end   = en;
+      out.items[out.count].narration = txt;
+      out.count++;
+      next_min = k;
+    }
+  } else {
+    int last_idx = -1;
+    for (int i = 0; i < want; i++) {
+      int idx = (want == 1) ? 0
+                : (int)(((long long)i * (long long)(n - 1)) / (long long)(want - 1));
+      if (idx == last_idx) continue;
+      last_idx = idx;
+
+      int st = cues[idx].start;
+      int en = cues[idx].end;
+      if (st <= 0) st = 1;
       if (en <= st) en = st + 10;
       if (en - st > 20) en = st + 16;
-    }
 
-    const char *src = cues[idx].text;
-    if (!src || !*src) src = "The story keeps moving, and the best is yet to come.";
-    char narbuf[512];
-    size_t tl = strlen(src);
-    if (tl >= sizeof(narbuf)) {
-      tl = sizeof(narbuf) - 1;
-      while (tl > 200 && src[tl] != ' ') tl--;
-    }
-    memcpy(narbuf, src, tl);
-    narbuf[tl] = '\0';
+      const char *src = cues[idx].text;
+      if (!src || !*src) src = "The story keeps moving, and the best is yet to come.";
+      char narbuf[512];
+      size_t tl = strlen(src);
+      if (tl >= sizeof(narbuf)) {
+        tl = sizeof(narbuf) - 1;
+        while (tl > 200 && src[tl] != ' ') tl--;
+      }
+      memcpy(narbuf, src, tl);
+      narbuf[tl] = '\0';
 
-    out.items[out.count].start = st;
-    out.items[out.count].end   = en;
-    out.items[out.count].narration = str_dup(narbuf);
-    out.count++;
+      out.items[out.count].start = st;
+      out.items[out.count].end   = en;
+      out.items[out.count].narration = str_dup(narbuf);
+      out.count++;
+    }
   }
 
   for (size_t i = 0; i < n; i++) free(cues[i].text);
