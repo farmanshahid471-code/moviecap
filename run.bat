@@ -2,7 +2,8 @@
 REM ==========================================================================
 REM  AI-Movie-Shorts (Windows)
 REM
-REM    run.bat              -> desktop UI
+REM    run.bat              -> download + check every required tool, then stop.
+REM                            You open the app yourself afterwards.
 REM    run.bat web          -> browser control panel (http://127.0.0.1:8080)
 REM    run.bat cli          -> headless (console only) generation
 REM    run.bat setup        -> install/check FFmpeg only, do not start the app
@@ -53,20 +54,45 @@ if not defined CI pause
 exit /b 1
 
 :tools_ready
-if /i not "%~1"=="setup" goto :launch
+if /i "%~1"=="setup" goto :confirm
+if /i "%~1"==""     goto :confirm
+if /i "%~1"=="web"  goto :launch
+if /i "%~1"=="cli"  goto :launch
 echo.
-echo Tools are ready in:
-echo   "%FFBIN%"
+echo [ERROR] Unknown command "%~1".
+echo         Usage: run.bat web / run.bat cli / run.bat setup / run.bat tts
+if not defined CI pause
+exit /b 1
+
+REM --------------------------------------------------------------------------
+REM  A bare double-click (and "setup") only installs and checks the tools,
+REM  prints the confirmation below and stops. You open the app yourself.
+:confirm
 echo.
-echo Run "run.bat" for the desktop UI or "run.bat web" for the browser panel.
+echo ============================================================
+echo  [OK] Everything the app needs is downloaded and installed.
+echo.
+echo   FFmpeg : "%FFBIN%"
+echo.
+echo  run.bat does not start the app on its own any more.
+echo  Open it yourself from this folder:
+echo.
+echo    movie_summary_web.exe   browser control panel - needs no
+echo                            graphics card, works everywhere
+echo    movie_summary_bot.exe   desktop window - needs OpenGL 3.3,
+echo                            so it cannot open on every PC
+echo    movie_summary_cli.exe   headless, console only
+echo.
+echo  Shortcuts:  run.bat web   /   run.bat cli   /   run.bat tts
+echo ============================================================
+if not defined CI pause
 exit /b 0
 
 :launch
 REM Make the portable FFmpeg visible to the app (this session only).
 if exist "%FFBIN%\ffmpeg.exe" set "PATH=%FFBIN%;%PATH%"
 
-set "EXE=movie_summary_bot.exe"
-if /i "%~1"=="cli" set "EXE=movie_summary_cli.exe"
+set "EXE=movie_summary_cli.exe"
 if /i "%~1"=="web" set "EXE=movie_summary_web.exe"
 
 set "EXEPATH="
@@ -77,28 +103,6 @@ if not defined EXEPATH goto :no_exe
 
 "%EXEPATH%" %2 %3 %4 %5
 set "RC=%errorlevel%"
-
-REM Exit code 2 from the desktop UI means "this machine has no OpenGL context"
-REM (Remote Desktop, a VM without GPU acceleration, or an old graphics driver).
-REM Fall back to the browser control panel: same controls, no graphics card.
-if not "%RC%"=="2" goto :after_exe
-if /i not "%~1"=="" goto :after_exe
-call :find_web
-if not defined WEBPATH goto :after_exe
-echo.
-echo ============================================================
-echo  The desktop window needs OpenGL, which this machine does
-echo  not provide. Starting the browser control panel instead -
-echo  it has the same controls and needs no graphics card.
-echo ============================================================
-echo.
-start "AI Movie Shorts - control panel" "%WEBPATH%"
-ping -n 4 127.0.0.1 >nul
-start "" http://127.0.0.1:8080
-echo The control panel is running in its own window.
-echo If your browser did not open, go to  http://127.0.0.1:8080
-echo Close that window to stop the server.
-exit /b 0
 
 :after_exe
 if not "%RC%"=="0" if not defined CI pause
@@ -173,15 +177,6 @@ exit /b 0
 
 REM --------------------------------------------------------------------------
 REM  Pick the tools folder. Everything stays on F: whenever that is possible.
-REM  Locate the web control panel exe in whichever build layout is present.
-:find_web
-set "WEBPATH="
-if exist "build\Release\movie_summary_web.exe" set "WEBPATH=build\Release\movie_summary_web.exe"
-if not defined WEBPATH if exist "build\movie_summary_web.exe" set "WEBPATH=build\movie_summary_web.exe"
-if not defined WEBPATH if exist "movie_summary_web.exe" set "WEBPATH=movie_summary_web.exe"
-exit /b 0
-
-REM --------------------------------------------------------------------------
 :resolve_tools
 if not exist "%MOVIECAP_TOOLS%" goto :rt_appdrive
 set "TOOLSDIR=%MOVIECAP_TOOLS%"

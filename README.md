@@ -57,7 +57,8 @@ run.bat web
 
 `run.bat web` starts the **browser control panel** on <http://127.0.0.1:8080> — that is where you
 set the API keys, drop movies in, watch the live log and preview the result.
-(`run.bat` opens the desktop window instead, `run.bat cli` runs headless.)
+(A bare `run.bat` only downloads/checks the tools, prints the confirmation and
+stops — you open the app yourself; `run.bat cli` runs headless.)
 
 Then put a movie in `movies\` (e.g. `movies\Citizen Kane.mp4`) and click **START GENERATION**.
 
@@ -99,7 +100,7 @@ There are **three** ways to drive the pipeline — pick whichever fits:
 | App | Start with | Best for |
 |---|---|---|
 | **Web control panel** (`movie_summary_web.exe`) | `run.bat web` → open <http://127.0.0.1:8080> | full control: settings, uploads, live progress, preview |
-| **Desktop window** (`movie_summary_bot.exe`, raylib) | `run.bat` | quick one-button runs |
+| **Desktop window** (`movie_summary_bot.exe`, raylib) | double-click `movie_summary_bot.exe` | quick one-button runs (needs OpenGL 3.3) |
 | **Headless CLI** (`movie_summary_cli.exe`) | `run.bat cli` | servers, scheduled jobs |
 
 ### Web control panel (recommended)
@@ -196,6 +197,8 @@ The runtime folders are created automatically.
 
 **Running the app** (the ready-made zip) needs nothing but FFmpeg, and `run.bat`
 installs that for you — portable, into `F:\AI-Movie-Shorts\tools`, nothing on `C:`.
+Double-clicking `run.bat` only performs this check/install and prints the result;
+it never launches the app on its own.
 
 **Building from source** additionally needs:
 

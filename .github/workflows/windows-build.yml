@@ -150,6 +150,19 @@ jobs:
           if ($rc -ne 0 -or -not $hit) { exit 1 }
           Write-Host "run.bat OK"
 
+          # Bare double-click: must confirm the tools and start no exe at all.
+          & cmd /c "run.bat" *> runbat-bare.log
+          $rcb = $LASTEXITCODE
+          Get-Content runbat-bare.log | ForEach-Object { Write-Host "::notice title=runbat-bare:: $_" }
+          Write-Host "bare run.bat exit code: $rcb"
+          $conf = Select-String -Path runbat-bare.log -Pattern "downloaded and installed" -Quiet
+          $launched = Select-String -Path runbat-bare.log -Pattern "Initializing raylib" -Quiet
+          if ($rcb -ne 0) { Write-Host "::error title=run.bat::bare run.bat exited with code $rcb" }
+          if (-not $conf) { Write-Host "::error title=run.bat::bare run.bat did not confirm the tools" }
+          if ($launched) { Write-Host "::error title=run.bat::bare run.bat started the app on its own" }
+          if ($rcb -ne 0 -or -not $conf -or $launched) { exit 1 }
+          Write-Host "bare run.bat OK - it confirms the tools and starts nothing"
+
       - name: "Test run.bat with no F drive (tools fall back to the app folder)"
         shell: pwsh
         run: |
@@ -389,7 +402,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "windows-latest"
-          $notes = "Ready-to-run Windows build (x64) from commit ${{ github.sha }}.`n`nNeeds FFmpeg: winget install Gyan.FFmpeg`nPut your API keys in config.json, then double-click run.bat."
+          $notes = "Ready-to-run Windows build (x64) from commit ${{ github.sha }}.`n`nDouble-click run.bat: it downloads every required tool (portable, kept off C:), confirms the install and stops.`nThen open movie_summary_web.exe yourself (browser panel, needs no graphics card) or movie_summary_bot.exe (desktop window, needs OpenGL 3.3).`nAPI keys go in config.json or into the panel."
           gh release view $tag 2>$null
           if ($LASTEXITCODE -ne 0) {
             gh release create $tag AI-Movie-Shorts-Windows.zip --title "AI-Movie-Shorts for Windows (latest build)" --notes $notes --target ${{ github.sha }} --latest
