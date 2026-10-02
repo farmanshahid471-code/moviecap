@@ -1447,8 +1447,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
 
   char *subs_trim = trim_copy_utf8_safe(subs_utf8, MAX_SUB_CHARS);
 
-  char placeholder_note[512];
-  placeholder_note[0] = '\0';
+  char placeholder_note[640];
   if (subs_placeholder)
     snprintf(placeholder_note, sizeof(placeholder_note),
              "\nIMPORTANT: INPUT A is an auto-generated PLACEHOLDER track, NOT the "
@@ -1456,6 +1455,12 @@ static ClipPlanList openai_make_plan(const Config *cfg,
              "the narrations, and spread the time ranges evenly across the whole "
              "runtime shown by the INPUT A timestamps.\n",
              movie_title);
+  else
+    snprintf(placeholder_note, sizeof(placeholder_note),
+             "\nIMPORTANT: Every narration must be strictly based on the real "
+             "events in INPUT A (the actual subtitle file): real character names, "
+             "real dialogue moments, real plot beats. Never use generic filler or "
+             "trailer cliches like \"the stakes get raised\".\n");
   char *scr_trim  = trim_copy_utf8_safe(scr_utf8,  MAX_SCRIPT_CHARS);
 
   free(subs_utf8);
@@ -2298,6 +2303,60 @@ static void srt_write_cue(FILE *f, int idx, int start_s, int end_s, const char *
           text);
 }
 
+/* Find a user-provided SRT whose name approximately matches the movie title.
+ * Names are normalized to lowercase alphanumerics, so "Toy Story 5 (2026)
+ * [1080p].mp4" matches "Toy Story 5.srt". Files ending in _modified.srt or
+ * _placeholder.srt are ignored. Returns false when nothing plausible exists. */
+static bool find_subtitle_srt(const char *movie_title, char *out, size_t outsz) {
+  size_t n = 0;
+  char **files = list_files_with_ext("scripts/srt_files", ".srt", NULL, &n);
+  if (!files) return false;
+
+  char want[256];
+  size_t wo = 0;
+  for (const char *p = movie_title; *p && wo + 1 < sizeof(want); p++) {
+    char c = *p;
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) want[wo++] = c;
+  }
+  want[wo] = '\0';
+
+  bool found = false;
+  int best_score = 0;
+  for (size_t i = 0; i < n; i++) {
+    const char *full = files[i];
+    const char *base = strrchr(full, '/');
+    base = base ? base + 1 : full;
+    size_t bl = strlen(base);
+    if (bl > 12 && str_icmp(base + bl - 12, "_modified.srt") == 0) continue;
+    if (bl > 15 && str_icmp(base + bl - 15, "_placeholder.srt") == 0) continue;
+
+    char cand[256];
+    size_t co = 0;
+    for (size_t k = 0; base[k] && k < bl - 4 && co + 1 < sizeof(cand); k++) {
+      char c = base[k];
+      if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+      if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) cand[co++] = c;
+    }
+    cand[co] = '\0';
+    if (co < 3 || wo < 3) continue;
+
+    int score = 0;
+    int ldiff = (int)co - (int)wo;
+    if (ldiff < 0) ldiff = -ldiff;
+    if (strcmp(cand, want) == 0) score = 10000;
+    else if (strncmp(cand, want, wo < co ? wo : co) == 0) score = 5000 - ldiff;
+    else if (strstr(cand, want) || strstr(want, cand)) score = 1000 - ldiff;
+    if (score > best_score) {
+      best_score = score;
+      snprintf(out, outsz, "scripts/srt_files/%s", base);
+      found = true;
+    }
+  }
+  free_str_list(files, n);
+  return found;
+}
+
 static bool make_fallback_srt(const char *movie_path, const char *movie_title,
                               const char *dest_srt_path, int num_clips) {
   double dur = ffprobe_duration_seconds(movie_path);
@@ -2554,17 +2613,30 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   report_progress(GEN_STAGE_SUBTITLES, movie_index, movie_total, 0, 0, movie_title);
 
   bool subs_placeholder = false;
+  char srt_ph[PATH_MAX];
+  snprintf(srt_ph, sizeof(srt_ph), "scripts/srt_files/%s_placeholder.srt", movie_title);
+
+  if (!file_exists(srt_in) && find_subtitle_srt(movie_title, srt_in, sizeof(srt_in)))
+    logok("Matched a subtitle file for %s: %s", movie_title, srt_in);
+
   if (!file_exists(srt_in)) {
-    logi("No SRT found for %s; attempting download...", movie_title);
+    logi("No exact SRT found for %s; attempting download...", movie_title);
     if (!download_subtitle_srt(movie_title, srt_in)) {
       logw("Subtitle download failed for %s.", movie_title);
-      logi("No subtitles online - building a fallback subtitle track instead.");
-      if (!make_fallback_srt(movie_path, movie_title, srt_in, num_clips)) {
-        logw("Fallback SRT could not be built. You can still place your own SRT at: %s", srt_in);
-        return false;
+      if (file_exists(srt_ph)) {
+        snprintf(srt_in, sizeof(srt_in), "%s", srt_ph);
+        subs_placeholder = true;
+        logw("Reusing the placeholder subtitle track for %s - the recap will NOT know the real story!", movie_title);
+      } else {
+        if (!make_fallback_srt(movie_path, movie_title, srt_ph, num_clips)) {
+          logw("Placeholder SRT could not be built. You can still place your own SRT at: scripts/srt_files/%s.srt", movie_title);
+          return false;
+        }
+        snprintf(srt_in, sizeof(srt_in), "%s", srt_ph);
+        subs_placeholder = true;
+        logw("NO REAL SUBTITLES for %s! The recap cannot know the story and will be generic.", movie_title);
       }
-      logok("Fallback SRT written: %s", srt_in);
-      subs_placeholder = true;
+      logw("For an accurate recap, put your subtitle file at: scripts/srt_files/%s.srt", movie_title);
     } else {
       logok("Downloaded SRT: %s", srt_in);
     }

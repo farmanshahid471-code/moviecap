@@ -329,7 +329,7 @@ jobs:
             $lines += ""
             $idx++
           }
-          ($lines -join "`r`n") | Set-Content "$free\scripts\srt_files\Free Run (2026).srt"
+          ($lines -join "`r`n") | Set-Content "$free\scripts\srt_files\Free Run 2026 1080p.srt"
           & "C:\ProgramData\chocolatey\bin\ffmpeg.exe" -hide_banner -loglevel error -f lavfi `            -i testsrc=size=640x360:duration=60 -c:v libx264 "$free\movies\Free Run (2026).mp4"
           $env:Path = "C:\ProgramData\chocolatey\bin;C:\Windows\System32;C:\Windows"
           Push-Location $free
@@ -343,6 +343,8 @@ jobs:
             Write-Host "::error title=pfree::cli exited $rc"; exit 1 }
           if (-not (Select-String -Path pfree.log -Pattern "Piper server started automatically" -Quiet)) {
             Write-Host "::error title=pfree::the app did not auto-start the Piper server"; exit 1 }
+          if (-not (Select-String -Path pfree.log -Pattern "Matched a subtitle file" -Quiet)) {
+            Write-Host "::error title=pfree::fuzzy SRT matching did not find the subtitle file"; exit 1 }
           if (-not (Select-String -Path pfree.log -Pattern "Processed: 1" -Quiet)) {
             Write-Host "::error title=pfree::the free keyless generation did not finish"; exit 1 }
           if (-not (Select-String -Path pfree.log -Pattern "Target recap length" -Quiet)) {
