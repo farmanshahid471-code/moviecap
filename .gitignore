@@ -30,3 +30,9 @@ scripts/srt_files/
 client_secrets.json
 cookies.txt
 config.local.json
+
+# test harness artifacts (tests/)
+tests/test_gen
+tests/.scenario
+tests/.srt_to_serve
+tests/.last_prompt_*

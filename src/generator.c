@@ -142,6 +142,12 @@ static void ensure_dir(const char *p) {
   }
 }
 
+static void *xrealloc(void *p, size_t n) {
+  void *q = realloc(p, n);
+  if (!q) die("OOM");
+  return q;
+}
+
 static char *read_entire_file(const char *path) {
   FILE *f = plat_fopen(path, "rb");
   if (!f) return NULL;
@@ -361,6 +367,7 @@ typedef struct {
   char eleven_voice_id[128];
   char eleven_model_id[128];
   char openai_model[128]; /* optional "openai_model" in config.json, default gpt-5.2 */
+  double target_minutes;  /* optional "target_minutes"; 0 = original behaviour (20-30 clips, ~3-4 min) */
 } Config;
 
 static Config load_config_json(const char *path) {
@@ -377,6 +384,8 @@ static Config load_config_json(const char *path) {
   const cJSON *vid = cJSON_GetObjectItemCaseSensitive(root, "eleven_voice_id");
   const cJSON *mid = cJSON_GetObjectItemCaseSensitive(root, "eleven_model_id");
   const cJSON *oam = cJSON_GetObjectItemCaseSensitive(root, "openai_model");
+  const cJSON *tmn = cJSON_GetObjectItemCaseSensitive(root, "target_minutes");
+  if (cJSON_IsNumber(tmn) && tmn->valuedouble > 0) c.target_minutes = tmn->valuedouble;
 
   if (cJSON_IsString(ok)  && ok->valuestring)  strncpy(c.openai_key, ok->valuestring, sizeof(c.openai_key)-1);
   if (cJSON_IsString(ek)  && ek->valuestring)  strncpy(c.eleven_key, ek->valuestring, sizeof(c.eleven_key)-1);
@@ -397,52 +406,6 @@ static Config load_config_json(const char *path) {
 
   cJSON_Delete(root);
   return c;
-}
-
-static int timestamp_to_seconds(const char *ts) {
-  int hh = 0, mm = 0, ss = 0, ms = 0;
-  if (sscanf(ts, "%d:%d:%d,%d", &hh, &mm, &ss, &ms) != 4) return -1;
-  (void)ms;
-  return hh * 3600 + mm * 60 + ss;
-}
-
-static bool convert_srt_timestamps_to_seconds(const char *input_srt, const char *output_srt) {
-  FILE *in = plat_fopen(input_srt, "rb");
-  if (!in) return false;
-  FILE *out = plat_fopen(output_srt, "wb");
-  if (!out) {
-    fclose(in);
-    return false;
-  }
-
-  char line[4096];
-  while (fgets(line, sizeof(line), in)) {
-    while (strstr(line, "<i>")) {
-      char *p = strstr(line, "<i>");
-      memmove(p, p + 3, strlen(p + 3) + 1);
-    }
-    while (strstr(line, "</i>")) {
-      char *p = strstr(line, "</i>");
-      memmove(p, p + 4, strlen(p + 4) + 1);
-    }
-
-    char a[64], b[64];
-    if (sscanf(line, "%63s --> %63s", a, b) == 2 && strchr(a, ':') && strchr(b, ':')) {
-      int s1 = timestamp_to_seconds(a);
-      int s2 = timestamp_to_seconds(b);
-      if (s1 >= 0 && s2 >= 0) {
-        fprintf(out, "%d --> %d\n", s1, s2);
-      } else {
-        fputs(line, out);
-      }
-    } else {
-      fputs(line, out);
-    }
-  }
-
-  fclose(in);
-  fclose(out);
-  return true;
 }
 
 static char *strcasestr_local(const char *haystack, const char *needle) {
@@ -568,6 +531,299 @@ static char *html_to_text_basic(const char *html, size_t n, size_t *out_n) {
   if (!out) out = str_dup("");
   if (out_n) *out_n = len;
   return out;
+}
+
+/* ----------------------- Subtitle decoding + parsing ----------------------- */
+/*
+ * Why this exists: the original read subtitles with fgets()/strlen(). A UTF-16
+ * .srt (very common on Windows) has a zero byte after almost every letter, so
+ * only "\xFF\xFE" + "1" reached OpenAI, and the model invented a generic,
+ * looping "recap" from the title alone. Subtitles are now decoded properly,
+ * parsed into cues, and checked before anything is sent to OpenAI.
+ */
+
+static void sb_put_cp(char **b, size_t *l, size_t *c, unsigned cp) {
+  char t[4];
+  size_t n;
+  if (cp < 0x80)         { t[0] = (char)cp; n = 1; }
+  else if (cp < 0x800)   { t[0] = (char)(0xC0 | (cp >> 6)); t[1] = (char)(0x80 | (cp & 0x3F)); n = 2; }
+  else if (cp < 0x10000) { t[0] = (char)(0xE0 | (cp >> 12)); t[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                           t[2] = (char)(0x80 | (cp & 0x3F)); n = 3; }
+  else                   { t[0] = (char)(0xF0 | (cp >> 18)); t[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                           t[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); t[3] = (char)(0x80 | (cp & 0x3F)); n = 4; }
+  sb_append(b, l, c, t, n);
+}
+
+static bool is_valid_utf8(const unsigned char *p, size_t n) {
+  size_t i = 0;
+  while (i < n) {
+    unsigned char c = p[i];
+    size_t need;
+    if (c < 0x80) { i++; continue; }
+    else if (c >= 0xC2 && c <= 0xDF) need = 1;
+    else if (c >= 0xE0 && c <= 0xEF) need = 2;
+    else if (c >= 0xF0 && c <= 0xF4) need = 3;
+    else return false;
+    for (size_t k = 1; k <= need; k++) {
+      if (i + k >= n || (p[i + k] & 0xC0) != 0x80) return false;
+    }
+    i += need + 1;
+  }
+  return true;
+}
+
+static const unsigned short CP1252_80_9F[32] = {
+  0x20AC,0xFFFD,0x201A,0x0192,0x201E,0x2026,0x2020,0x2021,0x02C6,0x2030,0x0160,0x2039,0x0152,0xFFFD,0x017D,0xFFFD,
+  0xFFFD,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,0x02DC,0x2122,0x0161,0x203A,0x0153,0xFFFD,0x017E,0x0178
+};
+
+/* Decode raw subtitle bytes (UTF-8 / UTF-8 BOM / UTF-16 LE/BE with or without BOM / Windows-1252) to UTF-8. */
+static char *decode_text_to_utf8(const unsigned char *p, size_t n, const char **enc_out) {
+  char *out = NULL;
+  size_t len = 0, cap = 0;
+  const char *enc = "UTF-8";
+  int utf16 = 0; /* 1 = LE, 2 = BE */
+
+  if (n >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) { p += 3; n -= 3; enc = "UTF-8 (BOM)"; }
+  else if (n >= 2 && p[0] == 0xFF && p[1] == 0xFE) { p += 2; n -= 2; utf16 = 1; enc = "UTF-16 LE"; }
+  else if (n >= 2 && p[0] == 0xFE && p[1] == 0xFF) { p += 2; n -= 2; utf16 = 2; enc = "UTF-16 BE"; }
+  else {
+    size_t m = n < 4000 ? n : 4000, z_even = 0, z_odd = 0;
+    for (size_t i = 0; i < m; i++) if (p[i] == 0) { if (i & 1) z_odd++; else z_even++; }
+    if (z_odd > m / 6 && z_even < z_odd / 4) { utf16 = 1; enc = "UTF-16 LE (no BOM)"; }
+    else if (z_even > m / 6 && z_odd < z_even / 4) { utf16 = 2; enc = "UTF-16 BE (no BOM)"; }
+  }
+
+  if (utf16) {
+    for (size_t i = 0; i + 1 < n; i += 2) {
+      unsigned u = (utf16 == 1) ? (unsigned)(p[i] | (p[i + 1] << 8)) : (unsigned)((p[i] << 8) | p[i + 1]);
+      if (u >= 0xD800 && u <= 0xDBFF && i + 3 < n) {
+        unsigned u2 = (utf16 == 1) ? (unsigned)(p[i + 2] | (p[i + 3] << 8)) : (unsigned)((p[i + 2] << 8) | p[i + 3]);
+        if (u2 >= 0xDC00 && u2 <= 0xDFFF) {
+          sb_put_cp(&out, &len, &cap, 0x10000 + ((u - 0xD800) << 10) + (u2 - 0xDC00));
+          i += 2;
+          continue;
+        }
+        u = 0xFFFD;
+      } else if (u >= 0xD800 && u <= 0xDFFF) {
+        u = 0xFFFD;
+      }
+      if (u == 0) continue;
+      sb_put_cp(&out, &len, &cap, u);
+    }
+  } else if (is_valid_utf8(p, n)) {
+    for (size_t i = 0; i < n; i++) if (p[i]) sb_append(&out, &len, &cap, (const char *)&p[i], 1);
+  } else {
+    enc = "Windows-1252";
+    for (size_t i = 0; i < n; i++) {
+      unsigned char c = p[i];
+      if (!c) continue;
+      unsigned cp = (c >= 0x80 && c <= 0x9F) ? CP1252_80_9F[c - 0x80] : c;
+      sb_put_cp(&out, &len, &cap, cp);
+    }
+  }
+
+  if (!out) out = str_dup("");
+  if (enc_out) *enc_out = enc;
+  return out;
+}
+
+static char *read_text_file_utf8(const char *path, const char **enc_out) {
+  FILE *f = plat_fopen(path, "rb");
+  if (!f) return NULL;
+  fseek(f, 0, SEEK_END);
+  long n = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (n < 0) { fclose(f); return NULL; }
+  unsigned char *raw = (unsigned char *)malloc((size_t)n + 1);
+  if (!raw) die("OOM");
+  size_t got = fread(raw, 1, (size_t)n, f);
+  fclose(f);
+  char *txt = decode_text_to_utf8(raw, got, enc_out);
+  free(raw);
+  return txt;
+}
+
+typedef struct {
+  double start, end;
+  char *text;
+} SubCue;
+
+typedef struct {
+  SubCue *items;
+  size_t count, cap;
+  size_t dialogue_chars;
+  double first_start, last_end;
+} SubList;
+
+static void free_sub_list(SubList *l) {
+  if (!l) return;
+  for (size_t i = 0; i < l->count; i++) free(l->items[i].text);
+  free(l->items);
+  memset(l, 0, sizeof(*l));
+}
+
+/* "01:02:03,456" / "01:02:03.456" / "02:03,456" / "1:02:03" -> seconds */
+static bool parse_srt_time(const char *s, double *out) {
+  while (*s == ' ' || *s == '\t') s++;
+  int f[3] = {0, 0, 0}, nf = 0;
+  while (nf < 3 && isdigit((unsigned char)*s)) {
+    int v = 0;
+    while (isdigit((unsigned char)*s)) { v = v * 10 + (*s - '0'); s++; }
+    f[nf++] = v;
+    if (*s == ':') s++; else break;
+  }
+  if (nf < 2) return false;
+  double ms = 0.0;
+  if (*s == ',' || *s == '.') {
+    s++;
+    double scale = 0.1;
+    while (isdigit((unsigned char)*s)) { ms += (*s - '0') * scale; scale /= 10.0; s++; }
+  }
+  double t = (nf == 3) ? f[0] * 3600.0 + f[1] * 60.0 + f[2] : f[0] * 60.0 + f[1];
+  *out = t + ms;
+  return true;
+}
+
+/* strip <i>, </font ...>, {\an8} etc., collapse whitespace */
+static void clean_sub_line(const char *in, char *out, size_t outsz) {
+  size_t j = 0;
+  bool space = false;
+  for (size_t i = 0; in[i] && j + 1 < outsz; i++) {
+    char c = in[i];
+    if (c == '<') { const char *e = strchr(in + i, '>'); if (e) { i = (size_t)(e - in); continue; } }
+    if (c == '{') { const char *e = strchr(in + i, '}'); if (e) { i = (size_t)(e - in); continue; } }
+    if (c == '\t' || c == ' ') { space = (j > 0); continue; }
+    if (space) { out[j++] = ' '; space = false; if (j + 1 >= outsz) break; }
+    out[j++] = c;
+  }
+  out[j] = 0;
+}
+
+static void sub_push(SubList *l, double a, double b, const char *text) {
+  if (!text || !text[0]) return;
+  if (l->count + 1 > l->cap) {
+    l->cap = l->cap ? l->cap * 2 : 1024;
+    l->items = (SubCue *)xrealloc(l->items, l->cap * sizeof(SubCue));
+  }
+  l->items[l->count].start = a;
+  l->items[l->count].end = b;
+  l->items[l->count].text = str_dup(text);
+  l->count++;
+  l->dialogue_chars += strlen(text);
+  if (l->count == 1 || a < l->first_start) l->first_start = a;
+  if (b > l->last_end) l->last_end = b;
+}
+
+static bool is_all_digits(const char *s) {
+  if (!*s) return false;
+  for (; *s; s++) if (!isdigit((unsigned char)*s)) return false;
+  return true;
+}
+
+static SubList parse_srt_text(const char *txt) {
+  SubList l;
+  memset(&l, 0, sizeof(l));
+  char cur[8192] = {0};
+  char pending_num[64] = {0};
+  bool in_cue = false;
+  double a = 0, b = 0;
+
+  const char *p = txt;
+  while (*p) {
+    const char *e = p;
+    while (*e && *e != '\n') e++;
+    size_t n = (size_t)(e - p);
+    char line[4096];
+    if (n >= sizeof(line)) n = sizeof(line) - 1;
+    memcpy(line, p, n);
+    line[n] = 0;
+    while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == ' ')) line[--n] = 0;
+    p = *e ? e + 1 : e;
+
+    char *arrow = strstr(line, "-->");
+    double ta, tb;
+    if (arrow && parse_srt_time(line, &ta) && parse_srt_time(arrow + 3, &tb)) {
+      if (in_cue) sub_push(&l, a, b, cur);
+      cur[0] = 0;
+      pending_num[0] = 0;
+      a = ta; b = tb;
+      in_cue = true;
+      continue;
+    }
+    if (!in_cue) continue;
+    if (line[0] == 0) { sub_push(&l, a, b, cur); cur[0] = 0; in_cue = false; continue; }
+
+    char clean[4096];
+    clean_sub_line(line, clean, sizeof(clean));
+    if (!clean[0]) continue;
+    if (is_all_digits(clean) && strlen(clean) < sizeof(pending_num)) {
+      /* could be the next cue's index (missing blank line) - decide on the next line */
+      if (pending_num[0]) { strncat(cur, " ", sizeof(cur) - strlen(cur) - 1); strncat(cur, pending_num, sizeof(cur) - strlen(cur) - 1); }
+      snprintf(pending_num, sizeof(pending_num), "%s", clean);
+      continue;
+    }
+    if (pending_num[0]) {
+      if (cur[0]) strncat(cur, " ", sizeof(cur) - strlen(cur) - 1);
+      strncat(cur, pending_num, sizeof(cur) - strlen(cur) - 1);
+      pending_num[0] = 0;
+    }
+    if (cur[0]) strncat(cur, " ", sizeof(cur) - strlen(cur) - 1);
+    strncat(cur, clean, sizeof(cur) - strlen(cur) - 1);
+  }
+  if (in_cue) sub_push(&l, a, b, cur);
+  return l;
+}
+
+/* Compact planning text: one line per subtitle, "START-END: dialogue" (whole seconds). */
+static char *sub_list_to_planning_text(const SubList *l) {
+  char *out = NULL;
+  size_t len = 0, cap = 0;
+  for (size_t i = 0; i < l->count; i++) {
+    char head[64];
+    int n = snprintf(head, sizeof(head), "%d-%d: ", (int)floor(l->items[i].start), (int)ceil(l->items[i].end));
+    sb_append(&out, &len, &cap, head, (size_t)n);
+    sb_append(&out, &len, &cap, l->items[i].text, strlen(l->items[i].text));
+    sb_append(&out, &len, &cap, "\n", 1);
+  }
+  if (!out) out = str_dup("");
+  return out;
+}
+
+static void fmt_mmss(double t, char *out, size_t outsz) {
+  int s = (int)(t + 0.5);
+  if (s >= 3600) snprintf(out, outsz, "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60);
+  else snprintf(out, outsz, "%d:%02d", s / 60, s % 60);
+}
+
+/* Refuse to plan from subtitles that are empty, truncated or belong to another movie. */
+static bool check_subtitles(const SubList *l, double movie_dur, char *why, size_t whysz) {
+  why[0] = 0;
+  if (l->count < 40 || l->dialogue_chars < 1500) {
+    snprintf(why, whysz,
+             "the subtitle file has almost no readable dialogue (%zu subtitle lines, %zu characters). "
+             "It is probably empty, damaged or in an unsupported format",
+             l->count, l->dialogue_chars);
+    return false;
+  }
+  if (movie_dur > 60.0) {
+    char a[32], b[32];
+    fmt_mmss(l->last_end, a, sizeof(a));
+    fmt_mmss(movie_dur, b, sizeof(b));
+    if (l->last_end < movie_dur * 0.5) {
+      snprintf(why, whysz,
+               "the subtitles stop at %s but the movie is %s long - they are incomplete or for a different movie/cut",
+               a, b);
+      return false;
+    }
+    if (l->last_end > movie_dur * 1.25 + 60.0) {
+      snprintf(why, whysz,
+               "the subtitles run until %s but the movie is only %s long - they are for a different movie or cut",
+               a, b);
+      return false;
+    }
+  }
+  return true;
 }
 
 /* ----------------------- Subtitle downloader ---------------------- */
@@ -1100,11 +1356,6 @@ static ClipPlanList parse_clip_plan_json(const char *json_text) {
   return out;
 }
 
-static void *xrealloc(void *p, size_t n) {
-  void *q = realloc(p, n);
-  if (!q) die("OOM");
-  return q;
-}
 
 static char *sanitize_utf8_lossy(const char *in) {
   if (!in) return str_dup("");
@@ -1202,56 +1453,103 @@ static char *trim_copy_utf8_safe(const char *s, size_t max_bytes) {
   return out;
 }
 
-static ClipPlanList openai_make_plan(const Config *cfg,
-                                     const char *movie_title,
-                                     const char *subs_seconds_text,
-                                     const char *optional_script_text,
-                                     int num_clips,
-                                     bool *out_retry_without_script) {
+/* ----------------------- Story planning (OpenAI) ----------------------- */
+
+static const char *PLAN_SYSTEM_PROMPT =
+  "You are an engaging YouTube movie-recap storyteller. You retell a movie's actual plot as one "
+  "continuous story, like explaining it to a friend who hasn't seen it. You ONLY use what is in the "
+  "material you are given; you never fall back on generic trailer phrases or filler, and you never "
+  "repeat yourself. You always answer with a single JSON object.";
+
+static void sb_add(char **b, size_t *l, size_t *c, const char *s) { sb_append(b, l, c, s, strlen(s)); }
+
+static char *build_plan_prompt(const char *title, const char *subs, const char *script,
+                               int num_clips, double movie_dur) {
+  char *p = NULL;
+  size_t l = 0, c = 0;
+  char tmp[1024];
+  int dur_s = (int)movie_dur;
+
+  sb_add(&p, &l, &c, "Movie: ");
+  sb_add(&p, &l, &c, title);
+  sb_add(&p, &l, &c, "\n");
+  if (dur_s > 0) {
+    snprintf(tmp, sizeof(tmp), "Movie length: %d seconds (%d min).\n", dur_s, dur_s / 60);
+    sb_add(&p, &l, &c, tmp);
+  }
+  sb_add(&p, &l, &c,
+    "\nINPUT A - the movie's subtitles. One line per subtitle: \"START-END: dialogue\" (seconds from the "
+    "start of the movie). This is the ONLY source of truth for what happens and when.\n");
+  sb_add(&p, &l, &c, subs);
+  sb_add(&p, &l, &c,
+    "\n\nINPUT B - optional screenplay text without timestamps (may be a different draft, may be empty). "
+    "Use it only to understand context; if it disagrees with INPUT A, INPUT A wins.\n");
+  sb_add(&p, &l, &c, script && script[0] ? script : "(empty)");
+
+  sb_add(&p, &l, &c,
+    "\n\nSTEP 1 - Understand the story from INPUT A: who the main characters are (use the names that "
+    "appear in the dialogue), what the protagonist wants, the main conflict, the turning points, the "
+    "climax and how it actually ends.\n\n");
+  snprintf(tmp, sizeof(tmp),
+    "STEP 2 - Tell that story as a recap split into %d clips, in chronological order:\n", num_clips);
+  sb_add(&p, &l, &c, tmp);
+  sb_add(&p, &l, &c,
+    "- Structure: Hook -> Setup (the characters and their normal world) -> Inciting incident -> Rising "
+    "action -> Climax -> Resolution. Cover the whole movie, including the real ending.\n"
+    "- Each narration continues the story from the previous one. Use character names. Explain WHY "
+    "characters act, not just what happens. Summarize; don't transcribe dialogue.\n"
+    "- Narration length: 20-35 words per clip, 2-4 short, natural, conversational sentences.\n"
+    "- STRICT: every narration must mention specific people, places, objects or events from THIS "
+    "movie's subtitles. No generic trailer phrases (for example: \"tensions boil over\", \"secrets "
+    "surface\", \"our hero digs deep\", \"wastes no time\", \"nothing will ever be the same\"). Never "
+    "repeat a sentence. Never pad or loop.\n");
+  sb_add(&p, &l, &c,
+    "- Clip time ranges: chosen ONLY from INPUT A timestamps, at the moment the narrated event happens "
+    "on screen; 8-16 seconds each (never more than 20); non-overlapping; increasing; never starting at 0.\n");
+  if (dur_s > 0) {
+    snprintf(tmp, sizeof(tmp), "- Every clip must end before second %d.\n", dur_s);
+    sb_add(&p, &l, &c, tmp);
+  }
+  sb_add(&p, &l, &c,
+    "- If INPUT A does not contain enough dialogue to understand the story, do NOT invent one: return "
+    "{\"error\":\"<why>\"} instead.\n");
+  sb_add(&p, &l, &c, "- The first narration must start with: \"Here we go, let's go over the movie ");
+  sb_add(&p, &l, &c, title);
+  sb_add(&p, &l, &c, ".\"\n\n");
+  sb_add(&p, &l, &c,
+    "Return STRICT JSON only, in exactly this shape:\n"
+    "{\"main_characters\":[\"names exactly as they appear in the subtitles\"],"
+    "\"story_summary\":\"3-5 sentences summarizing the actual plot, including the ending\","
+    "\"clips\":[{\"start\":120,\"end\":132,\"narration\":\"...\"}]}\n");
+  return p;
+}
+
+/*
+ * One planning request. Returns the model's JSON text (caller frees) or NULL.
+ * prev_output/feedback: when set, the previous (rejected) answer and the reasons
+ * are sent back so the model can fix them.
+ */
+static char *openai_request_plan(const Config *cfg, const char *movie_title, const char *subs_text,
+                                 const char *optional_script_text, int num_clips, double movie_dur,
+                                 const char *prev_output, const char *feedback,
+                                 bool *out_retry_without_script) {
   if (out_retry_without_script) *out_retry_without_script = false;
 
   const size_t MAX_SUB_CHARS    = 320000;
   const size_t MAX_SCRIPT_CHARS = 80000;
 
   char *title_utf8 = sanitize_utf8_lossy(movie_title ? movie_title : "");
-  char *subs_utf8  = sanitize_utf8_lossy(subs_seconds_text ? subs_seconds_text : "");
+  char *subs_utf8  = sanitize_utf8_lossy(subs_text ? subs_text : "");
   char *scr_utf8   = sanitize_utf8_lossy(optional_script_text ? optional_script_text : "");
 
   char *subs_trim = trim_copy_utf8_safe(subs_utf8, MAX_SUB_CHARS);
   char *scr_trim  = trim_copy_utf8_safe(scr_utf8,  MAX_SCRIPT_CHARS);
-
+  if (strlen(subs_utf8) > MAX_SUB_CHARS)
+    logw("Subtitles are very long (%zu bytes); only the first %zu bytes are sent.", strlen(subs_utf8), MAX_SUB_CHARS);
   free(subs_utf8);
   free(scr_utf8);
 
-  const char *prompt_fmt =
-    "You are given TWO inputs.\n"
-    "Movie: %s\n"
-    "\n"
-    "INPUT A (Subtitles with timestamps in SECONDS):\n"
-    "%s\n"
-    "\n"
-    "INPUT B (Optional script text WITHOUT timestamps; may be empty):\n"
-    "%s\n"
-    "\n"
-    "TASK:\n"
-    "- Choose %d non-overlapping time ranges that best cover the full plot arc.\n"
-    "- ONLY use INPUT A for selecting start/end times (seconds). INPUT B is for story context.\n"
-    "- Each time range should usually be 8-16 seconds long (end-start). Avoid >20 seconds.\n"
-    "- Keep narrations punchy but not tiny: about 20-35 words total, in 3-5 short sentences.\n"
-    "- Prefer ranges with clear visual action (reveals, confrontations, entrances, big moments).\n"
-    "- Skip any range that starts at 0.\n"
-    "- Return STRICT JSON with this shape ONLY:\n"
-    "  {\"clips\":[{\"start\":120,\"end\":145,\"narration\":\"...\"}, ...]}\n"
-    "- Clips must be increasing by start time.\n"
-    "- Each narration must be at least 3 full sentences, casual commentator vibe.\n"
-    "- The first narration must start with: \"Here we go, let's go over the movie %s.\".\n";
-
-  int plen = snprintf(NULL, 0, prompt_fmt, title_utf8, subs_trim, scr_trim, num_clips, title_utf8);
-  if (plen < 0) die("snprintf failed building prompt");
-  char *prompt = (char *)malloc((size_t)plen + 1);
-  if (!prompt) die("OOM");
-  snprintf(prompt, (size_t)plen + 1, prompt_fmt, title_utf8, subs_trim, scr_trim, num_clips, title_utf8);
-
+  char *prompt = build_plan_prompt(title_utf8, subs_trim, scr_trim, num_clips, movie_dur);
   free(title_utf8);
   free(subs_trim);
   free(scr_trim);
@@ -1266,13 +1564,35 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   cJSON *input = cJSON_CreateArray();
   cJSON *sys = cJSON_CreateObject();
   cJSON_AddStringToObject(sys, "role", "system");
-  cJSON_AddStringToObject(sys, "content", "You are a helpful assistant designed to output JSON.");
+  cJSON_AddStringToObject(sys, "content", PLAN_SYSTEM_PROMPT);
   cJSON_AddItemToArray(input, sys);
 
   cJSON *usr = cJSON_CreateObject();
   cJSON_AddStringToObject(usr, "role", "user");
   cJSON_AddStringToObject(usr, "content", prompt);
   cJSON_AddItemToArray(input, usr);
+
+  if (prev_output && feedback) {
+    char *prev_utf8 = sanitize_utf8_lossy(prev_output);
+    cJSON *asst = cJSON_CreateObject();
+    cJSON_AddStringToObject(asst, "role", "assistant");
+    cJSON_AddStringToObject(asst, "content", prev_utf8);
+    cJSON_AddItemToArray(input, asst);
+    free(prev_utf8);
+
+    char *fb = NULL;
+    size_t fl = 0, fc = 0;
+    sb_add(&fb, &fl, &fc, "Your answer was rejected for these reasons:\n");
+    sb_add(&fb, &fl, &fc, feedback);
+    sb_add(&fb, &fl, &fc,
+      "\nRewrite the whole recap from scratch. Every narration must be about specific events and the "
+      "named characters from INPUT A (the subtitles). No repeated sentences, no generic filler. Same JSON format.");
+    cJSON *fbm = cJSON_CreateObject();
+    cJSON_AddStringToObject(fbm, "role", "user");
+    cJSON_AddStringToObject(fbm, "content", fb);
+    cJSON_AddItemToArray(input, fbm);
+    free(fb);
+  }
   cJSON_AddItemToObject(req, "input", input);
 
   cJSON *text = cJSON_CreateObject();
@@ -1284,11 +1604,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   char *body = cJSON_PrintUnformatted(req);
   cJSON_Delete(req);
   free(prompt);
-
-  if (!body) {
-    ClipPlanList empty = {0};
-    return empty;
-  }
+  if (!body) return NULL;
 
   long http_code = 0;
   bool has_script = (optional_script_text && optional_script_text[0] != 0);
@@ -1301,34 +1617,251 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   if (http_code < 200 || http_code >= 300) {
     logw("OpenAI HTTP %ld", http_code);
     if (resp.data && resp.size) logw("OpenAI raw body: %.800s", resp.data);
-
     if (has_script && resp.data && openai_resp_should_retry_without_script(resp.data)) {
       if (out_retry_without_script) *out_retry_without_script = true;
     }
-
     if (resp.data) free(resp.data);
-    ClipPlanList empty = {0};
-    return empty;
+    return NULL;
   }
 
   char *out_text = openai_extract_output_text(resp.data ? resp.data : "");
   if (!out_text) {
     logw("OpenAI response parse failed.");
     if (resp.data && resp.size) logw("OpenAI raw body: %.800s", resp.data);
-
     if (has_script && resp.data && openai_resp_should_retry_without_script(resp.data)) {
       if (out_retry_without_script) *out_retry_without_script = true;
     }
+  }
+  if (resp.data) free(resp.data);
+  return out_text;
+}
 
-    if (resp.data) free(resp.data);
-    ClipPlanList empty = {0};
-    return empty;
+typedef struct {
+  ClipPlanList clips;
+  char *summary;
+  char **chars;
+  size_t n_chars;
+  char *error; /* the model said it could not do it */
+} StoryPlan;
+
+static void free_story_plan(StoryPlan *sp) {
+  if (!sp) return;
+  free_clip_plan_list(&sp->clips);
+  free(sp->summary);
+  for (size_t i = 0; i < sp->n_chars; i++) free(sp->chars[i]);
+  free(sp->chars);
+  free(sp->error);
+  memset(sp, 0, sizeof(*sp));
+}
+
+static StoryPlan parse_story_plan(const char *json_text) {
+  StoryPlan sp;
+  memset(&sp, 0, sizeof(sp));
+  if (!json_text) return sp;
+  sp.clips = parse_clip_plan_json(json_text);
+  cJSON *root = cJSON_Parse(json_text);
+  if (!root) return sp;
+  cJSON *sum = cJSON_GetObjectItemCaseSensitive(root, "story_summary");
+  if (cJSON_IsString(sum) && sum->valuestring) sp.summary = str_dup(sum->valuestring);
+  cJSON *err = cJSON_GetObjectItemCaseSensitive(root, "error");
+  if (cJSON_IsString(err) && err->valuestring && err->valuestring[0]) sp.error = str_dup(err->valuestring);
+  cJSON *chars = cJSON_GetObjectItemCaseSensitive(root, "main_characters");
+  if (cJSON_IsArray(chars)) {
+    int n = cJSON_GetArraySize(chars);
+    sp.chars = (char **)calloc((size_t)(n > 0 ? n : 1), sizeof(char *));
+    if (!sp.chars) die("OOM");
+    cJSON *it = NULL;
+    cJSON_ArrayForEach(it, chars) {
+      if (cJSON_IsString(it) && it->valuestring && it->valuestring[0]) sp.chars[sp.n_chars++] = str_dup(it->valuestring);
+    }
+  }
+  cJSON_Delete(root);
+  return sp;
+}
+
+/* lowercase letters/digits only, single spaces */
+static void normalize_sentence(const char *in, size_t n, char *out, size_t outsz, int *words) {
+  size_t j = 0;
+  bool sp = false;
+  *words = 0;
+  for (size_t i = 0; i < n && j + 1 < outsz; i++) {
+    unsigned char c = (unsigned char)in[i];
+    if (isalnum(c) || c >= 0x80) {
+      if (sp && j > 0) { out[j++] = ' '; if (j + 1 >= outsz) break; }
+      if (j == 0 || sp) (*words)++;
+      sp = false;
+      out[j++] = (char)tolower(c);
+    } else if (c == ' ' || c == '\t' || c == '\n' || c == '-' || c == ',') {
+      sp = true;
+    }
+  }
+  out[j] = 0;
+}
+
+static int cmp_strp(const void *a, const void *b) {
+  return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+/* Does `name` (any word of it, >= 3 letters) appear in `hay`? */
+static bool name_appears(const char *name, const char *hay) {
+  char w[128];
+  const char *p = name;
+  while (*p) {
+    while (*p && !isalnum((unsigned char)*p) && (unsigned char)*p < 0x80) p++;
+    size_t j = 0;
+    while (*p && (isalnum((unsigned char)*p) || (unsigned char)*p >= 0x80 || *p == '\'') && j + 1 < sizeof(w)) w[j++] = *p++;
+    w[j] = 0;
+    if (j >= 3 && strcasestr_local(hay, w)) return true;
+    if (j == 0 && *p) p++;
+  }
+  return false;
+}
+
+static const char *GENERIC_PHRASES[] = {
+  "wastes no time", "tensions boil", "tensions rise", "tensions run high", "secrets surface",
+  "digs deep", "old allies", "brand new enemies", "nothing will ever be the same",
+  "stakes have never been higher", "things take a dark turn", "against all odds",
+  "little do they know", "throws our characters", "everything changes", "a race against time",
+  NULL
+};
+
+/*
+ * Reject scripts that are not about the movie: looping/repeated sentences,
+ * generic trailer filler, characters that never appear in the subtitles,
+ * too few usable clips. Returns true if OK; otherwise `problems` lists why.
+ */
+static bool validate_story_plan(const StoryPlan *sp, const char *dialogue, double movie_dur,
+                                int num_clips, char *problems, size_t psz) {
+  problems[0] = 0;
+  size_t pl = 0;
+#define ADD_PROBLEM(...) do { if (pl < psz) { int _n = snprintf(problems + pl, psz - pl, __VA_ARGS__); if (_n > 0) pl += (size_t)_n; } } while (0)
+
+  if (sp->error) {
+    ADD_PROBLEM("- the model said it could not write the recap: %s\n", sp->error);
+    return false;
+  }
+  const ClipPlanList *cl = &sp->clips;
+  if (cl->count == 0) {
+    ADD_PROBLEM("- no clips were returned\n");
+    return false;
   }
 
-  ClipPlanList plan = parse_clip_plan_json(out_text);
-  free(out_text);
-  if (resp.data) free(resp.data);
-  return plan;
+  /* usable clips */
+  size_t usable = 0, out_of_range = 0;
+  int prev_end = 0;
+  for (size_t i = 0; i < cl->count; i++) {
+    int s = cl->items[i].start, e = cl->items[i].end;
+    bool ok = s > 0 && e > s && s >= prev_end - 1;
+    if (movie_dur > 1.0 && e > movie_dur + 1.0) { ok = false; out_of_range++; }
+    if (ok) { usable++; prev_end = e; }
+  }
+  /* fewer clips than asked only makes the video shorter; reject only if far too few */
+  size_t need = (size_t)(num_clips * 0.3);
+  if (need < 3) need = 3;
+  if (usable < need)
+    ADD_PROBLEM("- only %zu usable clips (asked for %d); %zu clips had timestamps past the end of the movie\n",
+                usable, num_clips, out_of_range);
+
+  /* repeated sentences (the "endless loop" failure) */
+  size_t cap = 64, ns = 0;
+  char **sents = (char **)malloc(cap * sizeof(char *));
+  if (!sents) die("OOM");
+  size_t identical_narrations = 0;
+  for (size_t i = 0; i < cl->count; i++) {
+    const char *t = cl->items[i].narration;
+    for (size_t k = 0; k < i; k++) if (strcmp(cl->items[k].narration, t) == 0) { identical_narrations++; break; }
+    const char *st = t;
+    bool first_sentence = true;
+    for (const char *q = t;; q++) {
+      if (*q == '.' || *q == '!' || *q == '?' || *q == 0) {
+        char norm[512];
+        int words = 0;
+        normalize_sentence(st, (size_t)(q - st), norm, sizeof(norm), &words);
+        bool intro = (i == 0 && first_sentence);
+        if (words >= 2 && !intro) {
+          if (ns + 1 > cap) { cap *= 2; sents = (char **)xrealloc(sents, cap * sizeof(char *)); }
+          sents[ns++] = str_dup(norm);
+        }
+        if (words > 0) first_sentence = false;
+        if (*q == 0) break;
+        st = q + 1;
+      }
+    }
+  }
+  qsort(sents, ns, sizeof(char *), cmp_strp);
+  size_t repeats = 0;
+  const char *example = NULL;
+  for (size_t i = 1; i < ns; i++) {
+    if (strcmp(sents[i], sents[i - 1]) == 0) { repeats++; if (!example) example = sents[i]; }
+  }
+  if (identical_narrations > 0 || (repeats >= 2 && repeats * 20 > ns)) {
+    ADD_PROBLEM("- %zu repeated sentences and %zu identical narrations (it is looping), e.g. \"%.120s\"\n",
+                repeats, identical_narrations, example ? example : cl->items[0].narration);
+  }
+  for (size_t i = 0; i < ns; i++) free(sents[i]);
+  free(sents);
+
+  /* generic filler */
+  size_t generic = 0;
+  const char *gex = NULL;
+  for (size_t i = 0; i < cl->count; i++) {
+    for (int g = 0; GENERIC_PHRASES[g]; g++) {
+      if (strcasestr_local(cl->items[i].narration, GENERIC_PHRASES[g])) { generic++; if (!gex) gex = GENERIC_PHRASES[g]; break; }
+    }
+  }
+  if (generic > 2 && generic * 5 > cl->count)
+    ADD_PROBLEM("- %zu of %zu narrations use generic trailer phrases (e.g. \"%s\") instead of describing the movie\n",
+                generic, cl->count, gex);
+
+  /* grounding: characters must come from the subtitles, and be used */
+  if (sp->n_chars == 0) {
+    ADD_PROBLEM("- no main characters were named\n");
+  } else {
+    size_t found = 0;
+    char missing[512] = {0};
+    for (size_t i = 0; i < sp->n_chars; i++) {
+      if (name_appears(sp->chars[i], dialogue)) found++;
+      else if (strlen(missing) + strlen(sp->chars[i]) + 3 < sizeof(missing)) {
+        if (missing[0]) strcat(missing, ", ");
+        strcat(missing, sp->chars[i]);
+      }
+    }
+    if (found * 2 < sp->n_chars)
+      ADD_PROBLEM("- most of the named characters never appear in the subtitles (%s) - the story was not taken from them\n",
+                  missing);
+    size_t mentions = 0;
+    for (size_t i = 0; i < cl->count; i++) {
+      for (size_t k = 0; k < sp->n_chars; k++) {
+        if (name_appears(sp->chars[k], dialogue) && name_appears(sp->chars[k], cl->items[i].narration)) { mentions++; break; }
+      }
+    }
+    if (found > 0 && mentions * 4 < cl->count)
+      ADD_PROBLEM("- only %zu of %zu narrations mention any of the main characters by name\n", mentions, cl->count);
+  }
+#undef ADD_PROBLEM
+  return problems[0] == 0;
+}
+
+/* output/<Title>_script.txt so the recap can be read before/after rendering */
+static void write_script_file(const char *path, const char *movie_title, const StoryPlan *sp, const char *problems) {
+  FILE *f = plat_fopen(path, "wb");
+  if (!f) { logw("Could not write %s", path); return; }
+  fprintf(f, "%s - recap script\n\n", movie_title);
+  if (problems && problems[0]) fprintf(f, "REJECTED because:\n%s\n", problems);
+  if (sp->n_chars) {
+    fprintf(f, "Main characters: ");
+    for (size_t i = 0; i < sp->n_chars; i++) fprintf(f, "%s%s", i ? ", " : "", sp->chars[i]);
+    fprintf(f, "\n");
+  }
+  if (sp->summary) fprintf(f, "Summary: %s\n", sp->summary);
+  fprintf(f, "\n");
+  for (size_t i = 0; i < sp->clips.count; i++) {
+    char a[32], b[32];
+    fmt_mmss(sp->clips.items[i].start, a, sizeof(a));
+    fmt_mmss(sp->clips.items[i].end, b, sizeof(b));
+    fprintf(f, "[%s - %s]  %s\n\n", a, b, sp->clips.items[i].narration);
+  }
+  fclose(f);
 }
 
 static bool elevenlabs_tts_to_mp3(const Config *cfg, const char *text, const char *out_mp3_path) {
@@ -1691,7 +2224,9 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   snprintf(srt_mod, sizeof(srt_mod), "scripts/srt_files/%s_modified.srt", movie_title);
   snprintf(script_txt, sizeof(script_txt), "scripts/srt_files/%s_summary.txt", movie_title);
 
+  bool downloaded_now = false;
   if (!file_exists(srt_in)) {
+    downloaded_now = true;
     logi("No SRT found for %s; attempting download...", movie_title);
     if (!download_subtitle_srt(movie_title, srt_in)) {
       logw("Subtitle download failed for %s. Place your SRT at: %s", movie_title, srt_in);
@@ -1702,16 +2237,62 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     logok("Found SRT: %s", srt_in);
   }
 
-  if (!file_exists(srt_mod)) {
-    logi("Converting SRT timestamps -> seconds: %s -> %s", srt_in, srt_mod);
-    if (!convert_srt_timestamps_to_seconds(srt_in, srt_mod)) {
-      logw("Failed to convert SRT for %s", movie_title);
-      return false;
-    }
-    logok("Converted subtitles (seconds): %s", srt_mod);
-  } else {
-    logok("Using cached converted subtitles: %s", srt_mod);
+  /* Decode + parse the subtitles every run (never trust a cached conversion). */
+  const char *enc = "?";
+  char *srt_raw = read_text_file_utf8(srt_in, &enc);
+  if (!srt_raw) {
+    logw("Could not read %s", srt_in);
+    return false;
   }
+  SubList subs = parse_srt_text(srt_raw);
+  free(srt_raw);
+
+  double movie_dur = ffprobe_duration_seconds(movie_path);
+  {
+    char a[32], b[32];
+    fmt_mmss(subs.last_end, a, sizeof(a));
+    fmt_mmss(movie_dur > 0 ? movie_dur : 0, b, sizeof(b));
+    logi("Subtitles: %zu lines of dialogue, %zu characters, encoding %s, last line at %s (movie length %s)",
+         subs.count, subs.dialogue_chars, enc, a, b);
+  }
+
+  char why[512];
+  if (!check_subtitles(&subs, movie_dur, why, sizeof(why))) {
+    logw("STOPPED before calling OpenAI: %s.", why);
+    if (downloaded_now) {
+      /* keep it for inspection, but out of the way so the next run downloads again */
+      char bad[PATH_MAX];
+      snprintf(bad, sizeof(bad), "scripts/srt_files/%s.srt.bad", movie_title);
+      plat_rename(srt_in, bad);
+      logw("The downloaded subtitle was moved to %s.", bad);
+    }
+    logw("Fix: put a correct English .srt for this exact movie at %s and press START again.", srt_in);
+    free_sub_list(&subs);
+    return false;
+  }
+  for (size_t i = 0; i < subs.count && i < 3; i++) {
+    size_t k = subs.count / 2 + i; /* a few lines from the middle, as proof the dialogue was read */
+    if (k >= subs.count) break;
+    logi("  sample %d-%ds: %.120s", (int)subs.items[k].start, (int)subs.items[k].end, subs.items[k].text);
+  }
+
+  char *subs_seconds = sub_list_to_planning_text(&subs);
+  if (!write_entire_file(srt_mod, subs_seconds, strlen(subs_seconds)))
+    logw("Could not write %s (continuing)", srt_mod);
+  else
+    logok("Subtitles prepared for planning: %s", srt_mod);
+
+  /* all dialogue in one string, used to check the AI's script against the movie */
+  char *dialogue = NULL;
+  {
+    size_t dl = 0, dc = 0;
+    for (size_t i = 0; i < subs.count; i++) {
+      sb_append(&dialogue, &dl, &dc, subs.items[i].text, strlen(subs.items[i].text));
+      sb_append(&dialogue, &dl, &dc, "\n", 1);
+    }
+    if (!dialogue) dialogue = str_dup("");
+  }
+  free_sub_list(&subs);
 
   long sz = file_size_bytes(script_txt);
   if (sz >= 0 && sz < 200) {
@@ -1731,13 +2312,6 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     }
   }
 
-  char *subs_seconds = read_entire_file(srt_mod);
-  if (!subs_seconds) {
-    logw("Failed to read converted subtitles for %s: %s", movie_title, srt_mod);
-    return false;
-  }
-  logok("Loaded subtitles for planning: %s (%zu bytes)", srt_mod, strlen(subs_seconds));
-
   char *imsdb_script = NULL;
   if (file_exists(script_txt)) {
     imsdb_script = read_entire_file(script_txt);
@@ -1751,26 +2325,79 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     logi("No IMSDb script available; using subtitles only.");
   }
 
-  logi("Requesting OpenAI clip plan (%d clips target)...", num_clips);
-  bool retry_no_script = false;
-  ClipPlanList plan = openai_make_plan(cfg, movie_title, subs_seconds,
-                                       imsdb_script ? imsdb_script : "",
-                                       num_clips, &retry_no_script);
+  const char *script_ctx = (imsdb_script && imsdb_script[0]) ? imsdb_script : "";
 
-  if (plan.count == 0 && retry_no_script && imsdb_script && imsdb_script[0]) {
+  logi("Requesting the recap script from OpenAI (%s, %d clips)...", cfg->openai_model, num_clips);
+  bool retry_no_script = false;
+  char *plan_json = openai_request_plan(cfg, movie_title, subs_seconds, script_ctx, num_clips, movie_dur,
+                                        NULL, NULL, &retry_no_script);
+  if (!plan_json && retry_no_script && script_ctx[0]) {
     logw("OpenAI request failed with IMSDb context; retrying without IMSDb script for %s", movie_title);
-    plan = openai_make_plan(cfg, movie_title, subs_seconds, "", num_clips, NULL);
+    script_ctx = "";
+    plan_json = openai_request_plan(cfg, movie_title, subs_seconds, "", num_clips, movie_dur, NULL, NULL, NULL);
+  }
+
+  StoryPlan sp = parse_story_plan(plan_json);
+  char problems[2048];
+  bool plan_ok = plan_json && validate_story_plan(&sp, dialogue, movie_dur, num_clips, problems, sizeof(problems));
+
+  if (plan_json && !plan_ok) {
+    logw("The AI's script failed the quality check:");
+    for (char *ln = strtok(problems, "\n"); ln; ln = strtok(NULL, "\n")) logw("  %s", ln);
+    /* strtok destroyed `problems`; rebuild it for the feedback message */
+    validate_story_plan(&sp, dialogue, movie_dur, num_clips, problems, sizeof(problems));
+    logi("Asking OpenAI to rewrite it (1 retry)...");
+    char *plan_json2 = openai_request_plan(cfg, movie_title, subs_seconds, script_ctx, num_clips, movie_dur,
+                                           plan_json, problems, NULL);
+    if (plan_json2) {
+      free_story_plan(&sp);
+      free(plan_json);
+      plan_json = plan_json2;
+      sp = parse_story_plan(plan_json);
+      plan_ok = validate_story_plan(&sp, dialogue, movie_dur, num_clips, problems, sizeof(problems));
+    }
   }
 
   free(subs_seconds);
+  free(dialogue);
   if (imsdb_script) free(imsdb_script);
 
-  if (plan.count == 0) {
+  char script_path[PATH_MAX];
+  if (!plan_json) {
     logw("No plan returned for %s", movie_title);
-    free_clip_plan_list(&plan);
+    free_story_plan(&sp);
     return false;
   }
-  logok("OpenAI plan received: %zu clips", plan.count);
+  free(plan_json);
+
+  if (!plan_ok) {
+    snprintf(script_path, sizeof(script_path), "output/%s_REJECTED_script.txt", movie_title);
+    write_script_file(script_path, movie_title, &sp, problems);
+    logw("STOPPED: the AI's script still isn't based on the movie after a retry, so no video was made");
+    logw("(no ElevenLabs credits were spent). Rejected script: %s", script_path);
+    for (char *ln = strtok(problems, "\n"); ln; ln = strtok(NULL, "\n")) logw("  %s", ln);
+    free_story_plan(&sp);
+    return false;
+  }
+
+  snprintf(script_path, sizeof(script_path), "output/%s_script.txt", movie_title);
+  write_script_file(script_path, movie_title, &sp, NULL);
+  logok("Recap script accepted: %zu clips. Saved to %s", sp.clips.count, script_path);
+  if (sp.n_chars) {
+    char names[512] = {0};
+    for (size_t i = 0; i < sp.n_chars; i++) {
+      if (strlen(names) + strlen(sp.chars[i]) + 3 >= sizeof(names)) break;
+      if (i) strcat(names, ", ");
+      strcat(names, sp.chars[i]);
+    }
+    logi("Characters: %s", names);
+  }
+  if (sp.summary) logi("Story: %.400s", sp.summary);
+
+  ClipPlanList plan = sp.clips;
+  sp.clips.items = NULL;
+  sp.clips.count = 0;
+  free_story_plan(&sp);
 
   char concat_list_path[PATH_MAX];
   snprintf(concat_list_path, sizeof(concat_list_path), "clips/%s_concat_list.txt", movie_title);
@@ -2023,6 +2650,13 @@ int run_generation(void) {
 
   srand((unsigned)time(NULL));
   int num_clips = MIN_NUM_CLIPS + (rand() % (MAX_NUM_CLIPS - MIN_NUM_CLIPS + 1));
+  if (cfg.target_minutes > 0) {
+    /* each clip is ~10 s of narration (20-35 words) */
+    num_clips = (int)lround(cfg.target_minutes * 6.0);
+    if (num_clips < 5) num_clips = 5;
+    if (num_clips > 200) num_clips = 200;
+    logi("target_minutes = %.1f -> %d clips", cfg.target_minutes, num_clips);
+  }
 
   /* Collect the movie list first: process_movie() moves files out of movies/,
      and modifying a directory while enumerating it is unreliable on Windows. */

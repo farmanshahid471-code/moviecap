@@ -49,6 +49,26 @@ Given a movie file, AI-Movie-Shorts will:
    - `tiktok_output\<MovieTitle>_vertical.mp4` (9:16 vertical)
 8. Move the source movie to `movies_retired\`
 
+### Quality guards: the recap must come from the movie
+Before spending anything on ElevenLabs or rendering, the app checks two things:
+
+1. **The subtitles are real and complete** (checked *before* OpenAI is called):
+   - encoding is detected automatically: UTF-8, UTF-8 BOM, UTF-16 LE/BE (with or without BOM), Windows-1252
+   - formatting tags (`<i>`, `<font>`, `{\an8}`) are removed
+   - it stops if there is almost no dialogue (fewer than 40 lines), if the subtitles end before the
+     middle of the movie, or if they run much longer than the movie (wrong movie or cut)
+   - the log shows the line count, the encoding and a few sample lines, so you can see the dialogue was read
+2. **The AI's script is about this movie**: it is rejected if it repeats sentences or whole narrations,
+   uses generic trailer filler ("tensions boil over", "secrets surface", ...), names characters who never
+   appear in the subtitles, or rarely mentions the characters at all. A rejected script is sent back to
+   OpenAI once with the reasons. If it is still bad, the movie is **stopped**: no video, no ElevenLabs
+   credits spent, and the script is saved as `output\<Title>_REJECTED_script.txt`.
+
+The prompt asks for a storyteller recap based only on the subtitles: hook, setup, inciting incident,
+rising action, climax, resolution, using character names and explaining *why* things happen. Every
+accepted script is saved as **`output\<Title>_script.txt`**, with the main characters, a plot summary
+and each clip's timestamps and narration.
+
 It also **clears generated files in `clips\` each run** (while preserving the `clips\audio\` folder and only removing files inside it).
 
 ---
@@ -138,6 +158,9 @@ Notes:
 - `eleven_voice_id` defaults to `JBFqnCBsd6RMkjVDRZzb` if omitted.
 - `eleven_model_id` defaults to `eleven_multilingual_v2` if omitted.
 - Optional (new): `"openai_model"`. Defaults to `gpt-5.2`, the same model the original uses.
+- Optional (new): `"target_minutes"`, the approximate recap length (about 6 clips per minute; for example
+  `20` gives about 120 clips). If you leave it out, the original 20–30 clips (about 3–4 minutes) are used.
+  Longer recaps cost more ElevenLabs credits.
 - If the placeholder values (`OpenAIAPI` / `ElevenLabsAPI`) are still there, the app stops with a clear message.
 
 > `config.json` is committed with placeholders only. After you add real keys, run
@@ -270,6 +293,12 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
 - **Filename matters**: `movies\My Movie.mp4` → treated as title `My Movie`
 - **"ffmpeg/ffprobe not found in PATH"** → `winget install Gyan.FFmpeg`, then **close and reopen** the app/terminal so the new PATH applies. Check with `ffmpeg -version`.
 - **Windows SmartScreen** may warn about an unsigned `.exe` you built or downloaded. Click *More info → Run anyway*.
+- **"STOPPED before calling OpenAI: …subtitles…"** → the subtitle file is empty, broken, incomplete or for
+  another movie/cut. A downloaded one is renamed to `<Title>.srt.bad`. Put a correct English `.srt` for your
+  exact movie file at `scripts\srt_files\<Title>.srt` and press START again.
+- **"The AI's script failed the quality check"** → it was sent back once automatically. If it still fails,
+  read `output\<Title>_REJECTED_script.txt`. Usually the subtitles don't match the movie (check the sample
+  lines in the log) or a weaker `openai_model` was set.
 - If you see "plan count = 0" / "No plan returned" or missing clips, check:
   - your OpenAI key (the exact error from OpenAI is shown in the log)
   - network connectivity
