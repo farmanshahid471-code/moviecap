@@ -1432,6 +1432,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
                                      const char *movie_title,
                                      const char *subs_seconds_text,
                                      const char *optional_script_text,
+                                     bool subs_placeholder,
                                      int num_clips,
                                      int per_clip_sec,
                                      bool *out_retry_without_script) {
@@ -1445,6 +1446,16 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   char *scr_utf8   = sanitize_utf8_lossy(optional_script_text ? optional_script_text : "");
 
   char *subs_trim = trim_copy_utf8_safe(subs_utf8, MAX_SUB_CHARS);
+
+  char placeholder_note[512];
+  placeholder_note[0] = '\0';
+  if (subs_placeholder)
+    snprintf(placeholder_note, sizeof(placeholder_note),
+             "\nIMPORTANT: INPUT A is an auto-generated PLACEHOLDER track, NOT the "
+             "real dialogue. You know the movie \"%s\". Retell its ACTUAL plot in "
+             "the narrations, and spread the time ranges evenly across the whole "
+             "runtime shown by the INPUT A timestamps.\n",
+             movie_title);
   char *scr_trim  = trim_copy_utf8_safe(scr_utf8,  MAX_SCRIPT_CHARS);
 
   free(subs_utf8);
@@ -1503,6 +1514,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "\n"
     "INPUT A (Subtitles with timestamps in SECONDS):\n"
     "%s\n"
+    "%s"
     "\n"
     "INPUT B (Optional script text WITHOUT timestamps; may be empty):\n"
     "%s\n"
@@ -1520,13 +1532,13 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "- Each narration must be at least 3 full sentences in the recap style above.\n"
     "- The first narration must start with: \"Here we go, let's go over the movie %s.\".\n";
 
-  int plen = snprintf(NULL, 0, prompt_fmt, title_utf8, subs_trim, scr_trim, num_clips,
-                      range_line, words_line, title_utf8);
+  int plen = snprintf(NULL, 0, prompt_fmt, title_utf8, subs_trim, placeholder_note,
+                      scr_trim, num_clips, range_line, words_line, title_utf8);
   if (plen < 0) die("snprintf failed building prompt");
   char *prompt = (char *)malloc((size_t)plen + 1);
   if (!prompt) die("OOM");
-  snprintf(prompt, (size_t)plen + 1, prompt_fmt, title_utf8, subs_trim, scr_trim, num_clips,
-           range_line, words_line, title_utf8);
+  snprintf(prompt, (size_t)plen + 1, prompt_fmt, title_utf8, subs_trim, placeholder_note,
+           scr_trim, num_clips, range_line, words_line, title_utf8);
 
   free(title_utf8);
   free(subs_trim);
@@ -2541,6 +2553,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
 
   report_progress(GEN_STAGE_SUBTITLES, movie_index, movie_total, 0, 0, movie_title);
 
+  bool subs_placeholder = false;
   if (!file_exists(srt_in)) {
     logi("No SRT found for %s; attempting download...", movie_title);
     if (!download_subtitle_srt(movie_title, srt_in)) {
@@ -2551,6 +2564,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
         return false;
       }
       logok("Fallback SRT written: %s", srt_in);
+      subs_placeholder = true;
     } else {
       logok("Downloaded SRT: %s", srt_in);
     }
@@ -2626,11 +2640,13 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   bool retry_no_script = false;
   ClipPlanList plan = openai_make_plan(cfg, movie_title, subs_seconds,
                                        imsdb_script ? imsdb_script : "",
+                                       subs_placeholder,
                                        num_clips, per_clip_sec, &retry_no_script);
 
   if (plan.count == 0 && retry_no_script && imsdb_script && imsdb_script[0]) {
     logw("OpenAI request failed with IMSDb context; retrying without IMSDb script for %s", movie_title);
-    plan = openai_make_plan(cfg, movie_title, subs_seconds, "", num_clips, per_clip_sec, NULL);
+    plan = openai_make_plan(cfg, movie_title, subs_seconds, "", subs_placeholder,
+                            num_clips, per_clip_sec, NULL);
   }
 
   if (plan.count == 0) {
