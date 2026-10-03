@@ -393,7 +393,7 @@ jobs:
           $env:Path = "C:\ProgramData\chocolatey\bin;" + $env:Path
           $py = "ci-tools\piper\python\python.exe"
           if (-not (Test-Path $py)) { Write-Host "::error title=extras::bundled python missing at $py"; exit 1 }
-          $o = (& $py -m pip install --no-warn-script-location --disable-pip-version-check edge-tts faster-whisper 2>&1 | Out-String)
+          $o = (& $py -m pip install --no-warn-script-location --disable-pip-version-check edge-tts faster-whisper==1.1.1 2>&1 | Out-String)
           if ($LASTEXITCODE -ne 0) { Write-Host "::error title=extras::pip install failed (exit $LASTEXITCODE): $($o.Substring([Math]::Max(0,$o.Length-600)))"; exit 1 }
           $o = (& $py -c "import edge_tts, faster_whisper, ctranslate2; print('imports OK', ctranslate2.__version__)" 2>&1 | Out-String)
           if ($LASTEXITCODE -ne 0) { Write-Host "::error title=extras::import failed: $o"; exit 1 }
