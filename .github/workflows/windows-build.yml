@@ -394,9 +394,9 @@ jobs:
           $py = "ci-tools\piper\python\python.exe"
           if (-not (Test-Path $py)) { Write-Host "::error title=extras::bundled python missing at $py"; exit 1 }
           $o = (& $py -m pip install --no-warn-script-location --disable-pip-version-check edge-tts faster-whisper==1.1.1 2>&1 | Out-String)
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error title=extras::pip install failed (exit $LASTEXITCODE): $($o.Substring([Math]::Max(0,$o.Length-600)))"; exit 1 }
+          if ($LASTEXITCODE -ne 0) { $f = ($o -replace "\r?\n", " ||| "); Write-Host "::error title=extras::pip install failed (exit $LASTEXITCODE): $($f.Substring([Math]::Max(0,$f.Length-600)))"; exit 1 }
           $o = (& $py -c "import edge_tts, faster_whisper, ctranslate2; print('imports OK', ctranslate2.__version__)" 2>&1 | Out-String)
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error title=extras::import failed: $o"; exit 1 }
+          if ($LASTEXITCODE -ne 0) { $f = ($o -replace "\r?\n", " ||| "); Write-Host "::error title=extras::import failed: $($f.Substring([Math]::Max(0,$f.Length-700)))"; exit 1 }
           $o = (& $py -c "from huggingface_hub import snapshot_download; p=snapshot_download('Systran/faster-whisper-tiny', cache_dir='ci-tools/hf-cache'); print('snapshot OK', p)" 2>&1 | Out-String)
           Write-Host $o
           if ($LASTEXITCODE -ne 0) { $f = ($o -replace "\r?\n", " ||| "); Write-Host "::error title=extras::model download failed: $($f.Substring([Math]::Max(0,$f.Length-700)))"; exit 1 }
