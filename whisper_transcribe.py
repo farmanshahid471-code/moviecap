@@ -10,6 +10,7 @@ The model (~150 MB - 1.5 GB depending on size) is downloaded once into
 import argparse
 import os
 import sys
+import traceback
 
 
 def fmt_ts(sec: float) -> str:
@@ -85,8 +86,9 @@ def main() -> int:
                         f"{seg.text.strip()}\n\n")
                 if n % 25 == 0:
                     print(f"[whisper] {n} segments, at {seg.end:.0f}s", flush=True)
-    except Exception as exc:
-        print(f"whisper_transcribe: transcription failed: {exc}", flush=True)
+    except Exception:
+        print("whisper_transcribe: transcription failed:\n"
+              + traceback.format_exc(), flush=True)
         return 1
 
     print(f"[whisper] done: {n} segments (language={info.language}, "
