@@ -390,8 +390,10 @@ jobs:
       - name: Test the AI extras (edge-tts + faster-whisper)
         shell: pwsh
         run: |
+          $env:Path = "C:\ProgramData\chocolatey\bin;" + $env:Path
           $py = "ci-tools\piper\python\python.exe"
-          & $py -m pip install --no-warn-script-location edge-tts faster-whisper | Select-Object -Last 1
+          & $py -m pip install --no-warn-script-location --disable-pip-version-check edge-tts faster-whisper | Select-Object -Last 2
+          Write-Host "pip exit code: $LASTEXITCODE"
           & $py -c "import edge_tts; print('edge-tts import OK')"
           if ($LASTEXITCODE -ne 0) { throw "edge-tts is not importable" }
           & $py -c "import faster_whisper; print('faster-whisper import OK')"
