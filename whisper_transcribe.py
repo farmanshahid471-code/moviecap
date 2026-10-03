@@ -48,10 +48,21 @@ def main() -> int:
         return 2
 
     print(f"[whisper] loading model '{args.model}' (first run downloads it)...", flush=True)
-    try:
-        model = WhisperModel(args.model, device="cpu", compute_type="int8")
-    except Exception as exc:
-        print(f"whisper_transcribe: model load failed: {exc}", file=sys.stderr)
+    model = None
+    last_exc = None
+    # If huggingface.co is unreachable (some regions/ISPs), retry via mirror.
+    for attempt, endpoint in enumerate((None, "https://hf-mirror.com")):
+        try:
+            if endpoint:
+                os.environ["HF_ENDPOINT"] = endpoint
+                print(f"[whisper] retrying the download via {endpoint} ...", flush=True)
+            model = WhisperModel(args.model, device="cpu", compute_type="int8")
+            break
+        except Exception as exc:
+            last_exc = exc
+            print(f"[whisper] model load attempt {attempt + 1} failed: {exc}", flush=True)
+    if model is None:
+        print(f"whisper_transcribe: model load failed: {last_exc}", flush=True)
         return 1
 
     print("[whisper] transcribing - for a full movie this can take a while on CPU...", flush=True)
@@ -66,7 +77,7 @@ def main() -> int:
                 if n % 25 == 0:
                     print(f"[whisper] {n} segments, at {seg.end:.0f}s", flush=True)
     except Exception as exc:
-        print(f"whisper_transcribe: transcription failed: {exc}", file=sys.stderr)
+        print(f"whisper_transcribe: transcription failed: {exc}", flush=True)
         return 1
 
     print(f"[whisper] done: {n} segments (language={info.language}, "

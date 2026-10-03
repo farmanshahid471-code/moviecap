@@ -399,9 +399,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Host "::error title=extras::import failed: $o"; exit 1 }
           ffmpeg -y -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=6" -ar 16000 -ac 1 extras_audio.wav
           if (-not (Test-Path extras_audio.wav)) { Write-Host "::error title=extras::ffmpeg did not produce the test audio"; exit 1 }
-          $o = (& $py whisper_transcribe.py --model tiny --audio extras_audio.wav --out extras.srt --cache-dir ci-tools\hf-cache 2>&1 | Out-String)
-          Write-Host $o
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error title=extras::whisper_transcribe failed (exit $LASTEXITCODE): $($o.Substring([Math]::Max(0,$o.Length-600)))"; exit 1 }
+          & $py whisper_transcribe.py --model tiny --audio extras_audio.wav --out extras.srt --cache-dir ci-tools\hf-cache *> whisper_run.txt
+          $wexit = $LASTEXITCODE
+          $wout = (Get-Content whisper_run.txt -Raw)
+          Write-Host $wout
+          if ($wexit -ne 0) { Write-Host "::error title=extras::whisper_transcribe failed (exit $wexit): $($wout.Substring([Math]::Max(0,$wout.Length-800)))"; exit 1 }
           if (-not (Test-Path extras.srt)) { Write-Host "::error title=extras::no SRT was produced"; exit 1 }
           Write-Host "AI extras OK (edge-tts importable, faster-whisper produced an SRT)"
 
