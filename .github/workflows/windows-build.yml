@@ -400,7 +400,7 @@ jobs:
           $o = (& $py -c "from huggingface_hub import snapshot_download; p=snapshot_download('Systran/faster-whisper-tiny', cache_dir='ci-tools/hf-cache'); print('snapshot OK', p)" 2>&1 | Out-String)
           Write-Host $o
           if ($LASTEXITCODE -ne 0) { $f = ($o -replace "\r?\n", " ||| "); Write-Host "::error title=extras::model download failed: $($f.Substring([Math]::Max(0,$f.Length-700)))"; exit 1 }
-          $o = (& $py -c "import glob, ctranslate2; d=glob.glob('ci-tools/hf-cache/models--Systran--faster-whisper-tiny/snapshots/*')[0]; m=ctranslate2.models.Whisper.from_directory(d); print('ct2 load OK')" 2>&1 | Out-String)
+          $o = (& $py -c "import glob, ctranslate2; d=glob.glob('ci-tools/hf-cache/models--Systran--faster-whisper-tiny/snapshots/*')[0]; m=ctranslate2.models.Whisper(d); print('ct2 load OK')" 2>&1 | Out-String)
           Write-Host $o
           if ($LASTEXITCODE -ne 0) { $f = ($o -replace "\r?\n", " ||| "); Write-Host "::error title=extras::ctranslate2 load failed: $($f.Substring([Math]::Max(0,$f.Length-700)))"; exit 1 }
           ffmpeg -y -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=6" -ar 16000 -ac 1 extras_audio.wav
