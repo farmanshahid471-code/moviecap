@@ -392,16 +392,17 @@ jobs:
         run: |
           $env:Path = "C:\ProgramData\chocolatey\bin;" + $env:Path
           $py = "ci-tools\piper\python\python.exe"
-          & $py -m pip install --no-warn-script-location --disable-pip-version-check edge-tts faster-whisper | Select-Object -Last 2
-          Write-Host "pip exit code: $LASTEXITCODE"
-          & $py -c "import edge_tts; print('edge-tts import OK')"
-          if ($LASTEXITCODE -ne 0) { throw "edge-tts is not importable" }
-          & $py -c "import faster_whisper; print('faster-whisper import OK')"
-          if ($LASTEXITCODE -ne 0) { throw "faster-whisper is not importable" }
+          if (-not (Test-Path $py)) { Write-Host "::error title=extras::bundled python missing at $py"; exit 1 }
+          $o = (& $py -m pip install --no-warn-script-location --disable-pip-version-check edge-tts faster-whisper 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error title=extras::pip install failed (exit $LASTEXITCODE): $($o.Substring([Math]::Max(0,$o.Length-600)))"; exit 1 }
+          $o = (& $py -c "import edge_tts, faster_whisper; print('imports OK')" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error title=extras::import failed: $o"; exit 1 }
           ffmpeg -y -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=6" -ar 16000 -ac 1 extras_audio.wav
-          & $py whisper_transcribe.py --model tiny --audio extras_audio.wav --out extras.srt --cache-dir ci-tools\hf-cache
-          if ($LASTEXITCODE -ne 0) { throw "whisper_transcribe.py failed" }
-          if (-not (Test-Path extras.srt)) { throw "no SRT was produced" }
+          if (-not (Test-Path extras_audio.wav)) { Write-Host "::error title=extras::ffmpeg did not produce the test audio"; exit 1 }
+          $o = (& $py whisper_transcribe.py --model tiny --audio extras_audio.wav --out extras.srt --cache-dir ci-tools\hf-cache 2>&1 | Out-String)
+          Write-Host $o
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error title=extras::whisper_transcribe failed (exit $LASTEXITCODE): $($o.Substring([Math]::Max(0,$o.Length-600)))"; exit 1 }
+          if (-not (Test-Path extras.srt)) { Write-Host "::error title=extras::no SRT was produced"; exit 1 }
           Write-Host "AI extras OK (edge-tts importable, faster-whisper produced an SRT)"
 
       - name: Smoke test the web control panel
