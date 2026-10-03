@@ -72,9 +72,12 @@ def main() -> int:
 
     print("[whisper] transcribing - for a full movie this can take a while on CPU...", flush=True)
     try:
-        segments, info = model.transcribe(args.audio, vad_filter=True)
-        n = 0
-        with open(args.out, "w", encoding="utf-8") as f:
+        # Hand PyAV a file OBJECT, not a path: on Windows, PyAV 15+ opens
+        # paths with a metadata_errors keyword that Python < 3.13 rejects.
+        with open(args.audio, "rb") as audio_fh, \
+             open(args.out, "w", encoding="utf-8") as f:
+            segments, info = model.transcribe(audio_fh, vad_filter=True)
+            n = 0
             for seg in segments:
                 n += 1
                 f.write(f"{n}\n{fmt_ts(seg.start)} --> {fmt_ts(seg.end)}\n"
