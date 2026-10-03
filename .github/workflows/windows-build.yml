@@ -395,8 +395,14 @@ jobs:
           if (-not (Test-Path $py)) { Write-Host "::error title=extras::bundled python missing at $py"; exit 1 }
           $o = (& $py -m pip install --no-warn-script-location --disable-pip-version-check edge-tts faster-whisper 2>&1 | Out-String)
           if ($LASTEXITCODE -ne 0) { Write-Host "::error title=extras::pip install failed (exit $LASTEXITCODE): $($o.Substring([Math]::Max(0,$o.Length-600)))"; exit 1 }
-          $o = (& $py -c "import edge_tts, faster_whisper; print('imports OK')" 2>&1 | Out-String)
+          $o = (& $py -c "import edge_tts, faster_whisper, ctranslate2; print('imports OK', ctranslate2.__version__)" 2>&1 | Out-String)
           if ($LASTEXITCODE -ne 0) { Write-Host "::error title=extras::import failed: $o"; exit 1 }
+          $o = (& $py -c "from huggingface_hub import snapshot_download; p=snapshot_download('Systran/faster-whisper-tiny', cache_dir='ci-tools/hf-cache'); print('snapshot OK', p)" 2>&1 | Out-String)
+          Write-Host $o
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error title=extras::model download failed: $($o.Substring([Math]::Max(0,$o.Length-700)))"; exit 1 }
+          $o = (& $py -c "import glob, ctranslate2; d=glob.glob('ci-tools/hf-cache/models--Systran--faster-whisper-tiny/snapshots/*')[0]; m=ctranslate2.models.Whisper.from_directory(d); print('ct2 load OK')" 2>&1 | Out-String)
+          Write-Host $o
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error title=extras::ctranslate2 load failed: $($o.Substring([Math]::Max(0,$o.Length-700)))"; exit 1 }
           ffmpeg -y -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=6" -ar 16000 -ac 1 extras_audio.wav
           if (-not (Test-Path extras_audio.wav)) { Write-Host "::error title=extras::ffmpeg did not produce the test audio"; exit 1 }
           & $py whisper_transcribe.py --model tiny --audio extras_audio.wav --out extras.srt --cache-dir ci-tools\hf-cache *> whisper_run.txt

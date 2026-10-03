@@ -37,10 +37,14 @@ def main() -> int:
         os.environ["XDG_CACHE_HOME"] = args.cache_dir
 
     try:
+        import faster_whisper
+        import ctranslate2
         from faster_whisper import WhisperModel
-    except ImportError:
-        print("whisper_transcribe: faster-whisper is not installed. "
-              "Double-click run.bat once to install it.", file=sys.stderr)
+        print(f"[whisper] python={sys.version.split()[0]} "
+              f"faster-whisper={faster_whisper.__version__} "
+              f"ctranslate2={ctranslate2.__version__}", flush=True)
+    except BaseException as exc:
+        print(f"whisper_transcribe: faster-whisper is not usable: {exc}", flush=True)
         return 3
 
     if not os.path.exists(args.audio):
@@ -58,9 +62,10 @@ def main() -> int:
                 print(f"[whisper] retrying the download via {endpoint} ...", flush=True)
             model = WhisperModel(args.model, device="cpu", compute_type="int8")
             break
-        except Exception as exc:
+        except BaseException as exc:
             last_exc = exc
-            print(f"[whisper] model load attempt {attempt + 1} failed: {exc}", flush=True)
+            print(f"[whisper] model load attempt {attempt + 1} failed: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
     if model is None:
         print(f"whisper_transcribe: model load failed: {last_exc}", flush=True)
         return 1
