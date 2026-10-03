@@ -37,12 +37,13 @@ def main() -> int:
         os.environ["XDG_CACHE_HOME"] = args.cache_dir
 
     try:
+        import av
         import faster_whisper
         import ctranslate2
         from faster_whisper import WhisperModel
         print(f"[whisper] python={sys.version.split()[0]} "
               f"faster-whisper={faster_whisper.__version__} "
-              f"ctranslate2={ctranslate2.__version__}", flush=True)
+              f"ctranslate2={ctranslate2.__version__} av={av.__version__}", flush=True)
     except BaseException as exc:
         print(f"whisper_transcribe: faster-whisper is not usable: {exc}", flush=True)
         return 3

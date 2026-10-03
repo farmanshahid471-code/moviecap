@@ -159,7 +159,7 @@ if not errorlevel 1 exit /b 0
 echo.
 echo [..] Adding Edge TTS voices and faster-whisper transcription (one time)...
 echo     About 600 MB into "%TOOLSDIR%" - nothing goes on C:.
-"%PIPERPY%" -m pip install --no-warn-script-location edge-tts faster-whisper==1.1.1 requests >nul 2>nul
+"%PIPERPY%" -m pip install --no-warn-script-location edge-tts faster-whisper==1.1.1 requests "av>=15" >nul 2>nul
 if errorlevel 1 echo [WARN] Extras install failed - Piper narration still works.
 set "HF_HOME=%TOOLSDIR%\hf-cache"
 "%PIPERPY%" -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')" >nul 2>nul
