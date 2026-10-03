@@ -437,7 +437,8 @@ typedef enum {
   TTS_ELEVENLABS = 0,  /* api.elevenlabs.io (needs a key)                     */
   TTS_XTTS,            /* Coqui XTTS v2 server, POST /tts_to_audio/ (free)    */
   TTS_PIPER,           /* piper http_server, POST /synthesize (free, local)   */
-  TTS_OPENAI           /* OpenAI-compatible POST /audio/speech (e.g. Kokoro)  */
+  TTS_OPENAI,          /* OpenAI-compatible POST /audio/speech (e.g. Kokoro)  */
+  TTS_EDGE             /* Microsoft Edge neural TTS via bundled Python (free) */
 } TtsProvider;
 
 typedef struct {
@@ -462,6 +463,8 @@ typedef struct {
   char tts_language[16];      /* xtts only, default "en" */
   char tts_model[64];         /* openai_tts only, default "tts-1" */
   char tts_api_key[512];      /* optional bearer for openai_tts */
+  bool auto_transcribe;       /* faster-whisper when a movie has no subtitles */
+  char whisper_model[32];     /* whisper model size; default "small"          */
 
   /* optional pipeline tuning */
   int    min_clips;          /* default 20   */
@@ -556,9 +559,11 @@ static Config load_config_json(const char *path) {
   else if (str_icmp(c.tts_provider_name, "xtts") == 0)       c.tts_provider = TTS_XTTS;
   else if (str_icmp(c.tts_provider_name, "coqui") == 0)      c.tts_provider = TTS_XTTS;
   else if (str_icmp(c.tts_provider_name, "piper") == 0)      c.tts_provider = TTS_PIPER;
+  else if (str_icmp(c.tts_provider_name, "edge") == 0 ||
+           str_icmp(c.tts_provider_name, "edge_tts") == 0)   c.tts_provider = TTS_EDGE;
   else if (str_icmp(c.tts_provider_name, "openai_tts") == 0) c.tts_provider = TTS_OPENAI;
   else if (str_icmp(c.tts_provider_name, "openai") == 0)     c.tts_provider = TTS_OPENAI;
-  else die("config.json: unknown tts_provider \"%s\" (use elevenlabs, xtts, piper or openai_tts)",
+  else die("config.json: unknown tts_provider \"%s\" (use elevenlabs, xtts, piper, edge or openai_tts)",
            c.tts_provider_name);
 
   if (c.tts_base_url[0] == 0) {
@@ -571,12 +576,17 @@ static Config load_config_json(const char *path) {
   if (c.tts_model[0] == 0)    snprintf(c.tts_model, sizeof(c.tts_model), "tts-1");
   if (c.tts_provider == TTS_XTTS && c.tts_voice[0] == 0)
     die("config.json: tts_voice must name an XTTS speaker (a .wav in the server's speakers folder)");
+  if (c.tts_provider == TTS_EDGE && c.tts_voice[0] == 0)
+    snprintf(c.tts_voice, sizeof(c.tts_voice), "en-US-GuyNeural");
 
   c.min_clips         = cfg_get_int(cJSON_GetObjectItemCaseSensitive(root, "min_clips"), MIN_NUM_CLIPS, 1, 200);
   c.max_clips         = cfg_get_int(cJSON_GetObjectItemCaseSensitive(root, "max_clips"), MAX_NUM_CLIPS, 1, 200);
   c.max_video_speedup = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "max_video_speedup"), MAX_VIDEO_SPEEDUP, 1.0, 8.0);
   c.recap_minutes     = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "recap_minutes"), 0, 0, 180);
   c.captions          = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "captions"), true);
+  c.auto_transcribe   = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "auto_transcribe"), true);
+  cfg_set_str(c.whisper_model, sizeof(c.whisper_model), cJSON_GetObjectItemCaseSensitive(root, "whisper_model"));
+  if (c.whisper_model[0] == 0) snprintf(c.whisper_model, sizeof(c.whisper_model), "small");
   c.narration_volume  = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "narration_volume"), 2.5, 0.0, 10.0);
   c.bgm_volume        = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "bgm_volume"), 0.1, 0.0, 10.0);
   c.bgm_enabled       = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "bgm_enabled"), true);
@@ -1891,11 +1901,84 @@ static void piper_ensure_server(const Config *cfg) {
 }
 
 /* Single entry point used by the pipeline. */
+/* The bundled private Python that run.bat installs under tools\piper\python. */
+static bool find_tools_python(char *py_out, size_t py_sz, char *root_out, size_t root_sz) {
+  char cwd[PATH_MAX] = "";
+  plat_getcwd(cwd, sizeof(cwd));
+  const char *envtools = getenv("MOVIECAP_TOOLS");
+  char roots[3][PATH_MAX];
+  int nroots = 0;
+  if (envtools && envtools[0]) snprintf(roots[nroots++], sizeof(roots[0]), "%s", envtools);
+  snprintf(roots[nroots++], sizeof(roots[0]), "F:/AI-Movie-Shorts/tools");
+  if (cwd[0]) snprintf(roots[nroots++], sizeof(roots[0]), "%s/tools", cwd);
+  for (int i = 0; i < nroots; i++) {
+    snprintf(py_out, py_sz, "%s/piper/python/python.exe", roots[i]);
+    if (file_exists(py_out)) {
+      if (root_out && root_sz) snprintf(root_out, root_sz, "%s", roots[i]);
+      return true;
+    }
+  }
+  py_out[0] = '\0';
+  return false;
+}
+
+/* Free Microsoft Edge neural TTS via the bundled Python + edge-tts package. */
+static bool tts_edge(const Config *cfg, const char *text, const char *out_mp3_path) {
+  char py[PATH_MAX];
+  if (!find_tools_python(py, sizeof(py), NULL, 0)) {
+    logw("Edge TTS needs the bundled Python - double-click run.bat once to install it.");
+    return false;
+  }
+  char txt[PATH_MAX];
+  snprintf(txt, sizeof(txt), "%s.txt", out_mp3_path);
+  FILE *f = plat_fopen(txt, "wb");
+  if (!f) { logw("Cannot write the Edge TTS text file."); return false; }
+  fputs(text, f);
+  fclose(f);
+  const char *voice = cfg->tts_voice[0] ? cfg->tts_voice : "en-US-GuyNeural";
+  int rc = run_cmd("\"%s\" edge_tts_synth.py --voice %s --text-file \"%s\" --out \"%s\"",
+                   py, voice, txt, out_mp3_path);
+  remove(txt);
+  if (rc != 0 || !file_exists(out_mp3_path)) {
+    logw("Edge TTS failed (rc=%d) - check the internet connection or switch to Piper.", rc);
+    return false;
+  }
+  return true;
+}
+
+/* faster-whisper: movie audio -> real SRT, so a movie without subtitles can
+ * still get a story-accurate recap. Model cache stays on the tools drive. */
+static bool whisper_transcribe_to_srt(const char *movie_path, const char *out_srt,
+                                      const char *model, const char *py,
+                                      const char *tools_root) {
+  ensure_dir("scripts/srt_files");
+  ensure_dir("clips");
+  const char *wav = "clips/_whisper_audio.wav";
+  if (run_cmd("ffmpeg -y -hide_banner -loglevel error -i \"%s\" -vn -ac 1 -ar 16000 \"%s\"",
+              movie_path, wav) != 0) {
+    logw("Could not extract the movie audio for transcription.");
+    return false;
+  }
+  char cache[PATH_MAX];
+  snprintf(cache, sizeof(cache), "%s/hf-cache", tools_root);
+  int rc = run_cmd("\"%s\" whisper_transcribe.py --model %s --audio \"%s\" --out \"%s\" --cache-dir \"%s\"",
+                   py, model, wav, out_srt, cache);
+  remove(wav);
+  if (rc != 0) return false;
+  FILE *f = plat_fopen(out_srt, "rb");
+  if (!f) return false;
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fclose(f);
+  return sz > 200;
+}
+
 static bool tts_synthesize(const Config *cfg, const char *text, const char *out_mp3_path) {
   switch (cfg->tts_provider) {
     case TTS_XTTS:  return tts_xtts(cfg, text, out_mp3_path);
     case TTS_PIPER: return tts_piper(cfg, text, out_mp3_path);
     case TTS_OPENAI: return tts_openai_compat(cfg, text, out_mp3_path);
+    case TTS_EDGE:  return tts_edge(cfg, text, out_mp3_path);
     default:        return elevenlabs_tts_to_mp3(cfg, text, out_mp3_path);
   }
 }
@@ -2632,20 +2715,35 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     logi("No exact SRT found for %s; attempting download...", movie_title);
     if (!download_subtitle_srt(movie_title, srt_in)) {
       logw("Subtitle download failed for %s.", movie_title);
-      if (file_exists(srt_ph)) {
-        snprintf(srt_in, sizeof(srt_in), "%s", srt_ph);
-        subs_placeholder = true;
-        logw("Reusing the placeholder subtitle track for %s - the recap will NOT know the real story!", movie_title);
-      } else {
-        if (!make_fallback_srt(movie_path, movie_title, srt_ph, num_clips)) {
-          logw("Placeholder SRT could not be built. You can still place your own SRT at: scripts/srt_files/%s.srt", movie_title);
-          return false;
+      if (cfg->auto_transcribe) {
+        char wpy[PATH_MAX], wroot[PATH_MAX];
+        if (find_tools_python(wpy, sizeof(wpy), wroot, sizeof(wroot))) {
+          logi("No subtitles anywhere - transcribing the movie audio with faster-whisper instead.");
+          logi("(First run downloads the model; a full movie can take 10-60 minutes on CPU.)");
+          if (whisper_transcribe_to_srt(movie_path, srt_in, cfg->whisper_model, wpy, wroot))
+            logok("AI transcription ready: %s", srt_in);
+          else
+            logw("AI transcription failed.");
+        } else {
+          logi("AI transcription is not installed (run run.bat once) - skipping it.");
         }
-        snprintf(srt_in, sizeof(srt_in), "%s", srt_ph);
-        subs_placeholder = true;
-        logw("NO REAL SUBTITLES for %s! The recap cannot know the story and will be generic.", movie_title);
       }
-      logw("For an accurate recap, put your subtitle file at: scripts/srt_files/%s.srt", movie_title);
+      if (!file_exists(srt_in)) {
+        if (file_exists(srt_ph)) {
+          snprintf(srt_in, sizeof(srt_in), "%s", srt_ph);
+          subs_placeholder = true;
+          logw("Reusing the placeholder subtitle track for %s - the recap will NOT know the real story!", movie_title);
+        } else {
+          if (!make_fallback_srt(movie_path, movie_title, srt_ph, num_clips)) {
+            logw("Placeholder SRT could not be built. You can still place your own SRT at: scripts/srt_files/%s.srt", movie_title);
+            return false;
+          }
+          snprintf(srt_in, sizeof(srt_in), "%s", srt_ph);
+          subs_placeholder = true;
+          logw("NO REAL SUBTITLES for %s! The recap cannot know the story and will be generic.", movie_title);
+        }
+        logw("For an accurate recap, put your subtitle file at: scripts/srt_files/%s.srt", movie_title);
+      }
     } else {
       logok("Downloaded SRT: %s", srt_in);
     }

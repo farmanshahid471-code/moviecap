@@ -658,6 +658,7 @@ static cJSON *config_read_json(void) {
   ADD_STR("tts_voice",    "tts_voice",    "");
   ADD_STR("tts_language", "tts_language", "en");
   ADD_STR("tts_model",    "tts_model",    "tts-1");
+  ADD_STR("whisper_model",  "whisper_model",  "small");
 
   ADD_NUM("min_clips",         "min_clips",         20);
   ADD_NUM("max_clips",         "max_clips",         30);
@@ -670,6 +671,7 @@ static cJSON *config_read_json(void) {
   ADD_BOOL("make_vertical", "make_vertical", true);
   ADD_BOOL("captions",        "captions",        true);
   ADD_BOOL("retire_movies", "retire_movies", true);
+  ADD_BOOL("auto_transcribe", "auto_transcribe", true);
 
 #undef ADD_STR
 #undef ADD_NUM
@@ -693,7 +695,8 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
   const char *str_keys[] = {
     "eleven_voice_id", "eleven_model_id", "openai_model",
     "openai_base_url", "elevenlabs_base_url",
-    "tts_provider", "tts_base_url", "tts_voice", "tts_language", "tts_model", NULL
+    "tts_provider", "tts_base_url", "tts_voice", "tts_language", "tts_model",
+    "whisper_model", NULL
   };
   for (int i = 0; str_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, str_keys[i]);
@@ -730,7 +733,7 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
     else cJSON_AddNumberToObject(root, num_keys[i], v->valuedouble);
   }
 
-  const char *bool_keys[] = { "bgm_enabled", "make_vertical", "retire_movies", "captions", NULL };
+  const char *bool_keys[] = { "bgm_enabled", "make_vertical", "retire_movies", "captions", "auto_transcribe", NULL };
   for (int i = 0; bool_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, bool_keys[i]);
     if (!cJSON_IsBool(v)) continue;
@@ -917,6 +920,7 @@ static const char *PAGE_HTML[] = {
   "        <option value='elevenlabs'>ElevenLabs - cloud, needs an API key</option>",
   "        <option value='xtts'>XTTS v2 - free, local, clones a voice sample</option>",
   "        <option value='piper'>Piper - free, offline, very fast</option>",
+  "        <option value='edge'>Edge TTS - free, natural neural voices (internet)</option>",
   "        <option value='openai_tts'>OpenAI-compatible /audio/speech (OpenAI, Kokoro, ...)</option>",
   "      </select>",
   "      <div id='ttsHint' class='hint'></div>",
@@ -939,6 +943,7 @@ static const char *PAGE_HTML[] = {
   "      <input type='text' id='tts_base_url' placeholder='http://127.0.0.1:8020'>",
   "      <div class='grid2'>",
   "        <div><label class='f'>TTS voice / speaker</label><input type='text' id='tts_voice'></div>",
+  "        <div><label class='f'>Whisper model <span class='hint'>auto-transcribe when no SRT</span></label><input type='text' id='whisper_model'></div>",
   "        <div><label class='f'>TTS language</label><input type='text' id='tts_language'></div>",
   "      </div>",
   "      <label class='f'>TTS model</label><input type='text' id='tts_model'>",
@@ -1070,7 +1075,7 @@ static const char *PAGE_HTML[] = {
   "  if (cfgLoaded) return;",
   "  cfgLoaded = true;",
   "  var texts = ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
-  "               'tts_base_url','tts_voice','tts_language','tts_model'];",
+  "               'tts_base_url','tts_voice','tts_language','tts_model','whisper_model'];",
   "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes'];",
   "  var bools = ['bgm_enabled','make_vertical','retire_movies','captions'];",
   "  texts.forEach(function(k){ el(k).value = c[k] || ''; });",

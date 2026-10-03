@@ -69,7 +69,7 @@ jobs:
           New-Item -ItemType Directory -Force smoke\movies | Out-Null
           Copy-Item build\Release\movie_summary_cli.exe smoke\
           Copy-Item -Recurse resources smoke\resources
-          '{"open_api_key":"sk-fake","elevenlabs_api_key":"el-fake"}' | Set-Content smoke\config.json
+          '{"open_api_key":"sk-fake","elevenlabs_api_key":"el-fake","auto_transcribe":false}' | Set-Content smoke\config.json
           ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc=size=640x360:duration=60 -c:v libx264 "smoke\movies\Amélie's Test (2001).mp4"
           Push-Location smoke
           .\movie_summary_cli.exe 2>&1 | Tee-Object -FilePath ..\smoke.log
@@ -387,6 +387,21 @@ jobs:
               Stop-Process -Force -ErrorAction SilentlyContinue
           }
 
+      - name: Test the AI extras (edge-tts + faster-whisper)
+        shell: pwsh
+        run: |
+          $py = "ci-tools\piper\python\python.exe"
+          & $py -m pip install --no-warn-script-location edge-tts faster-whisper | Select-Object -Last 1
+          & $py -c "import edge_tts; print('edge-tts import OK')"
+          if ($LASTEXITCODE -ne 0) { throw "edge-tts is not importable" }
+          & $py -c "import faster_whisper; print('faster-whisper import OK')"
+          if ($LASTEXITCODE -ne 0) { throw "faster-whisper is not importable" }
+          ffmpeg -y -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=6" -ar 16000 -ac 1 extras_audio.wav
+          & $py whisper_transcribe.py --model tiny --audio extras_audio.wav --out extras.srt --cache-dir ci-tools\hf-cache
+          if ($LASTEXITCODE -ne 0) { throw "whisper_transcribe.py failed" }
+          if (-not (Test-Path extras.srt)) { throw "no SRT was produced" }
+          Write-Host "AI extras OK (edge-tts importable, faster-whisper produced an SRT)"
+
       - name: Smoke test the web control panel
         shell: pwsh
         run: |
@@ -445,6 +460,7 @@ jobs:
           Copy-Item build\Release\movie_summary_bot.exe, build\Release\movie_summary_cli.exe, build\Release\movie_summary_web.exe $pkg\
           Copy-Item -Recurse resources, backgroundmusic $pkg\
           Copy-Item config.json, README.md, run.bat, setup.ps1, install_tools.ps1, install_piper.ps1 $pkg\
+          Copy-Item edge_tts_synth.py, whisper_transcribe.py $pkg\
           Compress-Archive -Path $pkg\* -DestinationPath "$pkg.zip" -Force
 
       - uses: actions/upload-artifact@v4

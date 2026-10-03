@@ -77,6 +77,7 @@ REM  prints the confirmation below and stops. You open the app yourself.
 :bare
 call :piper_install
 if errorlevel 1 echo [WARN] Piper could not be installed now - run "run.bat tts" later to retry.
+call :extras_install
 goto :confirm
 
 :confirm
@@ -147,6 +148,23 @@ if errorlevel 1 exit /b 1
 if exist "%PIPERVOICES%\%PIPER_VOICE%.onnx" exit /b 0
 exit /b 1
 
+
+REM --------------------------------------------------------------------------
+REM  Extras: Edge TTS voices + faster-whisper transcription, into the same
+REM  private Python as Piper. Failures are warnings - Piper alone still works.
+:extras_install
+if not exist "%PIPERPY%" exit /b 0
+"%PIPERPY%" -c "import edge_tts, faster_whisper" >nul 2>nul
+if not errorlevel 1 exit /b 0
+echo.
+echo [..] Adding Edge TTS voices and faster-whisper transcription (one time)...
+echo     About 600 MB into "%TOOLSDIR%" - nothing goes on C:.
+"%PIPERPY%" -m pip install --no-warn-script-location edge-tts faster-whisper >nul 2>nul
+if errorlevel 1 echo [WARN] Extras install failed - Piper narration still works.
+set "HF_HOME=%TOOLSDIR%\hf-cache"
+"%PIPERPY%" -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')" >nul 2>nul
+if errorlevel 1 echo [WARN] Whisper model pre-download failed - it retries on first use.
+exit /b 0
 :tts
 call :piper_install
 if not errorlevel 1 goto :tts_ready

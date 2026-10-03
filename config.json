@@ -21,6 +21,8 @@
   "max_video_speedup": 1.75,
   "recap_minutes": 0,
   "captions": true,
+  "auto_transcribe": true,
+  "whisper_model": "small",
   "narration_volume": 2.5,
   "bgm_volume": 0.1,
   "bgm_enabled": true,
