@@ -1457,7 +1457,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
 
   char *subs_trim = trim_copy_utf8_safe(subs_utf8, MAX_SUB_CHARS);
 
-  char placeholder_note[640];
+  char placeholder_note[1024];
   if (subs_placeholder)
     snprintf(placeholder_note, sizeof(placeholder_note),
              "\nIMPORTANT: INPUT A is an auto-generated PLACEHOLDER track, NOT the "
@@ -1467,10 +1467,21 @@ static ClipPlanList openai_make_plan(const Config *cfg,
              movie_title);
   else
     snprintf(placeholder_note, sizeof(placeholder_note),
-             "\nIMPORTANT: Every narration must be strictly based on the real "
-             "events in INPUT A (the actual subtitle file): real character names, "
-             "real dialogue moments, real plot beats. Never use generic filler or "
-             "trailer cliches like \"the stakes get raised\".\n");
+             "\nIMPORTANT - STAY TRUE TO THE SOURCE:\n"
+             "- Every narration must come ONLY from real events in INPUT A (the "
+             "actual subtitle file). Never invent events, outcomes or details "
+             "that are not there.\n"
+             "- Name every character correctly: use exactly the names that appear "
+             "in INPUT A, and keep each character's name consistent in every clip "
+             "- never call the same person by two different names.\n"
+             "- When it is unclear who is speaking or who someone is, refer to "
+             "them by their role from context (for example 'the sheriff', 'the "
+             "mother') instead of guessing a name.\n"
+             "- If a stretch of subtitles is confusing or incomplete, keep the "
+             "narration for that part short and factual instead of inventing an "
+             "explanation.\n"
+             "- Never use generic filler or trailer cliches like \"the stakes get "
+             "raised\".\n");
   char *scr_trim  = trim_copy_utf8_safe(scr_utf8,  MAX_SCRIPT_CHARS);
 
   free(subs_utf8);
