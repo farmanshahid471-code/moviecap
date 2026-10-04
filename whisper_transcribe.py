@@ -74,18 +74,44 @@ def main() -> int:
 
     print("[whisper] transcribing - for a full movie this can take a while on CPU...", flush=True)
     try:
-        # Hand PyAV a file OBJECT, not a path: on Windows, PyAV 15+ opens
-        # paths with a metadata_errors keyword that Python < 3.13 rejects.
-        with open(args.audio, "rb") as audio_fh, \
-             open(args.out, "w", encoding="utf-8") as f:
-            segments, info = model.transcribe(audio_fh, vad_filter=True)
-            n = 0
-            for seg in segments:
-                n += 1
-                f.write(f"{n}\n{fmt_ts(seg.start)} --> {fmt_ts(seg.end)}\n"
-                        f"{seg.text.strip()}\n\n")
-                if n % 25 == 0:
-                    print(f"[whisper] {n} segments, at {seg.end:.0f}s", flush=True)
+        # Decode the WAV ourselves (the app always extracts 16 kHz mono PCM)
+        # and hand faster-whisper a float32 array. This bypasses PyAV's file
+        # opening entirely, which is broken on some Windows/Python combos.
+        audio = None
+        try:
+            import wave
+            import numpy as np
+            with wave.open(args.audio, "rb") as w:
+                if w.getnchannels() != 1 or w.getsampwidth() != 2:
+                    raise ValueError(f"expected mono 16-bit PCM, got "
+                                     f"{w.getnchannels()}ch/{w.getsampwidth() * 8}bit")
+                rate = w.getframerate()
+                pcm = w.readframes(w.getnframes())
+            audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+            print(f"[whisper] decoded {len(audio) / rate / 60.0:.1f} minutes of audio at {rate} Hz",
+                  flush=True)
+        except Exception as exc:
+            print(f"[whisper] cannot read {args.audio} as PCM WAV ({exc}); "
+                  f"falling back to PyAV", flush=True)
+
+        n = 0
+        with open(args.out, "w", encoding="utf-8") as f:
+            def emit(segments):
+                nonlocal n
+                for seg in segments:
+                    n += 1
+                    f.write(f"{n}\n{fmt_ts(seg.start)} --> {fmt_ts(seg.end)}\n"
+                            f"{seg.text.strip()}\n\n")
+                    if n % 25 == 0:
+                        print(f"[whisper] {n} segments, at {seg.end:.0f}s", flush=True)
+
+            if audio is not None:
+                segments, info = model.transcribe(audio, vad_filter=True)
+                emit(segments)
+            else:
+                with open(args.audio, "rb") as audio_fh:
+                    segments, info = model.transcribe(audio_fh, vad_filter=True)
+                    emit(segments)
     except Exception:
         print("whisper_transcribe: transcription failed:\n"
               + traceback.format_exc(), flush=True)
