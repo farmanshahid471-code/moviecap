@@ -577,7 +577,7 @@ static Config load_config_json(const char *path) {
   if (c.tts_provider == TTS_XTTS && c.tts_voice[0] == 0)
     die("config.json: tts_voice must name an XTTS speaker (a .wav in the server's speakers folder)");
   if (c.tts_provider == TTS_EDGE && c.tts_voice[0] == 0)
-    snprintf(c.tts_voice, sizeof(c.tts_voice), "en-US-GuyNeural");
+    snprintf(c.tts_voice, sizeof(c.tts_voice), "en-US-ChristopherNeural");
 
   c.min_clips         = cfg_get_int(cJSON_GetObjectItemCaseSensitive(root, "min_clips"), MIN_NUM_CLIPS, 1, 200);
   c.max_clips         = cfg_get_int(cJSON_GetObjectItemCaseSensitive(root, "max_clips"), MAX_NUM_CLIPS, 1, 200);
@@ -1531,9 +1531,13 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "NARRATION STYLE (follow exactly, like the top movie recap channels):\n"
     "- Third person, present tense. Follow the characters through the plot\n"
     "beat by beat; every sentence must move the story one step forward.\n"
-    "- FIRST narration: right after the required opening line, immediately set\n"
-    "the stage - the world, the time, the main character and what they have\n"
-    "lost or want - then start the story moving.\n"
+    "- Fast-paced and suspenseful. Simple words and short sentences so the AI\n"
+    "voice never runs out of breath.\n"
+    "- Tell the story strictly in chronological order. No analysis of\n"
+    "cinematography or themes.\n"
+    "- FIRST narration: open instantly with 'The story begins...' and\n"
+    "immediately set the stage - the world, the time, the main character and\n"
+    "what they have lost or want - then start the story moving.\n"
     "- Connect every action to its cause or consequence: because, so, to,\n"
     "inspired by, after.\n"
     "- When the story jumps in time or place, open the narration with a\n"
@@ -1578,15 +1582,20 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "  {\"clips\":[{\"start\":120,\"end\":145,\"narration\":\"...\"}, ...]}\n"
     "- Clips must be increasing by start time.\n"
     "- Each narration must be at least 3 full sentences in the recap style above.\n"
-    "- The first narration must start with: \"Here we go, let's go over the movie %s.\".\n";
+    "- NO intro talk: the first narration must start instantly with \"The story\n"
+    "begins\" or \"The movie starts\" - never \"welcome\", \"today we\" or any\n"
+    "channel greeting.\n"
+    "- The LAST narration must end EXACTLY with: \"With that the story ends\n"
+    "right here. Let us know in the comments how you liked this explanation\n"
+    "and don't forget to like the video and subscribe to the channel.\"\n";
 
   int plen = snprintf(NULL, 0, prompt_fmt, title_utf8, subs_trim, placeholder_note,
-                      scr_trim, num_clips, range_line, words_line, title_utf8);
+                      scr_trim, num_clips, range_line, words_line);
   if (plen < 0) die("snprintf failed building prompt");
   char *prompt = (char *)malloc((size_t)plen + 1);
   if (!prompt) die("OOM");
   snprintf(prompt, (size_t)plen + 1, prompt_fmt, title_utf8, subs_trim, placeholder_note,
-           scr_trim, num_clips, range_line, words_line, title_utf8);
+           scr_trim, num_clips, range_line, words_line);
 
   free(title_utf8);
   free(subs_trim);
@@ -1997,7 +2006,7 @@ static bool tts_edge(const Config *cfg, const char *text, const char *out_mp3_pa
   if (!f) { logw("Cannot write the Edge TTS text file."); return false; }
   fputs(text, f);
   fclose(f);
-  const char *voice = cfg->tts_voice[0] ? cfg->tts_voice : "en-US-GuyNeural";
+  const char *voice = cfg->tts_voice[0] ? cfg->tts_voice : "en-US-ChristopherNeural";
   int rc = run_cmd("\"%s\" edge_tts_synth.py --voice %s --text-file \"%s\" --out \"%s\"",
                    py, voice, txt, out_mp3_path);
   remove(txt);
@@ -2552,7 +2561,7 @@ static bool make_fallback_srt(const char *movie_path, const char *movie_title,
 
     if (i == 0) {
       snprintf(line, sizeof(line),
-               "Here we go, let's go over the movie %s. "
+               "The story begins in %s. "
                "Today we cover the whole story from start to finish.", movie_title);
     } else if (i == num_clips - 1) {
       snprintf(line, sizeof(line),

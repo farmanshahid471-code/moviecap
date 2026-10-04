@@ -942,7 +942,7 @@ static const char *PAGE_HTML[] = {
   "      <label class='f'>TTS server URL <span class='hint'>xtts / piper / openai-compatible</span></label>",
   "      <input type='text' id='tts_base_url' placeholder='http://127.0.0.1:8020'>",
   "      <div class='grid2'>",
-  "        <div><label class='f'>TTS voice / speaker</label><input type='text' id='tts_voice'></div>",
+  "        <div><label class='f'>TTS voice / speaker <span class='hint'>edge recap voices: en-US-ChristopherNeural, en-GB-RyanNeural</span></label><input type='text' id='tts_voice'></div>",
   "        <div><label class='f'>Whisper model <span class='hint'>auto-transcribe when no SRT</span></label><input type='text' id='whisper_model'></div>",
   "        <div><label class='f'>TTS language</label><input type='text' id='tts_language'></div>",
   "      </div>",
