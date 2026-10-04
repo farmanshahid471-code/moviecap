@@ -1202,6 +1202,19 @@ static char *openai_extract_output_text(const char *resp_json) {
 
   cJSON *output = cJSON_GetObjectItemCaseSensitive(root, "output");
   if (!cJSON_IsArray(output)) {
+    /* Classic /chat/completions shape (DeepSeek, Groq, Mistral, ...):
+     * choices[0].message.content */
+    cJSON *choices = cJSON_GetObjectItemCaseSensitive(root, "choices");
+    if (cJSON_IsArray(choices)) {
+      cJSON *first = cJSON_GetArrayItem(choices, 0);
+      cJSON *message = first ? cJSON_GetObjectItemCaseSensitive(first, "message") : NULL;
+      cJSON *content = message ? cJSON_GetObjectItemCaseSensitive(message, "content") : NULL;
+      if (cJSON_IsString(content) && content->valuestring) {
+        char *out = str_dup(content->valuestring);
+        cJSON_Delete(root);
+        return out;
+      }
+    }
     cJSON_Delete(root);
     return NULL;
   }
@@ -1587,12 +1600,13 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   cJSON_AddItemToObject(req, "reasoning", reasoning);
 
   cJSON *input = cJSON_CreateArray();
-  cJSON *sys = cJSON_CreateObject();
-  cJSON_AddStringToObject(sys, "role", "system");
-  cJSON_AddStringToObject(sys, "content",
+  static const char *sys_prompt =
       "You are a professional movie recap scriptwriter for a popular recap "
       "channel. You retell movie plots as gripping present-tense stories that "
-      "follow the characters. You always answer with strict JSON only.");
+      "follow the characters. You always answer with strict JSON only.";
+  cJSON *sys = cJSON_CreateObject();
+  cJSON_AddStringToObject(sys, "role", "system");
+  cJSON_AddStringToObject(sys, "content", sys_prompt);
   cJSON_AddItemToArray(input, sys);
 
   cJSON *usr = cJSON_CreateObject();
@@ -1609,9 +1623,32 @@ static ClipPlanList openai_make_plan(const Config *cfg,
 
   char *body = cJSON_PrintUnformatted(req);
   cJSON_Delete(req);
+
+  /* Classic /chat/completions shape, used as a fallback for OpenAI-compatible
+   * providers that do not implement the Responses API (DeepSeek and most
+   * others). */
+  cJSON *creq = cJSON_CreateObject();
+  cJSON_AddStringToObject(creq, "model", cfg->openai_model);
+  cJSON *msgs = cJSON_CreateArray();
+  cJSON *csys = cJSON_CreateObject();
+  cJSON_AddStringToObject(csys, "role", "system");
+  cJSON_AddStringToObject(csys, "content", sys_prompt);
+  cJSON_AddItemToArray(msgs, csys);
+  cJSON *cusr = cJSON_CreateObject();
+  cJSON_AddStringToObject(cusr, "role", "user");
+  cJSON_AddStringToObject(cusr, "content", prompt);
+  cJSON_AddItemToArray(msgs, cusr);
+  cJSON_AddItemToObject(creq, "messages", msgs);
+  cJSON *rfmt = cJSON_CreateObject();
+  cJSON_AddStringToObject(rfmt, "type", "json_object");
+  cJSON_AddItemToObject(creq, "response_format", rfmt);
+  char *chat_body = cJSON_PrintUnformatted(creq);
+  cJSON_Delete(creq);
+
   free(prompt);
 
   if (!body) {
+    free(chat_body);
     ClipPlanList empty = {0};
     return empty;
   }
@@ -1635,9 +1672,23 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     }
 
     if (resp.data) free(resp.data);
-    ClipPlanList empty = {0};
-    return empty;
+    resp.data = NULL;
+    resp.size = 0;
+
+    logi("Trying the provider's /chat/completions endpoint instead (DeepSeek and other OpenAI-compatible APIs)...");
+    snprintf(endpoint, sizeof(endpoint), "%s/chat/completions", cfg->openai_base_url);
+    resp = http_post_json_to_mem(endpoint, cfg->openai_key,
+                                 chat_body ? chat_body : "{}", &http_code, timeout_s);
+    if (http_code < 200 || http_code >= 300) {
+      logw("Chat-completions HTTP %ld", http_code);
+      if (resp.data && resp.size) logw("Chat raw body: %.800s", resp.data);
+      if (resp.data) free(resp.data);
+      free(chat_body);
+      ClipPlanList empty = {0};
+      return empty;
+    }
   }
+  free(chat_body);
 
   char *out_text = openai_extract_output_text(resp.data ? resp.data : "");
   if (!out_text) {
