@@ -465,6 +465,8 @@ typedef struct {
   char tts_api_key[512];      /* optional bearer for openai_tts */
   bool auto_transcribe;       /* faster-whisper when a movie has no subtitles */
   char whisper_model[32];     /* whisper model size; default "small"          */
+  char recap_language[96];    /* "" / "english" = source language             */
+  char caption_font[256];     /* font used for burnt-in captions              */
 
   /* optional pipeline tuning */
   int    min_clips;          /* default 20   */
@@ -574,10 +576,18 @@ static Config load_config_json(const char *path) {
   }
   if (c.tts_language[0] == 0) snprintf(c.tts_language, sizeof(c.tts_language), "en");
   if (c.tts_model[0] == 0)    snprintf(c.tts_model, sizeof(c.tts_model), "tts-1");
+  cfg_set_str(c.recap_language, sizeof(c.recap_language), cJSON_GetObjectItemCaseSensitive(root, "recap_language"));
+  cfg_set_str(c.caption_font, sizeof(c.caption_font), cJSON_GetObjectItemCaseSensitive(root, "caption_font"));
+  if (c.caption_font[0] == 0) snprintf(c.caption_font, sizeof(c.caption_font), "resources/Inter-Regular.ttf");
   if (c.tts_provider == TTS_XTTS && c.tts_voice[0] == 0)
     die("config.json: tts_voice must name an XTTS speaker (a .wav in the server's speakers folder)");
-  if (c.tts_provider == TTS_EDGE && c.tts_voice[0] == 0)
-    snprintf(c.tts_voice, sizeof(c.tts_voice), "en-US-ChristopherNeural");
+  if (c.tts_provider == TTS_EDGE && c.tts_voice[0] == 0) {
+    const char *v = "en-US-ChristopherNeural";
+    if (strstr(c.recap_language, "Chinese"))      v = "zh-CN-YunxiNeural";
+    else if (strstr(c.recap_language, "Arabic"))  v = "ar-EG-ShakirNeural";
+    else if (strstr(c.recap_language, "Spanish")) v = "es-MX-JorgeNeural";
+    snprintf(c.tts_voice, sizeof(c.tts_voice), "%s", v);
+  }
 
   c.min_clips         = cfg_get_int(cJSON_GetObjectItemCaseSensitive(root, "min_clips"), MIN_NUM_CLIPS, 1, 200);
   c.max_clips         = cfg_get_int(cJSON_GetObjectItemCaseSensitive(root, "max_clips"), MAX_NUM_CLIPS, 1, 200);
@@ -1495,6 +1505,17 @@ static ClipPlanList openai_make_plan(const Config *cfg,
              "explanation.\n"
              "- Never use generic filler or trailer cliches like \"the stakes get "
              "raised\".\n");
+
+  char language_rule[384];
+  language_rule[0] = '\0';
+  if (cfg->recap_language[0] && str_icmp(cfg->recap_language, "english") != 0)
+    snprintf(language_rule, sizeof(language_rule),
+             "\nLANGUAGE: Write ALL narrations in %s - natural, fluent and "
+             "native-sounding, like a native recap narrator. The subtitles may "
+             "be in English or another language; tell the story in %s either "
+             "way. Keep character names recognizable (common localized names "
+             "or clean transliterations).\n",
+             cfg->recap_language, cfg->recap_language);
   char *scr_trim  = trim_copy_utf8_safe(scr_utf8,  MAX_SCRIPT_CHARS);
 
   free(subs_utf8);
@@ -1567,6 +1588,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "INPUT A (Subtitles with timestamps in SECONDS):\n"
     "%s\n"
     "%s"
+    "%s"
     "\n"
     "INPUT B (Optional script text WITHOUT timestamps; may be empty):\n"
     "%s\n"
@@ -1590,12 +1612,12 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "and don't forget to like the video and subscribe to the channel.\"\n";
 
   int plen = snprintf(NULL, 0, prompt_fmt, title_utf8, subs_trim, placeholder_note,
-                      scr_trim, num_clips, range_line, words_line);
+                      language_rule, scr_trim, num_clips, range_line, words_line);
   if (plen < 0) die("snprintf failed building prompt");
   char *prompt = (char *)malloc((size_t)plen + 1);
   if (!prompt) die("OOM");
   snprintf(prompt, (size_t)plen + 1, prompt_fmt, title_utf8, subs_trim, placeholder_note,
-           scr_trim, num_clips, range_line, words_line);
+           language_rule, scr_trim, num_clips, range_line, words_line);
 
   free(title_utf8);
   free(subs_trim);
@@ -2057,10 +2079,8 @@ static bool tts_synthesize(const Config *cfg, const char *text, const char *out_
 /* ---------------------------------------------------------------------------
  * Burnt-in subtitles: small, centred near the bottom of the frame.
  * ------------------------------------------------------------------------ */
-static bool caption_font_available(void) {
-  static int cached = -1;
-  if (cached < 0) cached = file_exists("resources/Inter-Regular.ttf") ? 1 : 0;
-  return cached == 1;
+static bool caption_font_available(const char *font) {
+  return file_exists(font);
 }
 
 /* Build a chain of up to three stacked drawtext filters for the caption.
@@ -2071,7 +2091,7 @@ static bool caption_font_available(void) {
  * splitter chokes on " and \ too), and every ':' is written \: so it
  * survives level 2 as a literal colon.  Wrapped lines become separate
  * drawtext filters - no newline characters anywhere. */
-static char *caption_filter_chain(const char *text) {
+static char *caption_filter_chain(const char *text, const char *font) {
   if (!text || !text[0]) return NULL;
 
   size_t cap = strlen(text) * 3 + 8;
@@ -2128,6 +2148,17 @@ static char *caption_filter_chain(const char *text) {
     esc[i][eo] = '\0';
   }
 
+  /* Escape the font path for the quoted filtergraph section. */
+  char font_esc[300];
+  size_t fo = 0;
+  for (const char *q = font; *q && fo + 2 < sizeof(font_esc); q++) {
+    if (*q == '"' || *q == '\'') { font_esc[fo++] = ' '; continue; }
+    if (*q == '\\') { font_esc[fo++] = '/'; continue; }
+    if (*q == ':') font_esc[fo++] = '\\';
+    font_esc[fo++] = *q;
+  }
+  font_esc[fo] = '\0';
+
   char *chain = (char *)malloc(2048);
   if (!chain) die("OOM");
   chain[0] = '\0';
@@ -2135,10 +2166,10 @@ static char *caption_filter_chain(const char *text) {
   for (int i = 0; i < nl; i++) {
     int k = (nl - 1) - i;
     int w = snprintf(chain + off, 2048 - off,
-                     ",drawtext=fontfile='resources/Inter-Regular.ttf':expansion=none:"
+                     ",drawtext=fontfile='%s':expansion=none:"
                      "text='%s':fontcolor=white:borderw=2:bordercolor=black:"
                      "fontsize=h*0.035:x=(w-text_w)/2:y=h-h*0.07-th-%d*h*0.045",
-                     esc[i], k);
+                     font_esc, esc[i], k);
     if (w < 0 || (size_t)w >= 2048 - off) break;
     off += (size_t)w;
   }
@@ -2200,8 +2231,8 @@ static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
   char *out_esc = sh_escape(out_mp4);
 
   char *cap_esc = NULL;
-  if (cfg->captions && caption && caption[0] && caption_font_available())
-    cap_esc = caption_filter_chain(caption);
+  if (cfg->captions && caption && caption[0] && caption_font_available(cfg->caption_font))
+    cap_esc = caption_filter_chain(caption, cfg->caption_font);
 
   int rc;
   if (cap_esc) {
@@ -2924,7 +2955,12 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     return false;
   }
 
-  if (cfg->captions && !caption_font_available())
+  bool non_en = cfg->recap_language[0] && str_icmp(cfg->recap_language, "english") != 0;
+  if (non_en && cfg->tts_provider == TTS_PIPER)
+    logw("Recap language is %s but the installed Piper voice speaks English - switch to Edge TTS or install a matching Piper voice.", cfg->recap_language);
+  if (cfg->captions && non_en)
+    logw("Captions use %s - if %s characters render as boxes, set \"caption_font\" in config.json to a font with those glyphs (Noto Sans SC for Chinese, Noto Sans Arabic for Arabic).", cfg->caption_font, cfg->recap_language);
+  if (cfg->captions && !caption_font_available(cfg->caption_font))
     logw("Captions are on but resources/Inter-Regular.ttf is missing - skipping burnt-in subtitles.");
 
   size_t made = 0;

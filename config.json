@@ -23,6 +23,8 @@
   "captions": true,
   "auto_transcribe": true,
   "whisper_model": "small",
+  "recap_language": "",
+  "caption_font": "resources/Inter-Regular.ttf",
   "narration_volume": 2.5,
   "bgm_volume": 0.1,
   "bgm_enabled": true,

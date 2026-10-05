@@ -659,6 +659,8 @@ static cJSON *config_read_json(void) {
   ADD_STR("tts_language", "tts_language", "en");
   ADD_STR("tts_model",    "tts_model",    "tts-1");
   ADD_STR("whisper_model",  "whisper_model",  "small");
+  ADD_STR("recap_language", "recap_language", "");
+  ADD_STR("caption_font",   "caption_font",   "resources/Inter-Regular.ttf");
 
   ADD_NUM("min_clips",         "min_clips",         20);
   ADD_NUM("max_clips",         "max_clips",         30);
@@ -696,7 +698,7 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
     "eleven_voice_id", "eleven_model_id", "openai_model",
     "openai_base_url", "elevenlabs_base_url",
     "tts_provider", "tts_base_url", "tts_voice", "tts_language", "tts_model",
-    "whisper_model", NULL
+    "whisper_model", "recap_language", "caption_font", NULL
   };
   for (int i = 0; str_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, str_keys[i]);
@@ -933,6 +935,13 @@ static const char *PAGE_HTML[] = {
   "        <div><label class='f'>Clips (min)</label><input type='number' id='min_clips' min='1' max='200'></div>",
   "        <div><label class='f'>Clips (max)</label><input type='number' id='max_clips' min='1' max='200'></div>",
   "        <div><label class='f'>Recap minutes (0=auto)</label><input type='number' id='recap_minutes' min='0' max='180'></div>",
+  "        <div><label class='f'>Recap language</label><select id='recap_language'>",
+  "          <option value=''>English</option>",
+  "          <option value='Mandarin Chinese (Simplified characters)'>中文 Mandarin Chinese</option>",
+  "          <option value='Modern Standard Arabic'>العربية Arabic</option>",
+  "          <option value='Spanish (neutral Latin American)'>Español Spanish</option>",
+  "        </select></div>",
+  "        <div><label class='f'>Caption font file <span class='hint'>must contain the language glyphs</span></label><input type='text' id='caption_font'></div>",
   "        <div><label class='f'>Max speed-up</label><input type='number' id='max_video_speedup' step='0.05' min='1' max='8'></div>",
   "        <div><label class='f'>Narration vol</label><input type='number' id='narration_volume' step='0.1' min='0' max='10'></div>",
   "        <div><label class='f'>Music vol</label><input type='number' id='bgm_volume' step='0.05' min='0' max='10'></div>",
@@ -1075,7 +1084,7 @@ static const char *PAGE_HTML[] = {
   "  if (cfgLoaded) return;",
   "  cfgLoaded = true;",
   "  var texts = ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
-  "               'tts_base_url','tts_voice','tts_language','tts_model','whisper_model'];",
+  "               'tts_base_url','tts_voice','tts_language','tts_model','whisper_model','caption_font'];",
   "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes'];",
   "  var bools = ['bgm_enabled','make_vertical','retire_movies','captions'];",
   "  texts.forEach(function(k){ el(k).value = c[k] || ''; });",
@@ -1089,6 +1098,9 @@ static const char *PAGE_HTML[] = {
   "  var prov = c.tts_provider || 'elevenlabs';",
   "  var sel = el('tts_provider');",
   "  for (var i = 0; i < sel.options.length; i++){ if (sel.options[i].value === prov) sel.selectedIndex = i; }",
+  "  var lang = c.recap_language || '';",
+  "  var lsel = el('recap_language');",
+  "  for (var j = 0; j < lsel.options.length; j++){ if (lsel.options[j].value === lang) lsel.selectedIndex = j; }",
   "  syncTtsUi();",
   "}",
   "",
@@ -1096,7 +1108,8 @@ static const char *PAGE_HTML[] = {
   "  elevenlabs: 'Needs an ElevenLabs API key. Voice id and TTS model above are used.',",
   "  xtts: 'Free. Run: pip install xtts-api-server && python -m xtts_api_server  (port 8020). Voice = a .wav in the servers speakers folder. Language: en, hi, ur, es, ...',",
   "  piper: 'Free and offline. Just run: run.bat tts  - it installs a private Python and a voice under F: and starts the server on port 5000. Voice is optional.',",
-  "  openai_tts: 'Any OpenAI-compatible endpoint: api.openai.com/v1, Kokoro-FastAPI, LM Studio, ... Uses TTS model + voice + TTS API key.'",
+  "  openai_tts: 'Any OpenAI-compatible endpoint: api.openai.com/v1, Kokoro-FastAPI, LM Studio, ... Uses TTS model + voice + TTS API key.',",
+  "  edge: 'Free Microsoft neural voices, needs internet, no key. Voice auto-matches the recap language (e.g. zh-CN-YunxiNeural for Chinese).'",
   "};",
   "var TTS_PH = {",
   "  elevenlabs: '', xtts: 'http://127.0.0.1:8020', piper: 'http://127.0.0.1:5000', openai_tts: 'https://api.openai.com/v1'",
@@ -1188,8 +1201,9 @@ static const char *PAGE_HTML[] = {
   "el('btnSave').onclick = function(){",
   "  var body = {};",
   "  ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
-  "   'tts_base_url','tts_voice','tts_language','tts_model'].forEach(function(k){ body[k] = el(k).value; });",
+  "   'tts_base_url','tts_voice','tts_language','tts_model','caption_font'].forEach(function(k){ body[k] = el(k).value; });",
   "  body.tts_provider = el('tts_provider').value;",
+  "  body.recap_language = el('recap_language').value;",
   "  ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes'].forEach(function(k){ body[k] = Number(el(k).value); });",
   "  ['bgm_enabled','make_vertical','retire_movies','captions'].forEach(function(k){ body[k] = el(k).checked; });",
   "  if (el('open_api_key').value) body.open_api_key = el('open_api_key').value;",
