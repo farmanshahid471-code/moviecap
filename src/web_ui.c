@@ -659,8 +659,22 @@ static cJSON *config_read_json(void) {
   ADD_STR("tts_language", "tts_language", "en");
   ADD_STR("tts_model",    "tts_model",    "tts-1");
   ADD_STR("whisper_model",  "whisper_model",  "small");
-  ADD_STR("recap_language", "recap_language", "");
   ADD_STR("caption_font",   "caption_font",   "resources/Inter-Regular.ttf");
+  {
+    cJSON *arr = cJSON_CreateArray();
+    const cJSON *langs = cJSON_GetObjectItemCaseSensitive(root, "recap_languages");
+    if (cJSON_IsArray(langs)) {
+      const cJSON *it = NULL;
+      cJSON_ArrayForEach(it, langs) {
+        if (cJSON_IsString(it)) cJSON_AddItemToArray(arr, cJSON_CreateString(it->valuestring));
+      }
+    } else {
+      const cJSON *one = cJSON_GetObjectItemCaseSensitive(root, "recap_language");
+      if (cJSON_IsString(one)) cJSON_AddItemToArray(arr, cJSON_CreateString(one->valuestring));
+    }
+    if (cJSON_GetArraySize(arr) == 0) cJSON_AddItemToArray(arr, cJSON_CreateString(""));
+    cJSON_AddItemToObject(o, "recap_languages", arr);
+  }
 
   ADD_NUM("min_clips",         "min_clips",         20);
   ADD_NUM("max_clips",         "max_clips",         30);
@@ -698,7 +712,7 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
     "eleven_voice_id", "eleven_model_id", "openai_model",
     "openai_base_url", "elevenlabs_base_url",
     "tts_provider", "tts_base_url", "tts_voice", "tts_language", "tts_model",
-    "whisper_model", "recap_language", "caption_font", NULL
+    "whisper_model", "caption_font", NULL
   };
   for (int i = 0; str_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, str_keys[i]);
@@ -741,6 +755,19 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
     if (!cJSON_IsBool(v)) continue;
     cJSON_DeleteItemFromObjectCaseSensitive(root, bool_keys[i]);
     cJSON_AddBoolToObject(root, bool_keys[i], cJSON_IsTrue(v));
+  }
+  {
+    const cJSON *langs = cJSON_GetObjectItemCaseSensitive(patch, "recap_languages");
+    if (cJSON_IsArray(langs)) {
+      cJSON *na = cJSON_CreateArray();
+      const cJSON *it = NULL;
+      cJSON_ArrayForEach(it, langs) {
+        if (cJSON_IsString(it)) cJSON_AddItemToArray(na, cJSON_CreateString(it->valuestring));
+      }
+      if (cJSON_GetArraySize(na) == 0) cJSON_AddItemToArray(na, cJSON_CreateString(""));
+      cJSON_DeleteItemFromObjectCaseSensitive(root, "recap_languages");
+      cJSON_AddItemToObject(root, "recap_languages", na);
+    }
   }
 
   char *out = cJSON_Print(root);
@@ -935,12 +962,14 @@ static const char *PAGE_HTML[] = {
   "        <div><label class='f'>Clips (min)</label><input type='number' id='min_clips' min='1' max='200'></div>",
   "        <div><label class='f'>Clips (max)</label><input type='number' id='max_clips' min='1' max='200'></div>",
   "        <div><label class='f'>Recap minutes (0=auto)</label><input type='number' id='recap_minutes' min='0' max='180'></div>",
-  "        <div><label class='f'>Recap language</label><select id='recap_language'>",
-  "          <option value=''>English</option>",
-  "          <option value='Mandarin Chinese (Simplified characters)'>中文 Mandarin Chinese</option>",
-  "          <option value='Modern Standard Arabic'>العربية Arabic</option>",
-  "          <option value='Spanish (neutral Latin American)'>Español Spanish</option>",
-  "        </select></div>",
+  "        <div><label class='f'>Recap languages <span class='hint'>one recap per checked language, in this order (max 4)</span></label></div>",
+  "        <div class='hint' style='margin-top:-6px;margin-bottom:8px'>One run renders every checked language back to back. Put <i>Title</i>.zh.srt / <i>Title</i>.ar.srt / <i>Title</i>.es.srt in scripts/srt_files to recap in that language directly - otherwise the English subtitles get translated. Non-English needs a font with those glyphs (set below).</div>",
+  "        <div style='display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px'>",
+  "          <label style='display:flex;align-items:center;gap:6px'><input type='checkbox' id='lang_en' checked> English</label>",
+  "          <label style='display:flex;align-items:center;gap:6px'><input type='checkbox' id='lang_zh'> 中文 Chinese</label>",
+  "          <label style='display:flex;align-items:center;gap:6px'><input type='checkbox' id='lang_ar'> العربية Arabic</label>",
+  "          <label style='display:flex;align-items:center;gap:6px'><input type='checkbox' id='lang_es'> Español Spanish</label>",
+  "        </div>",
   "        <div><label class='f'>Caption font file <span class='hint'>must contain the language glyphs</span></label><input type='text' id='caption_font'></div>",
   "        <div><label class='f'>Max speed-up</label><input type='number' id='max_video_speedup' step='0.05' min='1' max='8'></div>",
   "        <div><label class='f'>Narration vol</label><input type='number' id='narration_volume' step='0.1' min='0' max='10'></div>",
@@ -1098,9 +1127,12 @@ static const char *PAGE_HTML[] = {
   "  var prov = c.tts_provider || 'elevenlabs';",
   "  var sel = el('tts_provider');",
   "  for (var i = 0; i < sel.options.length; i++){ if (sel.options[i].value === prov) sel.selectedIndex = i; }",
-  "  var lang = c.recap_language || '';",
-  "  var lsel = el('recap_language');",
-  "  for (var j = 0; j < lsel.options.length; j++){ if (lsel.options[j].value === lang) lsel.selectedIndex = j; }",
+  "  var rl = (c.recap_languages && c.recap_languages.length) ? c.recap_languages : [c.recap_language || ''];",
+  "  var hasLang = function(v){ for (var k = 0; k < rl.length; k++){ if (rl[k] === v) return true; } return false; };",
+  "  el('lang_en').checked = hasLang('');",
+  "  el('lang_zh').checked = hasLang('Mandarin Chinese (Simplified characters)');",
+  "  el('lang_ar').checked = hasLang('Modern Standard Arabic');",
+  "  el('lang_es').checked = hasLang('Spanish (neutral Latin American)');",
   "  syncTtsUi();",
   "}",
   "",
@@ -1203,7 +1235,13 @@ static const char *PAGE_HTML[] = {
   "  ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
   "   'tts_base_url','tts_voice','tts_language','tts_model','caption_font'].forEach(function(k){ body[k] = el(k).value; });",
   "  body.tts_provider = el('tts_provider').value;",
-  "  body.recap_language = el('recap_language').value;",
+  "  var rl = [];",
+  "  if (el('lang_en').checked) rl.push('');",
+  "  if (el('lang_zh').checked) rl.push('Mandarin Chinese (Simplified characters)');",
+  "  if (el('lang_ar').checked) rl.push('Modern Standard Arabic');",
+  "  if (el('lang_es').checked) rl.push('Spanish (neutral Latin American)');",
+  "  if (!rl.length) rl.push('');",
+  "  body.recap_languages = rl;",
   "  ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes'].forEach(function(k){ body[k] = Number(el(k).value); });",
   "  ['bgm_enabled','make_vertical','retire_movies','captions'].forEach(function(k){ body[k] = el(k).checked; });",
   "  if (el('open_api_key').value) body.open_api_key = el('open_api_key').value;",
