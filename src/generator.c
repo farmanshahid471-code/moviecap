@@ -470,6 +470,9 @@ typedef struct {
   int  n_recap_languages;
   int  tts_voice_auto;        /* 1 = tts_voice was auto-picked, free to change */
   char caption_font[256];     /* font used for burnt-in captions              */
+  char caption_font_zh[256];  /* per-language caption fonts ("" = use above)  */
+  char caption_font_ar[256];
+  char caption_font_es[256];
 
   /* optional pipeline tuning */
   int    min_clips;          /* default 20   */
@@ -605,6 +608,9 @@ static Config load_config_json(const char *path) {
   cfg_set_str(c.recap_language, sizeof(c.recap_language), cJSON_GetObjectItemCaseSensitive(root, "recap_language"));
   cfg_set_str(c.caption_font, sizeof(c.caption_font), cJSON_GetObjectItemCaseSensitive(root, "caption_font"));
   if (c.caption_font[0] == 0) snprintf(c.caption_font, sizeof(c.caption_font), "resources/Inter-Regular.ttf");
+  cfg_set_str(c.caption_font_zh, sizeof(c.caption_font_zh), cJSON_GetObjectItemCaseSensitive(root, "caption_font_zh"));
+  cfg_set_str(c.caption_font_ar, sizeof(c.caption_font_ar), cJSON_GetObjectItemCaseSensitive(root, "caption_font_ar"));
+  cfg_set_str(c.caption_font_es, sizeof(c.caption_font_es), cJSON_GetObjectItemCaseSensitive(root, "caption_font_es"));
   if (c.tts_provider == TTS_XTTS && c.tts_voice[0] == 0)
     die("config.json: tts_voice must name an XTTS speaker (a .wav in the server's speakers folder)");
   c.tts_voice_auto = 0;
@@ -3032,7 +3038,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   if (non_en && cfg->tts_provider == TTS_PIPER)
     logw("Recap language is %s but the installed Piper voice speaks English - switch to Edge TTS or install a matching Piper voice.", cfg->recap_language);
   if (cfg->captions && non_en)
-    logw("Captions use %s - if %s characters render as boxes, set \"caption_font\" in config.json to a font with those glyphs (Noto Sans SC for Chinese, Noto Sans Arabic for Arabic).", cfg->caption_font, cfg->recap_language);
+    logw("Captions use %s - if %s characters render as boxes, set the per-language caption font in the panel (caption_font_zh / caption_font_ar / caption_font_es) to a font with those glyphs (Noto Sans SC for Chinese, Noto Sans Arabic for Arabic).", cfg->caption_font, cfg->recap_language);
   if (cfg->captions && !caption_font_available(cfg->caption_font))
     logw("Captions are on but resources/Inter-Regular.ttf is missing - skipping burnt-in subtitles.");
 
@@ -3425,6 +3431,12 @@ int run_generation(void) {
       if (lcfg.tts_provider == TTS_EDGE && cfg.tts_voice_auto)
         snprintf(lcfg.tts_voice, sizeof(lcfg.tts_voice), "%s",
                  edge_voice_for_language(lcfg.recap_language));
+      const char *lcode = recap_lang_code(lcfg.recap_language);
+      const char *lfont = !strcmp(lcode, "zh") ? cfg.caption_font_zh
+                        : !strcmp(lcode, "ar") ? cfg.caption_font_ar
+                        : !strcmp(lcode, "es") ? cfg.caption_font_es : "";
+      if (lfont[0])
+        snprintf(lcfg.caption_font, sizeof(lcfg.caption_font), "%s", lfont);
       const char *label = recap_lang_label(lcfg.recap_language);
       if (nl > 1) {
         snprintf(banner, sizeof(banner), "--- Recap %d/%d: %s ---", li + 1, nl,

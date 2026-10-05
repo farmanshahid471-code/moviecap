@@ -451,6 +451,7 @@ jobs:
             if ($page.Content -notmatch "tts_provider") { throw "engine picker missing from the page" }
             if ($page.Content -notmatch "recap_languages") { throw "recap languages hint missing from the page" }
             if ($page.Content -notmatch "lang_zh") { throw "language checkboxes missing from the page" }
+            if ($page.Content -notmatch "caption_font_zh") { throw "per-language caption font fields missing from the page" }
             Write-Host "TTS provider switch OK ($($cfg.tts_provider) / $($cfg.tts_base_url))"
 
             Set-Content -Path smoke\hello.srt -Value "1`n00:00:01,000 --> 00:00:02,000`nhi"

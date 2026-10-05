@@ -660,6 +660,9 @@ static cJSON *config_read_json(void) {
   ADD_STR("tts_model",    "tts_model",    "tts-1");
   ADD_STR("whisper_model",  "whisper_model",  "small");
   ADD_STR("caption_font",   "caption_font",   "resources/Inter-Regular.ttf");
+  ADD_STR("caption_font_zh", "caption_font_zh", "");
+  ADD_STR("caption_font_ar", "caption_font_ar", "");
+  ADD_STR("caption_font_es", "caption_font_es", "");
   {
     cJSON *arr = cJSON_CreateArray();
     const cJSON *langs = cJSON_GetObjectItemCaseSensitive(root, "recap_languages");
@@ -712,7 +715,7 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
     "eleven_voice_id", "eleven_model_id", "openai_model",
     "openai_base_url", "elevenlabs_base_url",
     "tts_provider", "tts_base_url", "tts_voice", "tts_language", "tts_model",
-    "whisper_model", "caption_font", NULL
+    "whisper_model", "caption_font", "caption_font_zh", "caption_font_ar", "caption_font_es", NULL
   };
   for (int i = 0; str_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, str_keys[i]);
@@ -970,7 +973,10 @@ static const char *PAGE_HTML[] = {
   "          <label style='display:flex;align-items:center;gap:6px'><input type='checkbox' id='lang_ar'> العربية Arabic</label>",
   "          <label style='display:flex;align-items:center;gap:6px'><input type='checkbox' id='lang_es'> Español Spanish</label>",
   "        </div>",
-  "        <div><label class='f'>Caption font file <span class='hint'>must contain the language glyphs</span></label><input type='text' id='caption_font'></div>",
+  "        <div><label class='f'>Caption font file <span class='hint'>used for English - and for any language left empty below</span></label><input type='text' id='caption_font'></div>",
+  "        <div><label class='f'>Caption font for 中文 Chinese <span class='hint'>e.g. C:/Windows/Fonts/msyh.ttc</span></label><input type='text' id='caption_font_zh' placeholder='empty = use the font above'></div>",
+  "        <div><label class='f'>Caption font for العربية Arabic <span class='hint'>e.g. C:/Windows/Fonts/arial.ttf</span></label><input type='text' id='caption_font_ar' placeholder='empty = use the font above'></div>",
+  "        <div><label class='f'>Caption font for Español Spanish <span class='hint'>optional - the default font covers Spanish</span></label><input type='text' id='caption_font_es' placeholder='empty = use the font above'></div>",
   "        <div><label class='f'>Max speed-up</label><input type='number' id='max_video_speedup' step='0.05' min='1' max='8'></div>",
   "        <div><label class='f'>Narration vol</label><input type='number' id='narration_volume' step='0.1' min='0' max='10'></div>",
   "        <div><label class='f'>Music vol</label><input type='number' id='bgm_volume' step='0.05' min='0' max='10'></div>",
@@ -1113,7 +1119,8 @@ static const char *PAGE_HTML[] = {
   "  if (cfgLoaded) return;",
   "  cfgLoaded = true;",
   "  var texts = ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
-  "               'tts_base_url','tts_voice','tts_language','tts_model','whisper_model','caption_font'];",
+  "               'tts_base_url','tts_voice','tts_language','tts_model','whisper_model','caption_font',",
+  "               'caption_font_zh','caption_font_ar','caption_font_es'];",
   "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes'];",
   "  var bools = ['bgm_enabled','make_vertical','retire_movies','captions'];",
   "  texts.forEach(function(k){ el(k).value = c[k] || ''; });",
@@ -1233,7 +1240,8 @@ static const char *PAGE_HTML[] = {
   "el('btnSave').onclick = function(){",
   "  var body = {};",
   "  ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
-  "   'tts_base_url','tts_voice','tts_language','tts_model','caption_font'].forEach(function(k){ body[k] = el(k).value; });",
+  "   'tts_base_url','tts_voice','tts_language','tts_model','caption_font',",
+  "   'caption_font_zh','caption_font_ar','caption_font_es'].forEach(function(k){ body[k] = el(k).value; });",
   "  body.tts_provider = el('tts_provider').value;",
   "  var rl = [];",
   "  if (el('lang_en').checked) rl.push('');",
