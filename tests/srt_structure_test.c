@@ -241,7 +241,27 @@ int main(void) {
   ck(i && count_cues(i) == 1, "still one cue");
   free(i);
 
-  /* ---- 10. a cached file from the old code is recognised as out of date -- */
+  /* ---- 10. overlapping and zero length cues are tidied up --------------- */
+  const char *overlap =
+    "1\n"
+    "01:20:00,000 --> 01:20:05,000\n"
+    "Two people talk at once here,\n\n"
+    "2\n"
+    "01:20:02,000 --> 01:20:04,000\n"
+    "and the second one cuts in.\n\n"
+    "3\n"
+    "01:20:10,000 --> 01:20:10,000\n"
+    "A cue with no length.\n\n";
+  write_file_("srt_j.srt", overlap);
+  convert_srt_timestamps_to_seconds("srt_j.srt", "j_mod.srt");
+  char *j = slurp("j_mod.srt");
+  printf("---- overlap file ----\n%s----------------\n", j ? j : "(null)");
+  ck(j && strstr(j, "4800 --> 4802") != NULL, "an overlapping cue ends where the next one starts");
+  ck(j && strstr(j, "4810 --> 4811") != NULL, "a zero length cue is given a second");
+  ck(j && count_cues(j) == 3, "both cues of an overlap survive");
+  free(j);
+
+  /* ---- 11. a cached file from the old code is recognised as out of date -- */
   write_file_("old_mod.srt",
               "1\n100 --> 100\nI\n\n"
               "2\n100 --> 101\ncan't\n\n"

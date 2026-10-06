@@ -987,6 +987,17 @@ static bool srt_text_is_speaker_change(const char *t) {
   return false;
 }
 
+/* Keep the written file well formed: no zero length cue and no cue running
+ * into the next one (overlapping subtitles are common - two people talking at
+ * once - and they would make the converted file look clumped again). */
+static void srt_fix_windows(SrtCue *cues, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    if (i + 1 < n && cues[i].end > cues[i + 1].start && cues[i + 1].start > cues[i].start)
+      cues[i].end = cues[i + 1].start;
+    if (cues[i].end <= cues[i].start) cues[i].end = cues[i].start + 1;
+  }
+}
+
 static void srt_merge_fragments(SrtCue *cues, size_t *n) {
   size_t w = 0;
   for (size_t i = 0; i < *n; i++) {
@@ -1166,6 +1177,7 @@ static bool convert_srt_timestamps_to_seconds(const char *input_srt, const char 
      planner gets a story and not a pile of pieces. */
   size_t before = n;
   srt_merge_fragments(cues, &n);
+  srt_fix_windows(cues, n);
   if (before > n)
     logi("Structured the subtitles: %zu cues -> %zu sentence cues (%zu fragments joined).",
          before, n, before - n);

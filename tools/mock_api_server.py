@@ -75,6 +75,39 @@ def guess_clip_window(text):
     return 1, 600
 
 
+CLOSING_LINE = (
+    "With that the story ends right here. Let us know in the comments how you liked this "
+    "explanation and don't forget to like the video and subscribe to the channel."
+)
+
+
+def narration_for(i, clips_wanted, title, lang, names):
+    """A narration that follows the same script rules the real prompt asks for:
+    no channel intro, present tense, and the exact closing sentence at the end.
+    Only a stand-in for the real model - the words do not matter, the shape does.
+    """
+    if i == 0:
+        text = (
+            f"The story begins in {title}. "
+            f"This is mock narration number 1, written in {lang}. "
+            f"Someone makes a choice here and the story starts moving."
+        )
+    elif names:
+        text = (
+            f"The story keeps moving and {names[i % len(names)]} is right in the middle of it. "
+            f"Something goes wrong and there is no time to think."
+        )
+    else:
+        text = (
+            f"The story keeps moving. Something goes wrong and there is no time to think."
+        )
+
+    if i == clips_wanted - 1:
+        text += " " + (CLOSING_LINE if lang.lower().startswith("english")
+                       else "That is where this story ends.")
+    return text
+
+
 def build_plan(body, clips_wanted):
     """Return {'clips': [...]} shaped like the real prompt asks for."""
     prompt = ""
@@ -90,9 +123,10 @@ def build_plan(body, clips_wanted):
     span = max(hi - lo, clips_wanted * 8)
     step = span / float(clips_wanted + 1)
 
-    title_m = re.search(r"The first narration must start with: .Here we go, let.s go over the movie (.+?)\.",
-                        prompt)
+    title_m = re.search(r"^Movie:\s*(.+?)\s*$", prompt, re.M)
     title = title_m.group(1).strip() if title_m else "this movie"
+    lang_m = re.search(r"^Narration language:\s*(.+?)\s*$", prompt, re.M)
+    lang = lang_m.group(1).strip() if lang_m else "English"
 
     names = names_from_prompt(prompt)
     if names:
@@ -109,17 +143,7 @@ def build_plan(body, clips_wanted):
         clips.append({
             "start": start,
             "end": end,
-            "narration": (
-                f"Here we go, let's go over the movie {title}. "
-                f"This is mock narration number {i + 1}. "
-                f"Nothing exciting happens here, but the visuals keep moving. "
-                f"Let's keep going." if i == 0 else
-                (f"Clip {i + 1} picks the story back up again and {names[i % len(names)]} "
-                 f"is right in the middle of it. " if names else
-                 f"Clip {i + 1} picks the story back up again. ")
-                + f"The scene changes and the tension builds. "
-                f"We are getting closer to the ending now."
-            ),
+            "narration": narration_for(i, clips_wanted, title, lang, names),
         })
     return {"clips": clips}
 
