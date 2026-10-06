@@ -34,7 +34,8 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-STATE = {"plans": 0, "tts": 0, "wiki_searches": 0, "wiki_extracts": 0, "lock": threading.Lock()}
+STATE = {"plans": 0, "tts": 0, "wiki_searches": 0, "wiki_extracts": 0,
+         "batches": {}, "batch_seq": 0, "lock": threading.Lock()}
 
 
 def make_tone_mp3(seconds, path, freq=440.0):
@@ -114,7 +115,12 @@ def build_plan(body, clips_wanted):
     for item in body.get("input", []):
         if item.get("role") == "user":
             prompt = item.get("content", "")
+    return plan_from_prompt(prompt, clips_wanted)
 
+
+def plan_from_prompt(prompt, clips_wanted):
+    """The same plan, built from the prompt text alone - which is all a batched
+    Messages request carries (its params hold system + messages)."""
     subs = ""
     if "INPUT A" in prompt:
         subs = prompt.split("INPUT A", 1)[1].split("INPUT B", 1)[0]
@@ -165,7 +171,55 @@ class OpenAIHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/v1/models"):
             return self._send(200, {"data": [{"id": "mock-model"}]})
+        # --- Anthropic Message Batches: status + results ------------------
+        m = re.match(r"^/anthropic/v1/messages/batches/([^/]+)/results$", self.path)
+        if m:
+            return self._send_batch_results(m.group(1))
+        m = re.match(r"^/anthropic/v1/messages/batches/([^/]+)$", self.path)
+        if m:
+            with STATE["lock"]:
+                batch = STATE["batches"].get(m.group(1))
+            if not batch:
+                return self._send(404, {"type": "error", "error": {
+                    "type": "not_found_error", "message": "no such batch"}})
+            done = len(batch["requests"])
+            return self._send(200, {
+                "id": m.group(1),
+                "type": "message_batch",
+                "processing_status": "ended",
+                "request_counts": {"processing": 0, "succeeded": done,
+                                   "errored": 0, "canceled": 0, "expired": 0},
+            })
         self._send(200, {"ok": True})
+
+    def _send_batch_results(self, batch_id):
+        with STATE["lock"]:
+            batch = STATE["batches"].get(batch_id)
+        if not batch:
+            return self._send(404, {"type": "error", "error": {
+                "type": "not_found_error", "message": "no such batch"}})
+        lines = []
+        for req in batch["requests"]:
+            params = req.get("params", {})
+            prompt = ""
+            for msg in params.get("messages", []):
+                if msg.get("role") == "user":
+                    prompt = msg.get("content", "")
+            plan = plan_from_prompt(prompt, batch["clips"])
+            lines.append(json.dumps({
+                "custom_id": req.get("custom_id"),
+                "result": {"type": "succeeded", "message": {
+                    "id": "msg_mock",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": params.get("model", "mock"),
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": json.dumps(plan)}],
+                    "usage": {"input_tokens": 100, "output_tokens": 500},
+                }},
+            }))
+        print(f"[mock-openai] batch {batch_id}: {len(lines)} result(s)", flush=True)
+        self._send(200, ("\n".join(lines) + "\n").encode(), "application/x-jsonlines")
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -177,6 +231,28 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         with STATE["lock"]:
             STATE["plans"] += 1
+
+        # --- Anthropic Message Batches: create ---------------------------
+        if self.path == "/anthropic/v1/messages/batches":
+            reqs = body.get("requests", [])
+            with STATE["lock"]:
+                STATE["batch_seq"] += 1
+                batch_id = f"msgbatch_mock{STATE['batch_seq']:03d}"
+                STATE["batches"][batch_id] = {"requests": reqs, "clips": 8}
+            for req in reqs:
+                if "stream" in req.get("params", {}):
+                    return self._send(400, {"type": "error", "error": {
+                        "type": "invalid_request_error",
+                        "message": "streaming is not supported in a batch"}})
+            print(f"[mock-openai] batch {batch_id} created with {len(reqs)} request(s)",
+                  flush=True)
+            return self._send(200, {
+                "id": batch_id,
+                "type": "message_batch",
+                "processing_status": "in_progress",
+                "request_counts": {"processing": len(reqs), "succeeded": 0,
+                                   "errored": 0, "canceled": 0, "expired": 0},
+            })
 
         if not self.path.endswith("/responses"):
             return self._send(404, {"error": {"message": "not found", "type": "invalid_request_error"}})

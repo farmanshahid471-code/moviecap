@@ -543,6 +543,409 @@ static void test_gateway_rescue_url(void) {
   free_clip_plan_list(&plan);
 }
 
+/* ------------------------------------------------- 8. the Message Batches API
+ *
+ * Batch planning is the 50%-cheaper path: every plan request is collected,
+ * submitted as one Message Batch, and the run waits for the results.  These
+ * checks drive that exact sequence against the scripted transport and verify
+ * the two things that matter: the requests are identical to a live run (so the
+ * narration does not change) and nothing is ever paid for twice.
+ */
+
+#define PLAN_TEXT "{\\\"clips\\\":[{\\\"start\\\":5,\\\"end\\\":9," \
+                  "\\\"narration\\\":\\\"The story begins in the batched town.\\\"}]}"
+
+static const char *BATCH_ID = "msgbatch_01TESTBATCH";
+
+/* A page of the GET /v1/messages/batches/<id> status reply. */
+static void queue_batch_status(const char *status, int processing, int succeeded,
+                               int errored) {
+  char buf[1024];
+  snprintf(buf, sizeof(buf),
+           "{\"id\":\"%s\",\"type\":\"message_batch\",\"processing_status\":\"%s\","
+           "\"request_counts\":{\"processing\":%d,\"succeeded\":%d,\"errored\":%d,"
+           "\"canceled\":0,\"expired\":0}}",
+           BATCH_ID, status, processing, succeeded, errored);
+  stub_queue_reply(200, buf);
+}
+
+static void queue_batch_create(void) {
+  char buf[1024];
+  snprintf(buf, sizeof(buf),
+           "{\"id\":\"%s\",\"type\":\"message_batch\",\"processing_status\":\"in_progress\","
+           "\"request_counts\":{\"processing\":1,\"succeeded\":0,\"errored\":0,"
+           "\"canceled\":0,\"expired\":0}}", BATCH_ID);
+  stub_queue_reply(200, buf);
+}
+
+/* One line of the results JSONL, the way the API returns it. */
+static void queue_batch_results_line(const char *custom_id, const char *type,
+                                     const char *text_or_error, int stop_max_tokens) {
+  char buf[4096];
+  if (strcmp(type, "succeeded") == 0) {
+    snprintf(buf, sizeof(buf),
+             "{\"custom_id\":\"%s\",\"result\":{\"type\":\"succeeded\",\"message\":{"
+             "\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\","
+             "\"stop_reason\":\"%s\",\"content\":[{\"type\":\"text\",\"text\":\"%s\"}]}}}\n",
+             custom_id, stop_max_tokens ? "max_tokens" : "end_turn", text_or_error);
+  } else {
+    snprintf(buf, sizeof(buf),
+             "{\"custom_id\":\"%s\",\"result\":{\"type\":\"%s\",\"error\":{"
+             "\"type\":\"invalid_request_error\",\"message\":\"%s\"}}}\n",
+             custom_id, type, text_or_error);
+  }
+  stub_queue_reply(200, buf);
+}
+
+/* a batch of one request, ready to submit.  The result line has to carry the
+ * custom id the app computed for this movie and language. */
+static void queue_full_batch_run(const char *title, const char *lang) {
+  char id[96];
+  batch_custom_id(title, lang, id, sizeof(id));
+  queue_batch_create();                      /* POST .../batches              */
+  queue_batch_status("ended", 0, 1, 0);
+  queue_batch_results_line(id, "succeeded", PLAN_TEXT, 0);
+}
+
+static Config batch_cfg(void) {
+  Config c = cfg_for("https://api.anthropic.com/v1", "claude-sonnet-4-5",
+                     "sk-ant-mock");
+  c.batch_planning = true;
+  c.batch_max_wait_minutes = 1;
+  return c;
+}
+
+static void test_batch_custom_id_shape(void) {
+  char a[96], b[96], c[96];
+  batch_custom_id("Amélie's Test (2001)", "en", a, sizeof(a));
+  batch_custom_id("Amélie's Test (2001)", "en", b, sizeof(b));
+  batch_custom_id("Amélie's Test (2001)", "zh", c, sizeof(c));
+
+  ck_str(a, b, "the custom id is the same every time (both passes agree)");
+  ck(strcmp(a, c) != 0, "a different language gets a different id");
+
+  bool charset_ok = true, len_ok = strlen(a) <= 64 && strlen(a) >= 1;
+  for (const char *q = a; *q; q++) {
+    bool ok = (*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
+              (*q >= '0' && *q <= '9') || *q == '-' || *q == '_';
+    if (!ok) charset_ok = false;
+  }
+  ck(charset_ok, "the id only uses the characters the API allows");
+  ck(len_ok, "the id is 1-64 characters long");
+  ck(strstr(a, "lzh") == NULL && strstr(c, "lzh") != NULL,
+     "the language tag is part of the id");
+}
+
+static void test_batch_collect_then_render(void) {
+  /* ---- collecting pass: no request goes out, the plan is queued ---------- */
+  stub_reset();
+  batch_items_free();
+  ensure_dir("scripts");
+  ensure_dir(BATCH_DIR);
+
+  /* make sure no stale plan file from an earlier test is picked up */
+  char stale[PATH_MAX];
+  batch_result_path("p0000000000000000-len", ".result.json", stale, sizeof(stale));
+  plat_unlink(stale);
+  batch_result_path("p0000000000000000-len", ".failed", stale, sizeof(stale));
+  plat_unlink(stale);
+
+  Config c = batch_cfg();
+  g_batch_poll_seconds = 0;          /* no sleeping in the tests */
+  g_batch_collect = true;
+  g_batch_render = false;
+
+  ClipPlanList queued = openai_make_plan(&c, "Batch Movie", "1\n5 --> 9\nStory.\n\n",
+                                        "", "", false, 2, 12, NULL, NULL, NULL);
+  ck(queued.count == 0, "the collecting pass renders nothing");
+  ck(g_plan_queued, "the collecting pass marks the plan as queued");
+  ck(stub_request_count() == 0, "the collecting pass sends no request at all");
+  ck(g_batch_n == 1, "exactly one request was collected");
+
+  const char *params = g_batch_n ? g_batch_items[0].params : "";
+  ck(body_has(params, "\"model\":\"claude-sonnet-4-5\""),
+     "the batched request carries the same model");
+  ck(body_has(params, "\"max_tokens\":32000"),
+     "the batched request carries the same output budget");
+  ck(body_has(params, "\"system\":") && body_has(params, "\"messages\":[{"),
+     "the batched request carries the same system prompt and text");
+  ck(!body_has(params, "\"stream\""),
+     "the batched request is not streamed (the API rejects that in a batch)");
+
+  /* ---- submitting it: one POST to /batches, then poll + results --------- */
+  stub_reset();
+  queue_full_batch_run("Batch Movie", "en");
+  bool cancelled = false;
+  bool in_flight = false;
+  bool got = batch_run_all(&c, &cancelled, &in_flight, NULL, 0);
+  ck(got, "the batch run reports that results were fetched");
+  ck(stub_request_count() >= 3, "the batch is created, polled and downloaded");
+
+  ck(stub_request_url(0) != NULL &&
+     strcmp(stub_request_url(0), "https://api.anthropic.com/v1/messages/batches") == 0,
+     "the batch is created on /v1/messages/batches");
+  const char *create_body = stub_request_body(0);
+  ck(body_has(create_body, "\"requests\":[{\"custom_id\":\""),
+     "the create body holds a requests array with custom ids");
+  ck(body_has(create_body, "\"params\":{"),
+     "every entry carries its params");
+  ck(!body_has(create_body, "\"stream\""),
+     "a stream field is stripped from the batched params");
+
+  /* The create call is a real API call: without the key the real API answers
+   * 401 and every plan would fall back live (costing double). */
+  ck_str(stub_request_header(0, "x-api-key"), "sk-ant-mock",
+         "the batch create call is authenticated");
+  ck_str(stub_request_header(0, "anthropic-version"), "2023-06-01",
+         "the batch create call sends the API version");
+
+  char results_url[512];
+  snprintf(results_url, sizeof(results_url),
+           "https://api.anthropic.com/v1/messages/batches/%s/results", BATCH_ID);
+  bool saw_results = false, saw_status = false;
+  for (int i = 0; i < stub_request_count(); i++) {
+    if (stub_request_url(i) && strcmp(stub_request_url(i), results_url) == 0)
+      saw_results = true;
+    char status_url[512];
+    snprintf(status_url, sizeof(status_url),
+             "https://api.anthropic.com/v1/messages/batches/%s", BATCH_ID);
+    if (stub_request_url(i) && strcmp(stub_request_url(i), status_url) == 0)
+      saw_status = true;
+  }
+  ck(saw_status, "the batch status is polled while it runs");
+  ck(saw_results, "the results are downloaded from the results endpoint");
+
+  /* ---- rendering pass: the plan comes from disk, no API call ------------ */
+  stub_reset();
+  g_batch_collect = false;
+  g_batch_render = true;
+  ClipPlanList plan = openai_make_plan(&c, "Batch Movie", "1\n5 --> 9\nStory.\n\n",
+                                       "", "", false, 2, 12, NULL, NULL, NULL);
+  ck(plan.count == 1, "the rendering pass uses the batched plan");
+  ck(plan.count == 1 && strcmp(plan.items[0].narration,
+                               "The story begins in the batched town.") == 0,
+     "the narration is the one the model wrote in the batch");
+  ck(stub_request_count() == 0,
+     "the rendering pass makes NO api call - that is where the 50% saving is");
+  free_clip_plan_list(&plan);
+
+  /* the plan is not bought a second time if the collecting pass runs again */
+  stub_reset();
+  g_batch_collect = true;
+  g_batch_render = false;
+  ClipPlanList again = openai_make_plan(&c, "Batch Movie", "1\n5 --> 9\nStory.\n\n",
+                                       "", "", false, 2, 12, NULL, NULL, NULL);
+  ck(again.count == 0 && stub_request_count() == 0,
+     "a plan that is already on disk is not queued (and not paid for) again");
+  free_clip_plan_list(&again);
+
+  g_batch_collect = false;
+  g_batch_render = false;
+  batch_items_free();
+}
+
+static void test_batch_failure_falls_back_live(void) {
+  /* An errored batch item must not cost the movie its recap: the app asks
+     live, at the normal price, with the identical prompt. */
+  stub_reset();
+  batch_items_free();
+  ensure_dir(BATCH_DIR);
+
+  Config c = batch_cfg();
+  batch_result_path("p0000000000000000-len", ".result.json", (char[PATH_MAX]){0},
+                    sizeof(char[PATH_MAX]));
+  char stale[PATH_MAX];
+  batch_custom_id("Failed Movie", "en", stale, sizeof(stale));
+  char path[PATH_MAX];
+  batch_result_path(stale, ".result.json", path, sizeof(path));
+  plat_unlink(path);
+  batch_result_path(stale, ".failed", path, sizeof(path));
+  plat_unlink(path);
+
+  /* the collecting pass, then a batch whose one request fails */
+  g_batch_collect = true;
+  g_batch_render = false;
+  ClipPlanList q = openai_make_plan(&c, "Failed Movie", "1\n5 --> 9\nStory.\n\n",
+                                    "", "", false, 2, 12, NULL, NULL, NULL);
+  free_clip_plan_list(&q);
+  ck(g_batch_n == 1, "the failing movie was collected");
+
+  stub_reset();
+  queue_batch_create();
+  queue_batch_status("ended", 0, 0, 1);
+  queue_batch_results_line(stale, "errored", "overloaded_error: try again later", 0);
+  bool cancelled = false, in_flight = false;
+  batch_run_all(&c, &cancelled, &in_flight, NULL, 0);
+
+  char failed[PATH_MAX];
+  ck(batch_failed_file("Failed Movie", "en", failed, sizeof(failed)),
+     "the failure is remembered next to the plans");
+
+  /* the rendering pass must ask live instead of skipping the movie */
+  stub_reset();
+  queue_ok(PLAN_JSON);
+  g_batch_collect = false;
+  g_batch_render = true;
+  ClipPlanList plan = openai_make_plan(&c, "Failed Movie", "1\n5 --> 9\nStory.\n\n",
+                                       "", "", false, 2, 12, NULL, NULL, NULL);
+  ck(plan.count == 1, "a failed batch request still produces a plan (asked live)");
+  ck(stub_request_count() == 1, "exactly one live request was made for it");
+  ck(stub_request_url(0) != NULL && strstr(stub_request_url(0), "/v1/messages"),
+     "the live fallback goes to the Messages API");
+  free_clip_plan_list(&plan);
+
+  g_batch_collect = false;
+  g_batch_render = false;
+  batch_items_free();
+}
+
+static void test_batch_cut_short_goes_live(void) {
+  /* A batched reply that stopped at the output limit is not good enough: the
+     app re-asks live (streamed, bigger budget) so the recap stays complete. */
+  stub_reset();
+  batch_items_free();
+  ensure_dir(BATCH_DIR);
+
+  Config c = batch_cfg();
+  char id[96], path[PATH_MAX];
+  batch_custom_id("Cut Short Movie", "en", id, sizeof(id));
+  batch_result_path(id, ".result.json", path, sizeof(path));
+  plat_unlink(path);
+  batch_result_path(id, ".failed", path, sizeof(path));
+  plat_unlink(path);
+
+  g_batch_collect = true;
+  ClipPlanList q = openai_make_plan(&c, "Cut Short Movie", "1\n5 --> 9\nStory.\n\n",
+                                    "", "", false, 2, 12, NULL, NULL, NULL);
+  free_clip_plan_list(&q);
+
+  stub_reset();
+  queue_batch_create();
+  queue_batch_status("ended", 0, 1, 0);
+  queue_batch_results_line(id, "succeeded", PLAN_TEXT, 1);   /* stop_reason=max_tokens */
+  bool cancelled = false, in_flight = false;
+  batch_run_all(&c, &cancelled, &in_flight, NULL, 0);
+
+  stub_reset();
+  queue_ok(PLAN_JSON);
+  g_batch_collect = false;
+  g_batch_render = true;
+  ClipPlanList plan = openai_make_plan(&c, "Cut Short Movie", "1\n5 --> 9\nStory.\n\n",
+                                       "", "", false, 2, 12, NULL, NULL, NULL);
+  ck(plan.count == 1, "a plan cut short in the batch is replaced by a live plan");
+  ck(stub_request_count() >= 1, "the live request was actually sent");
+  free_clip_plan_list(&plan);
+
+  g_batch_collect = false;
+  g_batch_render = false;
+  batch_items_free();
+}
+
+static void test_batch_chunking(void) {
+  /* More requests than one batch may hold are split, never dropped. */
+  stub_reset();
+  batch_items_free();
+  ensure_dir(BATCH_DIR);
+
+  for (int i = 0; i < 3; i++) {
+    char title[64];
+    snprintf(title, sizeof(title), "Chunk Movie %d", i);
+    char params[256];
+    snprintf(params, sizeof(params), "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":32}");
+    char *copy = str_dup(params);
+    batch_item_add(title, "en", 2, 12, 32000, copy);
+  }
+  ck(g_batch_n == 3, "three requests were collected");
+
+  Config c = batch_cfg();
+  /* one create call per chunk; the stub answers the same id twice */
+  queue_batch_create();
+  queue_batch_status("ended", 0, 3, 0);
+  queue_batch_create();
+  queue_batch_status("ended", 0, 3, 0);
+  queue_batch_results_line("p0000000000000000-len", "succeeded", PLAN_TEXT, 0);
+
+  bool cancelled = false, in_flight = false;
+  batch_run_all(&c, &cancelled, &in_flight, NULL, 0);
+  ck(stub_request_count() >= 2, "the run submitted at least one batch");
+
+  int creates = 0;
+  for (int i = 0; i < stub_request_count(); i++)
+    if (stub_request_url(i) && strstr(stub_request_url(i), "/batches") &&
+        !strstr(stub_request_url(i), "/results") &&
+        strstr(stub_request_url(i), "msgbatch_") == NULL)
+      creates++;
+  ck(creates >= 1, "the batch create call happened");
+  batch_items_free();
+}
+
+static void test_batch_manifest_resume(void) {
+  /* A batch that was submitted but never fetched must be reused, not re-bought. */
+  ensure_dir(BATCH_DIR);
+  batch_save_manifest("msgbatch_01PENDING", "submitted", 4);
+
+  char id[128], status[32];
+  size_t items = 0;
+  ck(batch_load_manifest(id, sizeof(id), status, sizeof(status), &items),
+     "the pending batch is remembered on disk");
+  ck_str(id, "msgbatch_01PENDING", "the pending batch id is restored");
+  ck_str(status, "submitted", "its status says it was not fetched yet");
+  ck(items == 4, "the request count is restored");
+
+  batch_save_manifest("msgbatch_01PENDING", "fetched", 4);
+  batch_load_manifest(id, sizeof(id), status, sizeof(status), &items);
+  ck_str(status, "fetched", "a fetched batch is not resumed again");
+}
+
+/* A batch that has been submitted but has not finished yet must NOT lead to a
+ * live request: that would pay for the very same plans twice. */
+static void test_batch_in_flight_is_not_paid_for_twice(void) {
+  stub_reset();
+  batch_items_free();
+  ensure_dir("scripts");
+  ensure_dir(BATCH_DIR);
+  g_batch_poll_seconds = 0;                 /* do not sleep: never finishes */
+
+  Config c = batch_cfg();
+  c.batch_max_wait_minutes = 1;
+
+  g_batch_collect = true;
+  g_batch_render = false;
+  ClipPlanList queued = openai_make_plan(&c, "In Flight Movie", "1\n5 --> 9\nStory.\n\n",
+                                        "", "", false, 2, 12, NULL, NULL, NULL);
+  ck(g_batch_n == 1, "one request was collected");
+
+  char id[96];
+  batch_custom_id("In Flight Movie", "en", id, sizeof(id));
+  char plan_path[PATH_MAX], failed_path[PATH_MAX];
+  batch_result_path(id, ".result.json", plan_path, sizeof(plan_path));
+  batch_result_path(id, ".failed", failed_path, sizeof(failed_path));
+  plat_unlink(plan_path);
+  plat_unlink(failed_path);
+
+  stub_reset();
+  queue_batch_create();
+  queue_batch_status("in_progress", 1, 0, 0);     /* never ends */
+  bool cancelled = false, in_flight = false;
+  char in_flight_id[128] = "";
+  bool got = batch_run_all(&c, &cancelled, &in_flight, in_flight_id, sizeof(in_flight_id));
+
+  ck(!got, "an unfinished batch does not count as fetched");
+  ck(in_flight, "the run is told the batch is still in flight");
+  ck(strcmp(in_flight_id, BATCH_ID) == 0, "the in-flight batch id is handed back");
+  ck(!file_exists(plan_path), "no plan file was invented for it");
+  ck(!file_exists(failed_path),
+     "and it is not marked as failed - that would force a full-price live request");
+  ck(stub_request_count() == 2, "only the create and the status poll went out");
+
+  char mid[128], status[32];
+  size_t items = 0;
+  ck(batch_load_manifest(mid, sizeof(mid), status, sizeof(status), &items),
+     "the batch is remembered on disk");
+  ck(strcmp(status, "submitted") == 0 && strcmp(mid, BATCH_ID) == 0,
+     "the manifest says the batch is still to be fetched");
+}
+
 int main(void) {
   test_endpoint_shapes();
   test_native_claude_request();
@@ -560,6 +963,13 @@ int main(void) {
   test_plain_json_is_not_touched();
   test_native_failure_says_why();
   test_gateway_rescue_url();
+  test_batch_in_flight_is_not_paid_for_twice();
+  test_batch_custom_id_shape();
+  test_batch_collect_then_render();
+  test_batch_failure_falls_back_live();
+  test_batch_cut_short_goes_live();
+  test_batch_chunking();
+  test_batch_manifest_resume();
 
   printf("\n%d checks, %d failures\n", g_pass + g_fail, g_fail);
   if (g_fail == 0) printf("ALL OK\n");

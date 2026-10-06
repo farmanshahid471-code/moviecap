@@ -468,6 +468,92 @@ jobs:
           Write-Host "captions OK: $chunks chunks in speech order, first line of every multi-line chunk drawn on top"
           Write-Host "free keyless generation OK (auto-started Piper, fallback SRT, local plan, captions)"
 
+      - name: "Test batch planning end to end (Anthropic Message Batches)"
+        shell: pwsh
+        run: |
+          # The batch path is the 50%-cheaper one: every plan request is
+          # collected, submitted as ONE Message Batch, waited for, and the
+          # videos are rendered from those results.  The mock API implements
+          # /anthropic/v1/messages/batches (create, status, results), so this
+          # covers the whole thing: both passes of the movie loop, the polling,
+          # the JSONL results parsing and the final video.
+          $ErrorActionPreference = 'Continue'
+          $pb = Join-Path (Get-Location) "pbatch"
+          New-Item -ItemType Directory -Force "$pb\movies" | Out-Null
+          New-Item -ItemType Directory -Force "$pb\scripts\srt_files" | Out-Null
+          Copy-Item build\Release\movie_summary_cli.exe $pb\
+          Copy-Item -Recurse resources $pb\resources
+          # Claude via the Anthropic-compatible path, batch planning on.
+          '{"open_api_key":"sk-ant-mock","openai_base_url":"http://127.0.0.1:9100/anthropic","openai_model":"claude-sonnet-4-5","tts_provider":"piper","min_clips":2,"max_clips":2,"recap_minutes":1,"batch_planning":true,"batch_max_wait_minutes":5,"use_wikipedia_plot":false,"auto_transcribe":false}' | Set-Content "$pb\config.json"
+          $lines = @()
+          $idx = 1
+          for ($t = 0; $t -lt 58; $t += 2) {
+            $lines += "$idx"
+            $lines += ("00:00:{0:D2},000 --> 00:00:{1:D2},000" -f $t, ($t + 2))
+            $lines += "Scene $t - the story moves forward here."
+            $lines += ""
+            $idx++
+          }
+          ($lines -join "`r`n") | Set-Content "$pb\scripts\srt_files\Batch Run 2026 1080p.srt"
+          & "C:\ProgramData\chocolatey\bin\ffmpeg.exe" -hide_banner -loglevel error -f lavfi -i testsrc=size=640x360:duration=60 -c:v libx264 "$pb\movies\Batch Run (2026).mp4"
+          if ($LASTEXITCODE -ne 0) { throw "ffmpeg could not build the test movie" }
+
+          $srv = Start-Process -FilePath "python" `
+            -ArgumentList "tools/mock_api_server.py","--openai-port","9100","--eleven-port","9101","--tts-port","8020" `
+            -PassThru -RedirectStandardOutput "mockbatch.log" -RedirectStandardError "mockbatch.err"
+          Start-Sleep -Seconds 4
+          try {
+            $env:Path = "C:\ProgramData\chocolatey\bin;C:\Windows\System32;C:\Windows"
+            Push-Location $pb
+            .\movie_summary_cli.exe 2>&1 | Tee-Object -FilePath ..\pbatch.log
+            $rc = $LASTEXITCODE
+            Pop-Location
+          } finally {
+            Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+          }
+          $tail = (Get-Content pbatch.log -Tail 12) -join " ||| "
+          Write-Host "::warning title=pbatch-tail::$tail"
+          if ($rc -ne 0) { Write-Host "::error title=pbatch::cli exited $rc"; exit 1 }
+
+          if (-not (Select-String -Path pbatch.log -Pattern "Batch planning is ON" -Quiet)) {
+            Write-Host "::error title=pbatch::batch mode was not enabled"; exit 1 }
+          if (-not (Select-String -Path pbatch.log -Pattern "Submitting 1 plan request" -Quiet)) {
+            Write-Host "::error title=pbatch::the collected request was not submitted as a batch"; exit 1 }
+          if (-not (Select-String -Path pbatch.log -Pattern "Queued for the batch" -Quiet)) {
+            Write-Host "::error title=pbatch::the collecting pass did not queue the plan"; exit 1 }
+          if (-not (Select-String -Path pbatch.log -Pattern "Batch msgbatch_mock.* submitted" -Quiet)) {
+            Write-Host "::error title=pbatch::no batch was created"; exit 1 }
+          if (-not (Select-String -Path pbatch.log -Pattern "ended: 1 succeeded" -Quiet)) {
+            Write-Host "::error title=pbatch::the batch never finished"; exit 1 }
+          if (-not (Select-String -Path pbatch.log -Pattern "Using the batched plan for" -Quiet)) {
+            Write-Host "::error title=pbatch::the rendering pass did not use the batched plan"; exit 1 }
+          if (-not (Select-String -Path pbatch.log -Pattern "All done. Processed: 1" -Quiet)) {
+            Write-Host "::error title=pbatch::the run did not finish"; exit 1 }
+
+          # The plan really came from the batch: no live plan call was made
+          # (the mock prints "returning N clips" for a live /responses request).
+          if (Select-String -Path mockbatch.err -Pattern "returning \d+ clips" -Quiet) {
+            Write-Host "::error title=pbatch::a LIVE plan request was made - the batch was bypassed"
+            exit 1 }
+          if (-not (Select-String -Path mockbatch.err -Pattern "created with 1 request" -Quiet)) {
+            Write-Host "::error title=pbatch::the mock never received a batch create call"; exit 1 }
+
+          # The result file and the manifest are on disk, with the real script.
+          $manifest = Get-Content "$pb\scripts\plans\batch_state.json" | ConvertFrom-Json
+          if ($manifest.status -ne "fetched") {
+            Write-Host "::error title=pbatch::the batch manifest is not marked as fetched ($($manifest.status))"
+            exit 1 }
+          if (-not (Select-String -Path "$pb\scripts\plans\*.result.json" -Pattern "don't forget to like the video" -Quiet)) {
+            Write-Host "::error title=pbatch::the batched plan does not carry the closing line"; exit 1 }
+
+          $vid = Get-Item "$pb\output\Batch Run (2026).mp4" -ErrorAction SilentlyContinue
+          if (-not $vid) { Write-Host "::error title=pbatch::no video was rendered"; exit 1 }
+          $dur = & "C:\ProgramData\chocolatey\bin\ffprobe.exe" -v error -show_entries format=duration -of csv=p=0 "$pb\output\Batch Run (2026).mp4"
+          Write-Host "pbatch video: $($vid.Length) bytes, $dur s"
+          if ([double]$dur -lt 40) {
+            Write-Host "::error title=pbatch::the batched recap collapsed to $dur s"; exit 1 }
+          Write-Host "batch planning OK: 1 request batched, results fetched, video rendered from the batched plan"
+
       - name: "Test run.bat web brings the control panel up"
         shell: pwsh
         run: |
