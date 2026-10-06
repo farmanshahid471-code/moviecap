@@ -47,6 +47,12 @@ static const char *BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
   "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
 
+/* Wikimedia asks automated clients to identify themselves instead of sending a
+   generic browser User-Agent, so the Wikipedia calls carry their own one. */
+static const char *WIKI_UA =
+  "AI-Movie-Shorts/2.0 (movie recap planner; "
+  "https://github.com/farmanshahid471-code/moviecap)";
+
 typedef struct {
   char *data;
   size_t size;
@@ -240,7 +246,7 @@ static size_t curl_file_write_cb(void *contents, size_t size, size_t nmemb, void
   return fwrite(contents, size, nmemb, (FILE *)userp);
 }
 
-static MemBuf http_get_to_mem_ex(const char *url, long *http_code_out) {
+static MemBuf http_get_to_mem_ua(const char *url, long *http_code_out, const char *user_agent) {
   if (http_code_out) *http_code_out = -1;
 
   CURL *curl = curl_easy_init();
@@ -254,7 +260,7 @@ static MemBuf http_get_to_mem_ex(const char *url, long *http_code_out) {
   curl_easy_setopt(curl, CURLOPT_URL, url);
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
-  curl_easy_setopt(curl, CURLOPT_USERAGENT, BROWSER_UA);
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent ? user_agent : BROWSER_UA);
   curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
   curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
@@ -286,6 +292,10 @@ static MemBuf http_get_to_mem_ex(const char *url, long *http_code_out) {
   }
 
   return buf;
+}
+
+static MemBuf http_get_to_mem_ex(const char *url, long *http_code_out) {
+  return http_get_to_mem_ua(url, http_code_out, BROWSER_UA);
 }
 
 static MemBuf http_post_json_to_mem(const char *url, const char *bearer_key, const char *json_body,
@@ -1521,7 +1531,7 @@ static char *wiki_search_title(const char *base, const char *movie_title) {
            "%s?action=query&list=search&srsearch=%s&srlimit=5&format=json", base, enc);
 
   long code = 0;
-  MemBuf r = http_get_to_mem_ex(url, &code);
+  MemBuf r = http_get_to_mem_ua(url, &code, WIKI_UA);
   if (code != 200 || !r.data) { if (r.data) free(r.data); return NULL; }
 
   char *title = NULL;
@@ -1566,7 +1576,7 @@ static char *wiki_fetch_extract(const char *base, const char *page_title) {
            base, enc);
 
   long code = 0;
-  MemBuf r = http_get_to_mem_ex(url, &code);
+  MemBuf r = http_get_to_mem_ua(url, &code, WIKI_UA);
   if (code != 200 || !r.data) { if (r.data) free(r.data); return NULL; }
 
   char *text = NULL;
