@@ -529,6 +529,14 @@ jobs:
             Write-Host "::error title=pbatch::the rendering pass did not use the batched plan"; exit 1 }
           if (-not (Select-String -Path pbatch.log -Pattern "All done. Processed: 1" -Quiet)) {
             Write-Host "::error title=pbatch::the run did not finish"; exit 1 }
+          # The batched plan must satisfy the length target on its own: the audit
+          # asking for longer narrations would mean the batch produced a shorter
+          # recap than the live path would have.
+          if (Select-String -Path pbatch.log -Pattern "asking the model once more for full-length" -Quiet) {
+            Write-Host "::error title=pbatch::the batched plan was too short - the length audit had to top it up"
+            exit 1 }
+          if (Select-String -Path pbatch.log -Pattern "came back in the wrong language" -Quiet) {
+            Write-Host "::error title=pbatch::the batched plan came back in the wrong language"; exit 1 }
 
           # The plan really came from the batch: no live plan call was made
           # (the mock prints "returning N clips" for a live /responses request).

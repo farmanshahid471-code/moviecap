@@ -82,7 +82,19 @@ CLOSING_LINE = (
 )
 
 
-def narration_for(i, clips_wanted, title, lang, names):
+def pad_narration(text, seconds, lang):
+    """A real model writes to the requested length; the mock should too, so the
+    length audit in the app has nothing to complain about.  ~2.7 words per
+    second, and never after the closing line."""
+    need = max(int(seconds * 2.7), 25)
+    filler = ("Then the story turns again and the people in it have to decide "
+              "what they are willing to lose.")
+    while len(text.split()) < need:
+        text = text + " " + filler
+    return text
+
+
+def narration_for(i, clips_wanted, title, lang, names, target_sec=0):
     """A narration that follows the same script rules the real prompt asks for:
     no channel intro, present tense, and the exact closing sentence at the end.
     Only a stand-in for the real model - the words do not matter, the shape does.
@@ -103,6 +115,9 @@ def narration_for(i, clips_wanted, title, lang, names):
             f"The story keeps moving. Something goes wrong and there is no time to think."
         )
 
+    if target_sec > 0:
+        text = pad_narration(text, target_sec, lang)
+
     if i == clips_wanted - 1:
         text += " " + (CLOSING_LINE if lang.lower().startswith("english")
                        else "That is where this story ends.")
@@ -118,9 +133,14 @@ def build_plan(body, clips_wanted):
     return plan_from_prompt(prompt, clips_wanted)
 
 
-def plan_from_prompt(prompt, clips_wanted):
+def plan_from_prompt(prompt, clips_wanted, honour_length=False):
     """The same plan, built from the prompt text alone - which is all a batched
     Messages request carries (its params hold system + messages)."""
+    target_sec = 0
+    if honour_length:
+        m = re.search(r"Target clip length:\s*(\d+)-(\d+) seconds each", prompt)
+        if m:
+            target_sec = int(m.group(2))
     subs = ""
     if "INPUT A" in prompt:
         subs = prompt.split("INPUT A", 1)[1].split("INPUT B", 1)[0]
@@ -149,7 +169,7 @@ def plan_from_prompt(prompt, clips_wanted):
         clips.append({
             "start": start,
             "end": end,
-            "narration": narration_for(i, clips_wanted, title, lang, names),
+            "narration": narration_for(i, clips_wanted, title, lang, names, target_sec),
         })
     return {"clips": clips}
 
@@ -205,7 +225,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             for msg in params.get("messages", []):
                 if msg.get("role") == "user":
                     prompt = msg.get("content", "")
-            plan = plan_from_prompt(prompt, batch["clips"])
+            plan = plan_from_prompt(prompt, batch["clips"], honour_length=True)
             lines.append(json.dumps({
                 "custom_id": req.get("custom_id"),
                 "result": {"type": "succeeded", "message": {
