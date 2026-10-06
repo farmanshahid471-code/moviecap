@@ -129,7 +129,12 @@ no browser extension, nothing to install. The page gives you:
 - **target recap length** (`recap_minutes`, minutes, 0 = automatic): the planner makes
   clip windows and narrations longer so the finished video lands near that length
 - **burnt-in subtitles** (`captions`, on by default): the narration as small centred
-  captions (~3.5% of frame height, thin outline) — readable, never huge
+  captions (~3.5% of frame height, thin outline) — readable, never huge. Each caption
+  changes exactly when the voice moves on to the next sentence: the clip length is
+  estimated per sentence (syllables, digits that are read out loud, punctuation pauses)
+  and those boundaries are then snapped onto the real pauses `ffmpeg`'s `silencedetect`
+  finds in the narration audio, so the text never runs ahead of the words or lags
+  behind them
 - **file management** for `movies\`, `scripts\srt_files\`, `backgroundmusic\`,
   `output\`, `tiktok_output\`, `movies_retired\`, `clips\`:
   drag-and-drop **upload**, **delete**, **download**
@@ -474,8 +479,9 @@ Saved to `tiktok_output\`.
 
 The pipeline is the same shape: clip counts (20–30), durations, speed cap, FFmpeg filters, BGM mixing
 and vertical crop match the original. The recap prompt was rewritten (character list first, clip length
-targets in seconds x 2.6 words, strict JSON), the plan is force-sorted chronologically, and the
-subtitle -> seconds conversion sorts out-of-order tracks.
+targets in seconds x 2.6 words, strict JSON), the plan is force-sorted chronologically, the
+subtitle -> seconds conversion sorts out-of-order tracks, and caption changes are aligned to the
+pauses of the generated narration instead of a character count.
 
 ### Source layout
 - `src\generator.c/.h` — the pipeline (subtitles → OpenAI → ElevenLabs → FFmpeg),
