@@ -336,8 +336,9 @@ Plot summary: 2611 chars from Wikipedia (Heat (1995)) will be handed to the mode
 Plot summary: the article "Some Obscure Film (2021 film)" has no usable plot section - continuing without it.
 ```
 
-To fix a wrong or missing summary by hand, create the cache file yourself — it is read before any
-network call and never overwritten:
+To fix a wrong or missing summary by hand, create the cache file yourself — it is read **before any
+network call**, so a file of at least 400 characters is used exactly as written. (A shorter file is
+treated as junk and replaced by a fresh download.)
 
 ```
 scripts\srt_files\<MovieTitle>_plot.txt
