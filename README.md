@@ -481,7 +481,9 @@ The pipeline is the same shape: clip counts (20–30), durations, speed cap, FFm
 and vertical crop match the original. The recap prompt was rewritten (character list first, clip length
 targets in seconds x 2.6 words, strict JSON), the plan is force-sorted chronologically, the
 subtitle -> seconds conversion sorts out-of-order tracks, and caption changes are aligned to the
-pauses of the generated narration instead of a character count.
+pauses of the generated narration instead of a character count (measured with real ffmpeg against
+simulated TTS takes: worst caption change 0.04-0.05 s away from the moment the voice stops, against
+0.15-0.56 s early and 0.63-1.17 s late before).
 
 ### Source layout
 - `src\generator.c/.h` — the pipeline (subtitles → OpenAI → ElevenLabs → FFmpeg),
@@ -539,6 +541,13 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
     arrived instead of quietly shipping a half-length recap.
   - DeepSeek's gateway maps `claude-*` model names to its own models, so a `claude-sonnet-...` model
     works against `https://api.deepseek.com/anthropic` too.
+- **Captions ahead of / behind the voice?** Caption changes are aligned to the pauses of the
+  narration itself (`narration_pauses` + `align_boundaries_to_pauses` in `src/generator.c`), and the
+  log says `Caption timing: N of M sentence boundaries aligned ...` plus the spoken range it used
+  (e.g. `voice 0.60-19.15 s`). Two things to check in the log if it ever looks off:
+  `No pauses could be found in the narration of this clip` (the portable ffmpeg is incomplete) and
+  `Could not trim the silence at the edges of ...` (the narration keeps its lead-in, which shifts
+  every caption of that clip).
 - **Characters get mixed up / people who are not in the shot get named?** The recap prompt
   (`openai_make_plan` in `src/generator.c`) builds a character list from the subtitles first and is
   told never to guess or invent a name, to use one name per character everywhere and to only mention

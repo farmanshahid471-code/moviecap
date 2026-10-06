@@ -3086,23 +3086,31 @@ static bool whisper_transcribe_to_srt(const char *movie_path, const char *out_sr
 }
 
 /* Every TTS engine leaves silence at the start/end of a clip; those dead
- * gaps at every cut are most of the "slow pacing" feel. Trim them. */
+ * gaps at every cut are most of the "slow pacing" feel - and they also shift
+ * every caption away from the words, because the caption timeline starts at the
+ * beginning of the audio file. Trim them. */
 static void tts_trim_silence(const char *mp3) {
   char tmp[PATH_MAX];
-  snprintf(tmp, sizeof(tmp), "%s.trim", mp3);
+  snprintf(tmp, sizeof(tmp), "%s.trim.mp3", mp3);
   char *in_esc  = sh_escape(mp3);
   char *tmp_esc = sh_escape(tmp);
+  /* -f mp3: the temporary name ends in .mp3, but be explicit - without a known
+     container ffmpeg refuses to write the file and the trim silently never
+     happens (which is how captions drifted for every clip). */
   int rc = run_cmd(
     "ffmpeg -y -hide_banner -loglevel error -i %s -af "
     "\"silenceremove=start_periods=1:start_threshold=-45dB,areverse,"
     "silenceremove=start_periods=1:start_threshold=-45dB,areverse\" "
-    "-c:a libmp3lame -b:a 192k %s", in_esc, tmp_esc);
+    "-c:a libmp3lame -b:a 192k -f mp3 %s", in_esc, tmp_esc);
   free(in_esc);
   free(tmp_esc);
   if (rc == 0 && file_size_bytes(tmp) > 2048) {
     plat_unlink(mp3);
     if (plat_rename(tmp, mp3) != 0) logw("Could not swap in the silence-trimmed narration.");
   } else {
+    /* Never silent: the trim decides how well captions line up with the voice. */
+    logw("Could not trim the silence at the edges of %s (ffmpeg exit %d) - "
+         "captions and pacing will be slightly less tight.", mp3, rc);
     plat_unlink(tmp);
   }
 }
@@ -3353,64 +3361,173 @@ static size_t narration_pauses(const char *mp3, double **mids, double **lens) {
   return ps.n;
 }
 
-/* Move each estimated caption boundary onto the nearest real pause, so the
- * caption leaves the screen when the voice actually stops speaking it.  Only
- * pauses close enough (and not already used by the previous boundary) are
- * accepted; everything else keeps the estimate.
+/* The audio the captions have to follow: where the voice starts and stops
+ * (the lead-in / tail of a TTS file is not speech) plus the silences inside it. */
+typedef struct {
+  const double *pauses;   /* midpoint of each silence, in order */
+  const double *plens;    /* how long that silence lasted */
+  size_t        npauses;
+  double        onset;    /* first moment the voice is heard */
+  double        stop;     /* last moment the voice is heard */
+} CaptionAudio;
+
+/* Work out the spoken part of the narration from its silences: a silence that
+ * starts at 0 is the engine's lead-in, one that reaches the end is the tail.
+ * Captions have to follow the voice, not the file - otherwise every caption of
+ * the clip sits early by the length of that lead-in and the last one hangs
+ * there through the tail. */
+static CaptionAudio caption_audio_from(const double *mids, const double *lens,
+                                       size_t np, double dur) {
+  CaptionAudio au;
+  au.pauses = mids;
+  au.plens  = lens;
+  au.npauses = np;
+  au.onset = 0.0;
+  au.stop  = dur;
+  if (np == 0) return au;
+  double head = lens[0] * 0.5, tail = lens[np - 1] * 0.5;
+  if (mids[0] - head <= 0.05) au.onset = mids[0] + head;
+  if (mids[np - 1] + tail >= dur - 0.05) au.stop = mids[np - 1] - tail;
+  if (au.stop <= au.onset + 0.30) { au.onset = 0.0; au.stop = dur; }
+  return au;
+}
+
+/* Put the estimated sentence boundaries onto the real pauses of the narration.
  *
- * A longer silence wins over a shorter one that is a little closer, because a
- * sentence end is a longer stop than a comma -- that keeps the snap from
- * landing on a brief breath mid-sentence.  Measured against simulated TTS takes
- * this puts 96% of boundaries within half a second of the real sentence end
- * (the old character-count estimate put 46% there). */
-static void snap_boundaries_to_pauses(double *bound, int nseg,
-                                      const double *pauses, const double *plens,
-                                      size_t np, double dur) {
-  if (nseg < 2 || np == 0) return;
+ * A greedy "snap it when a pause is close enough" misses whenever the estimate
+ * has drifted: a boundary that is two seconds out never sees its pause inside
+ * the tolerance window, and stays wrong.  So the boundaries and the pauses are
+ * aligned as two ordered sequences with a small dynamic program - skip a pause,
+ * skip a boundary, or match the two - scoring a match by how far the pause is
+ * from the estimate minus a bonus for how long the silence lasted (a sentence
+ * end is a longer stop than a comma).  Every boundary that was not matched is
+ * then re-spread inside the interval between its two matched neighbours in
+ * proportion to its speech weight, so a drift can never survive past the next
+ * matched pause. */
+static void align_boundaries_to_pauses(double *bound, const double *w_cum, int nseg,
+                                       const CaptionAudio *au) {
+  const int nb = nseg - 1;                  /* boundaries between chunks */
+  bound[nseg] = au->stop;
+  if (nb <= 0 || au->npauses == 0) return;
 
-  size_t pi = 0;
-  int snapped = 0;
-  for (int g = 1; g < nseg; g++) {
-    double t    = bound[g];
-    double prev = bound[g - 1];
-    double next = bound[g + 1];                 /* estimate, not yet snapped */
-    double tol  = 0.45 * (next - prev);
-    if (tol > 2.00) tol = 2.00;
-    if (tol < 0.15) tol = 0.15;
+  /* Candidate change points: the moment the voice stops before a silence, so a
+     caption is never taken away while its line is still being spoken.  The one
+     exception is a very long pause: there the change point is pulled to at most
+     CHASE seconds before the next line starts, so the next caption does not sit
+     on screen long before its words are said.  Only silences strictly inside the
+     spoken part can carry a sentence end. */
+  const double CHASE = 0.50;
+  int *pidx = (int *)malloc(au->npauses * sizeof(int));
+  double *ppos = (double *)malloc(au->npauses * sizeof(double));
+  if (!pidx || !ppos) die("OOM");
+  size_t ne = 0;
+  for (size_t k = 0; k < au->npauses; k++) {
+    double len   = au->plens ? au->plens[k] : 0.0;
+    double start = au->pauses[k] - len * 0.5;
+    double end   = au->pauses[k] + len * 0.5;
+    double p     = start;
+    if (end - CHASE > p) p = end - CHASE;
+    if (p > au->onset + 0.05 && p < au->stop - 0.05) { pidx[ne] = (int)k; ppos[ne] = p; ne++; }
+  }
+  if (ne == 0) { free(pidx); free(ppos); return; }
 
-    size_t best = (size_t)-1;
-    double best_score = 0;
-    for (size_t k = pi; k < np && pauses[k] <= t + tol; k++) {
-      double p = pauses[k];
-      if (p < t - tol) continue;
-      if (!(p > prev + 0.30)) continue;                       /* keeps captions ordered */
-      if (g + 1 < nseg && !(p < bound[g + 1] - 0.30)) continue;
-      double keep = plens ? plens[k] : 0.0;                   /* prefer longer stops */
-      if (keep > 0.6) keep = 0.6;
-      double score = fabs(p - t) - 0.5 * keep;
-      if (best == (size_t)-1 || score < best_score) { best = k; best_score = score; }
-    }
-    if (best != (size_t)-1) {
-      bound[g] = pauses[best];
-      snapped++;
-      pi = best + 1;
+  /* Weights of the two "give up" moves.  Skipping a boundary has to cost more
+     than matching a pause that is up to ~1.8 s away, otherwise a boundary that
+     merely drifted is left as an estimate instead of being put right - which is
+     how the drift used to accumulate over a whole clip. */
+  const double SKIP_B   = 1.50;   /* not every sentence end is a detected stop */
+  const double BONUS    = 0.50;   /* ... and a long stop is likely a sentence end */
+  const double MAXJUMP  = 3.50;   /* beyond this it is not the same moment */
+  const double INF      = 1e30;
+
+  size_t cols = ne + 1;
+  double *dp = (double *)malloc((size_t)(nb + 1) * cols * sizeof(double));
+  unsigned char *ch = (unsigned char *)malloc((size_t)(nb + 1) * cols);
+  if (!dp || !ch) die("OOM");
+  for (size_t q = 0; q < (size_t)(nb + 1) * cols; q++) { dp[q] = INF; ch[q] = 0; }
+  dp[0] = 0.0;
+
+  for (int i = 0; i <= nb; i++) {
+    for (size_t k = 0; k <= ne; k++) {
+      double cur = dp[(size_t)i * cols + k];
+      if (cur >= INF) continue;
+
+      if (i < nb) {                                   /* leave boundary i estimated */
+        double *t = &dp[(size_t)(i + 1) * cols + k];
+        if (cur + SKIP_B < *t) { *t = cur + SKIP_B; ch[(size_t)(i + 1) * cols + k] = 1; }
+      }
+      if (k < ne) {                                   /* leave pause k unused */
+        double *t = &dp[(size_t)i * cols + (k + 1)];
+        if (cur < *t) { *t = cur; ch[(size_t)i * cols + (k + 1)] = 2; }
+      }
+      if (i < nb && k < ne) {                         /* boundary i+1 <-> pause k */
+        size_t pk = (size_t)pidx[k];
+        double p   = ppos[k];
+        double d   = fabs(p - bound[i + 1]);
+        if (d <= MAXJUMP) {
+          double len = au->plens ? au->plens[pk] : 0.0;
+          if (len > 0.6) len = 0.6;
+          double *t = &dp[(size_t)(i + 1) * cols + (k + 1)];
+          if (cur + d - BONUS * len < *t) {
+            *t = cur + d - BONUS * len;
+            ch[(size_t)(i + 1) * cols + (k + 1)] = 3;
+          }
+        }
+      }
     }
   }
 
-  /* Captions must stay in order and never run past the end of the audio. */
+  /* walk back: every cell saying "match" is a boundary sitting on a real stop */
+  bool is_anchor[CAP_MAX_SEG + 1];
+  for (int g = 0; g <= nseg; g++) is_anchor[g] = false;
+  int matched = 0, i = nb;
+  size_t k = ne;
+  while (i > 0 || k > 0) {
+    unsigned char c = ch[(size_t)i * cols + k];
+    if (c == 3) { bound[i] = ppos[k - 1]; is_anchor[i] = true; matched++; i--; k--; }
+    else if (c == 1) { i--; }
+    else if (c == 2) { k--; }
+    else break;
+  }
+  free(dp); free(ch); free(pidx); free(ppos);
+
+  /* re-spread the unmatched boundaries between their neighbouring anchors */
+  int    prev_g = 0;
+  double prev_t = au->onset;
   for (int g = 1; g <= nseg; g++) {
-    double limit = dur - 0.25 * (double)(nseg - g);
+    bool anchor = (g == nseg) || is_anchor[g];
+    if (!anchor) continue;
+    double t = (g == nseg) ? au->stop : bound[g];
+    if (g > prev_g + 1 && w_cum) {
+      double w0 = w_cum[prev_g], w1 = w_cum[g];
+      if (w1 > w0 + 1e-6) {
+        for (int q = prev_g + 1; q < g; q++)
+          bound[q] = prev_t + (t - prev_t) * (w_cum[q] - w0) / (w1 - w0);
+      }
+    }
+    prev_g = g;
+    prev_t = t;
+  }
+
+  /* captions stay in order, on screen long enough, and inside the voice */
+  for (int g = 1; g <= nseg; g++) {
+    double limit = au->stop - 0.20 * (double)(nseg - g);
     if (limit < bound[g - 1] + 0.05) limit = bound[g - 1] + 0.05;
-    if (bound[g] < bound[g - 1] + 0.30) bound[g] = bound[g - 1] + 0.30;
+    if (bound[g] < bound[g - 1] + 0.25) bound[g] = bound[g - 1] + 0.25;
     if (bound[g] > limit) bound[g] = limit;
   }
-  if (snapped) logi("Caption timing: %d of %d sentence boundaries snapped to the "
-                    "pauses in the narration.", snapped, nseg - 1);
+  bound[nseg] = au->stop;
+
+  if (matched)
+    logi("Caption timing: %d of %d sentence boundaries aligned to the pauses in the "
+         "narration (voice %.2f-%.2f s).", matched, nb, au->onset, au->stop);
+  else if (au->npauses)
+    logw("Found %zu pause(s) in the narration but none lined up with a sentence end - "
+         "caption timing stays estimated for this clip.", au->npauses);
 }
 
 static char *caption_filter_chain(const char *text, const char *font, double dur,
-                                  const double *pauses, const double *plens,
-                                  size_t npauses) {
+                                  const CaptionAudio *au) {
   if (!text || !text[0] || dur <= 0.1) return NULL;
 
   /* Clean: curly apostrophe for ', space for " \\ and newlines. */
@@ -3513,15 +3630,22 @@ static char *caption_filter_chain(const char *text, const char *font, double dur
   }
   if (total_w <= 0) total_w = 1;
 
+  /* Estimated share of the spoken time per chunk: speech units, spread over the
+     part of the file that actually contains speech. */
+  double w_cum[CAP_MAX_SEG + 1];
   double bound[CAP_MAX_SEG + 1];
   {
     double acc = 0;
-    bound[0] = 0;
+    w_cum[0] = 0;
+    bound[0] = au->onset;
     for (int g = 0; g < nseg; g++) {
       acc += seg_w[g];
-      bound[g + 1] = dur * acc / total_w;
+      w_cum[g + 1] = acc;
+      bound[g + 1] = au->onset + (au->stop - au->onset) * acc / total_w;
     }
-    snap_boundaries_to_pauses(bound, nseg, pauses, plens, npauses, dur);
+    bound[0] = au->onset;
+    align_boundaries_to_pauses(bound, w_cum, nseg, au);
+    bound[0] = au->onset;
   }
 
   char font_esc[300];
@@ -3541,7 +3665,7 @@ static char *caption_filter_chain(const char *text, const char *font, double dur
   size_t off = 0;
   for (int g = 0; g < nseg; g++) {
     double t0 = bound[g];
-    double t1 = (g == nseg - 1) ? dur + 1.0 : bound[g + 1];
+    double t1 = (g == nseg - 1) ? au->stop : bound[g + 1];
     for (int li = 0; li < nline; li++) {
       if (lseg[li] != (size_t)g) continue;
       int stack = 0;
@@ -3627,8 +3751,11 @@ static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
   if (cfg->captions && caption && caption[0] && caption_font_available(cfg->caption_font)) {
     double *pauses = NULL, *plens = NULL;
     size_t npauses = narration_pauses(narration_mp3, &pauses, &plens);
-    cap_esc = caption_filter_chain(caption, cfg->caption_font, narration_dur,
-                                   pauses, plens, npauses);
+    CaptionAudio au = caption_audio_from(pauses, plens, npauses, narration_dur);
+    if (npauses == 0)
+      logw("No pauses could be found in the narration of this clip - caption timing "
+           "stays estimated (is the portable ffmpeg complete?).");
+    cap_esc = caption_filter_chain(caption, cfg->caption_font, narration_dur, &au);
     free(pauses);
     free(plens);
   }
