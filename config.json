@@ -27,6 +27,8 @@
   "use_wikipedia_plot": true,
   "wikipedia_base_url": "",
   "offline_planner": false,
+  "batch_planning": false,
+  "batch_max_wait_minutes": 720,
   "recap_languages": [""],
   "caption_font": "resources/Inter-Regular.ttf",
   "caption_font_zh": "",

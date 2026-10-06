@@ -473,6 +473,8 @@ typedef struct {
   char tts_language[16];      /* xtts only, default "en" */
   char tts_model[64];         /* openai_tts only, default "tts-1" */
   char tts_api_key[512];      /* optional bearer for openai_tts */
+  bool batch_planning;        /* Anthropic Message Batches: 50% cheaper plans */
+  int  batch_max_wait_minutes;/* how long to wait for a batch (0 = until ended)*/
   bool auto_transcribe;       /* faster-whisper when a movie has no subtitles */
   char whisper_model[32];     /* whisper model size; default "small"          */
   char recap_language[96];    /* language of the CURRENT run ("" = English)   */
@@ -746,6 +748,10 @@ static Config load_config_json(const char *path) {
   c.max_video_speedup = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "max_video_speedup"), MAX_VIDEO_SPEEDUP, 1.0, 8.0);
   c.recap_minutes     = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "recap_minutes"), 0, 0, 180);
   c.captions          = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "captions"), true);
+  c.batch_planning    = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "batch_planning"), false);
+  c.batch_max_wait_minutes =
+      (int)cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "batch_max_wait_minutes"), 720, 0, 2880);
+  if (c.batch_planning && c.batch_max_wait_minutes <= 0) c.batch_max_wait_minutes = 720;
   c.auto_transcribe   = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "auto_transcribe"), true);
   cfg_set_str(c.whisper_model, sizeof(c.whisper_model), cJSON_GetObjectItemCaseSensitive(root, "whisper_model"));
   if (c.whisper_model[0] == 0) snprintf(c.whisper_model, sizeof(c.whisper_model), "small");
@@ -2091,13 +2097,13 @@ static bool anthropic_host_is_native(const char *base) {
   return strcasestr_local(base, "api.anthropic.com") != NULL;
 }
 
-static MemBuf anthropic_post_messages(const Config *cfg, const char *sys_prompt,
-                                      const char *prompt, int max_tokens,
-                                      bool disable_thinking, bool stream,
-                                      long *http_code, long timeout_s) {
-  char endpoint[560];
-  anthropic_endpoint(cfg->openai_base_url, endpoint, sizeof(endpoint));
-
+/* The Messages API request body.  The live path and the batch path build it
+ * here so a batched plan is byte-for-byte the request a live run would send -
+ * same model, same system prompt, same text, same output budget.  (Batch
+ * requests must NOT carry "stream": true, so the batch path never does.) */
+static char *anthropic_build_params(const Config *cfg, const char *sys_prompt,
+                                    const char *prompt, int max_tokens,
+                                    bool disable_thinking, bool stream) {
   cJSON *req = cJSON_CreateObject();
   cJSON_AddStringToObject(req, "model", cfg->openai_model);
   /* A full clip plan is thousands of tokens; a small budget silently
@@ -2126,6 +2132,38 @@ static MemBuf anthropic_post_messages(const Config *cfg, const char *sys_prompt,
   cJSON_AddItemToObject(req, "messages", msgs);
   char *body = cJSON_PrintUnformatted(req);
   cJSON_Delete(req);
+  return body;
+}
+
+/* Every Anthropic call needs the same credentials: an OAuth token goes in
+ * Authorization, a normal key in x-api-key (plus Authorization for
+ * Anthropic-compatible providers, which expect OpenAI-style auth). */
+static void anthropic_auth_headers(const Config *cfg, char *keyhdr, size_t keyhdr_sz,
+                                   char *bearhdr, size_t bearhdr_sz) {
+  snprintf(keyhdr, keyhdr_sz, "x-api-key: %s", cfg->openai_key);
+  snprintf(bearhdr, bearhdr_sz, "Authorization: Bearer %s", cfg->openai_key);
+}
+
+static void anthropic_auth_add(const Config *cfg, struct curl_slist **headers,
+                               const char *keyhdr, const char *bearhdr) {
+  if (strncmp(cfg->openai_key, "sk-ant-oat", 10) == 0) {
+    *headers = curl_slist_append(*headers, bearhdr);   /* OAuth token: Bearer only */
+  } else {
+    *headers = curl_slist_append(*headers, keyhdr);
+    if (!anthropic_host_is_native(cfg->openai_base_url))
+      *headers = curl_slist_append(*headers, bearhdr);
+  }
+}
+
+static MemBuf anthropic_post_messages(const Config *cfg, const char *sys_prompt,
+                                      const char *prompt, int max_tokens,
+                                      bool disable_thinking, bool stream,
+                                      long *http_code, long timeout_s) {
+  char endpoint[560];
+  anthropic_endpoint(cfg->openai_base_url, endpoint, sizeof(endpoint));
+
+  char *body = anthropic_build_params(cfg, sys_prompt, prompt, max_tokens,
+                                      disable_thinking, stream);
   if (!body) { if (http_code) *http_code = -1; return (MemBuf){0}; }
 
   const char *key = cfg->openai_key;
@@ -2150,6 +2188,583 @@ static MemBuf anthropic_post_messages(const Config *cfg, const char *sys_prompt,
   MemBuf r = http_post_json_headers(endpoint, hdrs, body, http_code, timeout_s);
   free(body);
   return r;
+}
+
+/* -------------------------------------------- Anthropic Message Batches API
+ *
+ * A recap needs one planning request per movie per language.  Sending them
+ * through the Message Batches API costs 50% less (input AND output) and the
+ * requests are otherwise identical - same model, same system prompt, same
+ * text, same output budget - so the narration is exactly the one a live call
+ * would have produced.  The batches are asynchronous, so a run collects every
+ * plan it needs, submits them together, waits, and then renders.
+ *
+ * Nothing here changes the live path: a batch item that fails or comes back
+ * truncated is simply re-requested live at the normal price, which is what
+ * happened before this feature existed.
+ * ------------------------------------------------------------------------- */
+
+#define BATCH_DIR                 "scripts/plans"
+#define BATCH_MANIFEST            "scripts/plans/batch_state.json"
+#define BATCH_MAX_ITEMS_PER_BATCH 100          /* the API allows 100k         */
+#define BATCH_MAX_BYTES_PER_BATCH (32u * 1024u * 1024u)  /* API: 256 MB     */
+static int  g_batch_poll_seconds = 30;   /* shortened by the unit tests */
+
+typedef struct {
+  char  custom_id[96];
+  char  title_hash[24];
+  char  movie_title[PATH_MAX];
+  char  lang_code[8];
+  int   num_clips;
+  int   per_clip_sec;
+  int   budget;
+  char *params;                 /* the Messages params, as JSON           */
+} BatchItem;
+
+static BatchItem *g_batch_items = NULL;
+static size_t     g_batch_n = 0, g_batch_cap = 0;
+static size_t     g_batch_pending = 0;   /* items collected in this pass   */
+static bool       g_plan_queued = false; /* set when a plan went into a batch */
+static bool       g_batch_collect = false;/* pass 1: collect requests        */
+static bool       g_batch_render  = false;/* pass 2: use the batch results   */
+/* A correction request ("write longer narrations", "answer in <language>") must
+   reach the model again, so it goes live instead of re-reading the batched
+   reply - the batched plan is already bought and cannot be re-asked. */
+static bool       g_batch_bypass_lookup = false;
+
+static void batch_items_free(void) {
+  for (size_t i = 0; i < g_batch_n; i++) free(g_batch_items[i].params);
+  free(g_batch_items);
+  g_batch_items = NULL;
+  g_batch_n = g_batch_cap = 0;
+}
+
+/* A custom_id has to match ^[a-zA-Z0-9_-]{1,64}$ - a movie title may contain
+ * spaces, apostrophes or any alphabet, so the id is built from a hash of the
+ * title plus the language code.  It is derived from the strings alone, so the
+ * collecting pass and the rendering pass compute the same id. */
+static void batch_custom_id(const char *title, const char *lang, char *out, size_t outsz) {
+  /* FNV-1a, twice, with different offsets: 64 bits of the title */
+  unsigned long h1 = 2166136261u, h2 = 0x811C9DC5u ^ 0x5bf03635u;
+  for (const unsigned char *q = (const unsigned char *)(title ? title : ""); *q; q++) {
+    h1 ^= *q; h1 = (h1 * 16777619u) & 0xffffffffu;
+    h2 = ((h2 ^ *q) * 16777619u) & 0xffffffffu;
+    h2 ^= (h2 >> 13);
+  }
+  const char *lc = (lang && lang[0]) ? lang : "en";
+  snprintf(out, outsz, "p%08lx%08lx-l%s", h1 & 0xffffffffu, h2 & 0xffffffffu, lc);
+}
+
+static void batch_title_hash(const char *title, char *out, size_t outsz) {
+  unsigned long h1 = 2166136261u, h2 = 0x811C9DC5u ^ 0x5bf03635u;
+  for (const unsigned char *q = (const unsigned char *)(title ? title : ""); *q; q++) {
+    h1 ^= *q; h1 = (h1 * 16777619u) & 0xffffffffu;
+    h2 = ((h2 ^ *q) * 16777619u) & 0xffffffffu;
+    h2 ^= (h2 >> 13);
+  }
+  snprintf(out, outsz, "%08lx%08lx", h1 & 0xffffffffu, h2 & 0xffffffffu);
+}
+
+static void batch_item_add(const char *title, const char *lang, int num_clips,
+                           int per_clip_sec, int budget, char *params_owned) {
+  if (g_batch_n + 1 > g_batch_cap) {
+    g_batch_cap = g_batch_cap ? g_batch_cap * 2 : 16;
+    g_batch_items = (BatchItem *)realloc(g_batch_items, g_batch_cap * sizeof(BatchItem));
+    if (!g_batch_items) die("OOM");
+  }
+  BatchItem *it = &g_batch_items[g_batch_n++];
+  memset(it, 0, sizeof(*it));
+  batch_custom_id(title, lang, it->custom_id, sizeof(it->custom_id));
+  batch_title_hash(title, it->title_hash, sizeof(it->title_hash));
+  snprintf(it->movie_title, sizeof(it->movie_title), "%s", title ? title : "");
+  snprintf(it->lang_code, sizeof(it->lang_code), "%s", (lang && lang[0]) ? lang : "en");
+  it->num_clips = num_clips;
+  it->per_clip_sec = per_clip_sec;
+  it->budget = budget;
+  it->params = params_owned;
+  g_batch_pending++;
+}
+
+static BatchItem *batch_find(const char *custom_id) {
+  for (size_t i = 0; i < g_batch_n; i++)
+    if (strcmp(g_batch_items[i].custom_id, custom_id) == 0) return &g_batch_items[i];
+  return NULL;
+}
+
+static void batch_result_path(const char *custom_id, const char *suffix,
+                              char *out, size_t outsz) {
+  snprintf(out, outsz, "%s/%s%s", BATCH_DIR, custom_id, suffix);
+}
+
+/* The plan file the rendering pass reads.  It holds the whole Messages reply,
+ * exactly like a live response body, so the same parsing runs on it. */
+static bool batch_plan_file(const char *title, const char *lang, char *out, size_t outsz) {
+  char id[96];
+  batch_custom_id(title, lang, id, sizeof(id));
+  char path[PATH_MAX];
+  batch_result_path(id, ".result.json", path, sizeof(path));
+  if (file_exists(path)) { snprintf(out, outsz, "%s", path); return true; }
+  return false;
+}
+
+static bool batch_failed_file(const char *title, const char *lang, char *out, size_t outsz) {
+  char id[96];
+  batch_custom_id(title, lang, id, sizeof(id));
+  char path[PATH_MAX];
+  batch_result_path(id, ".failed", path, sizeof(path));
+  if (file_exists(path)) { snprintf(out, outsz, "%s", path); return true; }
+  return false;
+}
+
+/* ------------------------------------------------------------ HTTP helpers */
+
+/* GET with the Anthropic headers (the batch endpoints are GETs). */
+static MemBuf anthropic_get(const Config *cfg, const char *url, long *http_code,
+                            long timeout_s) {
+  if (http_code) *http_code = -1;
+  CURL *curl = curl_easy_init();
+  if (!curl) return (MemBuf){0};
+
+  MemBuf buf = (MemBuf){0};
+  char keyhdr[1024], bearhdr[1024];
+  anthropic_auth_headers(cfg, keyhdr, sizeof(keyhdr), bearhdr, sizeof(bearhdr));
+
+  struct curl_slist *headers = NULL;
+  headers = curl_slist_append(headers, "anthropic-version: 2023-06-01");
+  anthropic_auth_add(cfg, &headers, keyhdr, bearhdr);
+
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&buf);
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_s);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+  CURLcode res = curl_easy_perform(curl);
+  long code = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+  if (http_code) *http_code = code;
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+
+  if (res != CURLE_OK) {
+    logw("GET failed for %s: %s", url, curl_easy_strerror(res));
+    free(buf.data);
+    if (http_code) *http_code = -1;
+    return (MemBuf){0};
+  }
+  return buf;
+}
+
+/* GET straight into a file (the results endpoint can be large). */
+static bool anthropic_get_to_file(const Config *cfg, const char *url, const char *path,
+                                  long *http_code, long timeout_s) {
+  if (http_code) *http_code = -1;
+  FILE *f = plat_fopen(path, "wb");
+  if (!f) return false;
+
+  CURL *curl = curl_easy_init();
+  if (!curl) { fclose(f); return false; }
+
+  char keyhdr[1024], bearhdr[1024];
+  anthropic_auth_headers(cfg, keyhdr, sizeof(keyhdr), bearhdr, sizeof(bearhdr));
+
+  struct curl_slist *headers = NULL;
+  headers = curl_slist_append(headers, "anthropic-version: 2023-06-01");
+  anthropic_auth_add(cfg, &headers, keyhdr, bearhdr);
+
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_file_write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)f);
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_s);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+  CURLcode res = curl_easy_perform(curl);
+  long code = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+  if (http_code) *http_code = code;
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  fclose(f);
+
+  if (res != CURLE_OK) {
+    logw("Downloading the batch results failed: %s", curl_easy_strerror(res));
+    plat_unlink(path);
+    if (http_code) *http_code = -1;
+    return false;
+  }
+  return code >= 200 && code < 300;
+}
+
+/* ---------------------------------------------------------------- submit */
+
+static bool batch_create(const Config *cfg, size_t from, size_t to,
+                         char *out_id, size_t outsz) {
+  cJSON *root = cJSON_CreateObject();
+  cJSON *reqs = cJSON_AddArrayToObject(root, "requests");
+  size_t bytes = 0;
+  for (size_t i = from; i < to; i++) {
+    cJSON *entry = cJSON_CreateObject();
+    cJSON_AddStringToObject(entry, "custom_id", g_batch_items[i].custom_id);
+    cJSON *params = cJSON_Parse(g_batch_items[i].params);
+    if (!params) { cJSON_Delete(entry); cJSON_Delete(root); return false; }
+    /* A batched request must not stream - the results come back as one file. */
+    cJSON_DeleteItemFromObjectCaseSensitive(params, "stream");
+    cJSON_AddItemToObject(entry, "params", params);
+    cJSON_AddItemToArray(reqs, entry);
+    bytes += strlen(g_batch_items[i].params);
+  }
+
+  char *body = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!body) return false;
+
+  /* The Message Batches API lives at /v1/messages/batches (the same base as
+     the Messages endpoint, plus /batches). */
+  char endpoint[800];
+  anthropic_endpoint(cfg->openai_base_url, endpoint, sizeof(endpoint));
+  snprintf(endpoint + strlen(endpoint), sizeof(endpoint) - strlen(endpoint), "/batches");
+
+  logi("Submitting %zu plan request%s as one batch (50%% cheaper): %s", to - from,
+       (to - from) == 1 ? "" : "s", endpoint);
+
+  /* The create call carries the same credentials as a live Messages call. */
+  char keyhdr[1024], bearhdr[1024];
+  anthropic_auth_headers(cfg, keyhdr, sizeof(keyhdr), bearhdr, sizeof(bearhdr));
+
+  const char *hdrs[4];
+  int nh = 0;
+  hdrs[nh++] = "anthropic-version: 2023-06-01";
+  if (strncmp(cfg->openai_key, "sk-ant-oat", 10) == 0) {
+    hdrs[nh++] = bearhdr;
+  } else {
+    hdrs[nh++] = keyhdr;
+    if (!anthropic_host_is_native(cfg->openai_base_url)) hdrs[nh++] = bearhdr;
+  }
+  hdrs[nh] = NULL;
+
+  long code = 0;
+  MemBuf resp = http_post_json_headers(endpoint, hdrs, body, &code, 900);
+  free(body);
+
+  bool ok = false;
+  if (code >= 200 && code < 300 && resp.data) {
+    cJSON *r = cJSON_Parse(resp.data);
+    if (r) {
+      cJSON *id = cJSON_GetObjectItemCaseSensitive(r, "id");
+      if (cJSON_IsString(id) && id->valuestring && id->valuestring[0]) {
+        snprintf(out_id, outsz, "%s", id->valuestring);
+        ok = true;
+      }
+      cJSON_Delete(r);
+    }
+  }
+  if (!ok) {
+    logw("The batch could not be created (HTTP %ld)%s", code,
+         resp.data ? "" : " - no response body");
+    if (resp.data && resp.size) logw("Batch create reply: %.500s", resp.data);
+  }
+  free(resp.data);
+  return ok;
+}
+
+typedef struct {
+  char status[32];
+  int  processing, succeeded, errored, canceled, expired;
+  bool known;
+} BatchStatus;
+
+static BatchStatus batch_poll(const Config *cfg, const char *batch_id) {
+  BatchStatus st;
+  memset(&st, 0, sizeof(st));
+  snprintf(st.status, sizeof(st.status), "unknown");
+
+  char endpoint[800];
+  anthropic_endpoint(cfg->openai_base_url, endpoint, sizeof(endpoint));
+  snprintf(endpoint + strlen(endpoint), sizeof(endpoint) - strlen(endpoint),
+           "/batches/%s", batch_id);
+
+  long code = 0;
+  MemBuf resp = anthropic_get(cfg, endpoint, &code, 120);
+  if (code >= 200 && code < 300 && resp.data) {
+    cJSON *r = cJSON_Parse(resp.data);
+    if (r) {
+      cJSON *ps = cJSON_GetObjectItemCaseSensitive(r, "processing_status");
+      if (cJSON_IsString(ps) && ps->valuestring)
+        snprintf(st.status, sizeof(st.status), "%s", ps->valuestring);
+      cJSON *rc = cJSON_GetObjectItemCaseSensitive(r, "request_counts");
+      if (cJSON_IsObject(rc)) {
+        const struct { const char *k; int *v; } keys[] = {
+          {"processing", &st.processing}, {"succeeded", &st.succeeded},
+          {"errored", &st.errored}, {"canceled", &st.canceled},
+          {"expired", &st.expired},
+        };
+        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+          cJSON *v = cJSON_GetObjectItemCaseSensitive(rc, keys[i].k);
+          if (cJSON_IsNumber(v)) *keys[i].v = (int)v->valuedouble;
+        }
+      }
+      st.known = true;
+      cJSON_Delete(r);
+    }
+  }
+  free(resp.data);
+  return st;
+}
+
+/* ---------------------------------------------------------------- results */
+
+/* Turn the results JSONL into one file per request: <id>.result.json holds the
+ * Messages reply (so the normal parsing runs on it) and <id>.failed holds the
+ * reason a request did not produce one. */
+static int batch_write_results(const char *jsonl_path) {
+  char *data = read_entire_file(jsonl_path);
+  if (!data) return 0;
+
+  int written = 0;
+  char *cur = data;
+  while (cur && *cur) {
+    char *nl = strchr(cur, '\n');
+    if (nl) *nl = '\0';
+    size_t ll = strlen(cur);
+    while (ll > 0 && (cur[ll - 1] == '\r' || cur[ll - 1] == ' ')) cur[--ll] = '\0';
+    if (*cur) {
+      cJSON *line = cJSON_Parse(cur);
+      if (line) {
+        cJSON *cid = cJSON_GetObjectItemCaseSensitive(line, "custom_id");
+        cJSON *res = cJSON_GetObjectItemCaseSensitive(line, "result");
+        if (cJSON_IsString(cid) && cid->valuestring && cJSON_IsObject(res)) {
+          const BatchItem *it = batch_find(cid->valuestring);
+          const char *name = it ? it->movie_title : cid->valuestring;
+          const char *lang = it ? it->lang_code : "?";
+          cJSON *type = cJSON_GetObjectItemCaseSensitive(res, "type");
+          const char *ty = cJSON_IsString(type) ? type->valuestring : "";
+
+          if (strcmp(ty, "succeeded") == 0) {
+            cJSON *msg = cJSON_GetObjectItemCaseSensitive(res, "message");
+            char *msg_json = msg ? cJSON_PrintUnformatted(msg) : NULL;
+            if (msg_json) {
+              char path[PATH_MAX];
+              batch_result_path(cid->valuestring, ".result.json", path, sizeof(path));
+              FILE *f = plat_fopen(path, "wb");
+              if (f) { fputs(msg_json, f); fclose(f); written++; }
+              free(msg_json);
+            }
+          } else {
+            char reason[512];
+            snprintf(reason, sizeof(reason), "%s", ty[0] ? ty : "no result");
+            cJSON *err = cJSON_GetObjectItemCaseSensitive(res, "error");
+            if (cJSON_IsObject(err)) {
+              cJSON *em = cJSON_GetObjectItemCaseSensitive(err, "message");
+              if (cJSON_IsString(em) && em->valuestring)
+                snprintf(reason, sizeof(reason), "%s: %s", ty, em->valuestring);
+            }
+            logw("Batch request for %s [%s] did not succeed (%s) - it will be "
+                 "requested live at the normal price.", name, lang, reason);
+            char path[PATH_MAX];
+            batch_result_path(cid->valuestring, ".failed", path, sizeof(path));
+            FILE *f = plat_fopen(path, "wb");
+            if (f) { fputs(reason, f); fclose(f); }
+          }
+        }
+        cJSON_Delete(line);
+      }
+    }
+    cur = nl ? nl + 1 : NULL;
+  }
+  free(data);
+  return written;
+}
+
+/* ------------------------------------------------------------- manifest */
+
+/* Which batch is still in flight, so a run that is interrupted (or a second
+ * run started before the first finished) never pays for the same plans twice. */
+static void batch_save_manifest(const char *batch_id, const char *status, size_t items) {
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "batch_id", batch_id);
+  cJSON_AddStringToObject(root, "status", status);
+  cJSON_AddNumberToObject(root, "items", (double)items);
+  cJSON_AddNumberToObject(root, "created_at", (double)time(NULL));
+  char *txt = cJSON_Print(root);
+  cJSON_Delete(root);
+  if (!txt) return;
+  FILE *f = plat_fopen(BATCH_MANIFEST, "wb");
+  if (f) { fputs(txt, f); fclose(f); }
+  free(txt);
+}
+
+static bool batch_load_manifest(char *batch_id, size_t idsz, char *status, size_t stsz,
+                                size_t *items) {
+  char *txt = read_entire_file(BATCH_MANIFEST);
+  if (!txt) return false;
+  bool ok = false;
+  cJSON *root = cJSON_Parse(txt);
+  if (root) {
+    cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "batch_id");
+    cJSON *st = cJSON_GetObjectItemCaseSensitive(root, "status");
+    cJSON *it = cJSON_GetObjectItemCaseSensitive(root, "items");
+    if (cJSON_IsString(id) && id->valuestring && id->valuestring[0]) {
+      snprintf(batch_id, idsz, "%s", id->valuestring);
+      snprintf(status, stsz, "%s", cJSON_IsString(st) ? st->valuestring : "submitted");
+      if (items) *items = cJSON_IsNumber(it) ? (size_t)it->valuedouble : 0;
+      ok = true;
+    }
+    cJSON_Delete(root);
+  }
+  free(txt);
+  return ok;
+}
+
+/* ----------------------------------------------------------------- drive */
+
+/* Wait for a batch to finish, then fetch and split its results. */
+static bool batch_wait_and_fetch(const Config *cfg, const char *batch_id,
+                                 size_t expected_items, bool *cancelled) {
+  if (cancelled) *cancelled = false;
+
+  int waited = 0;
+  BatchStatus st = batch_poll(cfg, batch_id);
+  if (st.known)
+    logi("Batch %s: %s (%d processing, %d done, %d errored).", batch_id, st.status,
+         st.processing, st.succeeded, st.errored);
+
+  while (st.known && strcmp(st.status, "ended") != 0 &&
+         strcmp(st.status, "canceling") != 0) {
+    if (generator_cancel_requested()) {
+      logw("Cancel requested while waiting for the batch. The results stay available "
+           "for 29 days - run again and the app will fetch batch %s instead of "
+           "submitting a new one.", batch_id);
+      if (cancelled) *cancelled = true;
+      return false;
+    }
+    if (g_batch_poll_seconds <= 0) {
+      /* No waiting in this mode (the unit tests): leave the batch in flight and
+         let the next run fetch it.  Never fall back to live here - the batch is
+         already paid for. */
+      logw("Not waiting for batch %s here - run the app again to fetch its results.",
+           batch_id);
+      return false;
+    }
+    if (cfg->batch_max_wait_minutes > 0 &&
+        waited >= cfg->batch_max_wait_minutes * 60) {
+      logw("Still not finished after %d minutes. Run the app again in a while: it "
+           "will fetch batch %s (already paid for) instead of submitting a new one.",
+           waited / 60, batch_id);
+      return false;
+    }
+    plat_sleep_ms(g_batch_poll_seconds * 1000);
+    waited += g_batch_poll_seconds;
+    st = batch_poll(cfg, batch_id);
+    if (st.known && g_batch_poll_seconds > 0 && (waited % 300 == 0))
+      logi("Batch %s: %s (%d processing, %d done, %d errored) - %d min waited.",
+           batch_id, st.status, st.processing, st.succeeded, st.errored, waited / 60);
+  }
+
+  if (st.known)
+    logi("Batch %s ended: %d succeeded, %d errored, %d expired, %d canceled.", batch_id,
+         st.succeeded, st.errored, st.expired, st.canceled);
+
+  char endpoint[800];
+  anthropic_endpoint(cfg->openai_base_url, endpoint, sizeof(endpoint));
+  snprintf(endpoint + strlen(endpoint), sizeof(endpoint) - strlen(endpoint),
+           "/batches/%s/results", batch_id);
+
+  char jsonl[PATH_MAX];
+  snprintf(jsonl, sizeof(jsonl), "%s/batch_%s.jsonl", BATCH_DIR, batch_id);
+  long code = 0;
+  if (!anthropic_get_to_file(cfg, endpoint, jsonl, &code, 1800)) {
+    logw("The batch results could not be downloaded (HTTP %ld). They stay available "
+         "for 29 days - run again to fetch them.", code);
+    return false;
+  }
+  int written = batch_write_results(jsonl);
+  logok("Batch results: %d of %zu plans written to %s/", written, expected_items, BATCH_DIR);
+  return written > 0;
+}
+
+/* Submit everything that was collected, wait, fetch.
+ * Returns true when at least one batch was fetched.  *out_in_flight is set when
+ * a batch was submitted and paid for but its results did not arrive (too slow,
+ * or the wait limit was hit): the caller must NOT fall back to live requests
+ * for those plans, that would pay for them a second time. */
+static bool batch_run_all(const Config *cfg, bool *cancelled, bool *out_in_flight,
+                          char *out_id, size_t idsz) {
+  if (cancelled) *cancelled = false;
+  if (out_in_flight) *out_in_flight = false;
+  if (g_batch_n == 0) return false;
+
+  /* Chunk: the API allows 100k requests or 256 MB, whichever comes first. */
+  size_t from = 0, done = 0;
+  while (from < g_batch_n) {
+    if (generator_cancel_requested()) {
+      if (cancelled) *cancelled = true;
+      return false;
+    }
+
+    size_t to = from, bytes = 0;
+    while (to < g_batch_n && (to - from) < BATCH_MAX_ITEMS_PER_BATCH) {
+      size_t add = strlen(g_batch_items[to].params);
+      if (bytes > 0 && bytes + add > BATCH_MAX_BYTES_PER_BATCH) break;
+      bytes += add;
+      to++;
+    }
+
+    char batch_id[128];
+    if (!batch_create(cfg, from, to, batch_id, sizeof(batch_id))) {
+      logw("Falling back to live requests for the %zu plan(s) in this chunk - the "
+           "narration is unchanged, only the discount is lost.", to - from);
+      /* mark them failed so the render pass makes a live request */
+      for (size_t i = from; i < to; i++) {
+        char path[PATH_MAX];
+        batch_result_path(g_batch_items[i].custom_id, ".failed", path, sizeof(path));
+        FILE *f = plat_fopen(path, "wb");
+        if (f) { fputs("batch create failed", f); fclose(f); }
+      }
+      from = to;
+      continue;
+    }
+
+    logok("Batch %s submitted (%zu request%s). Most batches finish within an hour; "
+          "this run waits for it.", batch_id, to - from, (to - from) == 1 ? "" : "s");
+    batch_save_manifest(batch_id, "submitted", to - from);
+
+    bool cancel = false;
+    if (batch_wait_and_fetch(cfg, batch_id, to - from, &cancel)) {
+      batch_save_manifest(batch_id, "fetched", to - from);
+      done += to - from;
+    } else if (!cancel && out_in_flight) {
+      *out_in_flight = true;
+      if (out_id && idsz) snprintf(out_id, idsz, "%s", batch_id);
+    }
+    if (cancel) { if (cancelled) *cancelled = true; return done > 0; }
+    from = to;
+  }
+  /* A chunk that is still in flight makes the whole run stop: rendering the
+     other plans now would end with live requests for these, at full price. */
+  return done > 0 && !(out_in_flight && *out_in_flight);
+}
+
+/* A batch that is still in flight from an earlier run: fetch it instead of
+ * paying for it a second time. */
+static bool batch_resume_pending(const Config *cfg, bool *cancelled) {
+  char id[128], status[32];
+  size_t items = 0;
+  if (!batch_load_manifest(id, sizeof(id), status, sizeof(status), &items)) return false;
+  if (strcmp(status, "submitted") != 0 || !id[0]) return false;
+
+  logi("An earlier run already submitted batch %s (%zu request%s) - fetching those "
+       "results instead of submitting a new batch.", id, items, items == 1 ? "" : "s");
+  if (batch_wait_and_fetch(cfg, id, items, cancelled)) {
+    batch_save_manifest(id, "fetched", items);
+    return true;
+  }
+  return false;
 }
 
 /* A streamed Messages reply is a server-sent event stream.  Fold it back into
@@ -3570,8 +4185,96 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   char endpoint[560];
   MemBuf resp;
 
+  /* Batch mode, collecting pass: build exactly the request a live run would
+     send, queue it, and let the batch carry it later.  Nothing is sent here. */
+  if (anthropic_base && g_batch_collect) {
+    free(body);
+    /* Already bought in an earlier run (the batch was fetched, or the request
+       failed and is going to be re-asked live)?  Then do not pay for it again. */
+    char known[PATH_MAX];
+    if (batch_plan_file(movie_title, recap_lang_code(cfg->recap_language), known, sizeof(known)) ||
+        batch_failed_file(movie_title, recap_lang_code(cfg->recap_language), known, sizeof(known))) {
+      logi("Already have a batched plan for %s [%s] - not submitting it again.",
+           movie_title, cfg->recap_language[0] ? cfg->recap_language : "English");
+      free(prompt);
+      free(chat_body);
+      free(chat_body_limited);
+      ClipPlanList empty = {0};
+      return empty;
+    }
+    char *params = anthropic_build_params(cfg, sys_prompt, prompt, 32000, false, false);
+    if (params) {
+      char cid[96];
+      batch_custom_id(movie_title, recap_lang_code(cfg->recap_language), cid, sizeof(cid));
+      batch_item_add(movie_title, recap_lang_code(cfg->recap_language),
+                     num_clips, per_clip_sec, 32000, params);
+      g_plan_queued = true;
+      logi("Queued for the batch: %s [%s] (%d clips) as %s", movie_title,
+           cfg->recap_language[0] ? cfg->recap_language : "English", num_clips, cid);
+    } else {
+      logw("Could not build the plan request for %s - it will be requested live.",
+           movie_title);
+    }
+    free(prompt);
+    free(chat_body);
+    free(chat_body_limited);
+    ClipPlanList empty = {0};
+    return empty;
+  }
+
   if (anthropic_base) {
     free(body);
+
+    /* Batch mode, rendering pass: the plan for this movie/language was already
+       bought (asynchronous, 50% cheaper) - read it instead of paying twice. */
+    if (g_batch_render && g_batch_bypass_lookup) {
+      g_batch_bypass_lookup = false;      /* this one is a correction request */
+      logi("Asking live for the corrected plan of %s [%s].", movie_title,
+           cfg->recap_language[0] ? cfg->recap_language : "English");
+    } else if (g_batch_render) {
+      char path[PATH_MAX], failed[PATH_MAX];
+      if (batch_plan_file(movie_title, recap_lang_code(cfg->recap_language), path, sizeof(path))) {
+        char *txt = read_entire_file(path);
+        if (txt) {
+          char stop[64];
+          anthropic_stop_reason(txt, stop, sizeof(stop));
+          if (strcmp(stop, "max_tokens") == 0) {
+            logw("The batched plan for %s [%s] stopped at the output limit - asking "
+                 "for it live with a bigger budget instead.", movie_title,
+                 cfg->recap_language);
+          } else {
+            /* exactly what the live path does with a response body */
+            char *out_text = openai_extract_output_text(txt);
+            if (out_text) {
+              ClipPlanList plan = parse_clip_plan_json(out_text);
+              free(out_text);
+              if (plan.count > 0) {
+                logok("Using the batched plan for %s [%s] (%zu clips) - no live API "
+                      "call, 50%% cheaper.", movie_title,
+                      cfg->recap_language[0] ? cfg->recap_language : "English",
+                      plan.count);
+                free(txt);
+                free(prompt);
+                free(chat_body);
+                free(chat_body_limited);
+                return plan;
+              }
+            }
+            logw("The batched reply for %s [%s] had no usable clip plan - asking "
+                 "live instead.", movie_title, cfg->recap_language);
+          }
+          free(txt);
+        }
+      } else if (batch_failed_file(movie_title, recap_lang_code(cfg->recap_language),
+                                   failed, sizeof(failed))) {
+        char *why = read_entire_file(failed);
+        logw("The batch request for %s [%s] failed (%s) - asking live at the normal "
+             "price.", movie_title, cfg->recap_language, why ? why : "unknown reason");
+        free(why);
+      }
+      /* otherwise: no batch result for this one - fall through to the live call */
+    }
+
     resp = anthropic_plan_request(cfg, sys_prompt, prompt, &http_code, timeout_s);
     if (http_code < 200 || http_code >= 300) {
       logw("Anthropic-compatible HTTP %ld from %s", http_code, cfg->openai_base_url);
@@ -5727,12 +6430,22 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
          "or drop a summary at scripts/srt_files/%s_plot.txt.", movie_title);
 
   bool retry_no_script = false, retry_json_only = false;
+  g_plan_queued = false;
   ClipPlanList plan = openai_make_plan(cfg, movie_title, subs_seconds,
                                        imsdb_script ? imsdb_script : "",
                                        plot_summary ? plot_summary : "",
                                        subs_placeholder,
                                        num_clips, per_clip_sec,
                                        &retry_no_script, &retry_json_only, NULL);
+
+  /* Batch collecting pass: the request is queued, nothing to render yet. */
+  if (g_plan_queued) {
+    free(plot_summary);
+    free(imsdb_script);
+    free(subs_seconds);
+    report_progress(GEN_STAGE_PLANNING, movie_index, movie_total, 0, 0, movie_title);
+    return true;
+  }
 
   if (plan.count == 0 && retry_no_script && imsdb_script && imsdb_script[0]) {
     logw("OpenAI request failed with IMSDb context; retrying without IMSDb script for %s", movie_title);
@@ -5766,6 +6479,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
              "rejected. EVERY narration string MUST be written entirely in %s, in that "
              "language's own characters. Do not output English.", cfg->recap_language);
     free_clip_plan_list(&plan);
+    g_batch_bypass_lookup = true;
     plan = openai_make_plan(cfg, movie_title, subs_seconds,
                             imsdb_script ? imsdb_script : "",
                             plot_summary ? plot_summary : "", subs_placeholder,
@@ -5806,6 +6520,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
       logw("The narrations are much shorter than the %.0f minute target (%.1f min of "
            "speech) - asking the model once more for full-length narrations.",
            cfg->recap_minutes, speech / 60.0);
+      g_batch_bypass_lookup = true;
       ClipPlanList longer = openai_make_plan(cfg, movie_title, subs_seconds,
                                              imsdb_script ? imsdb_script : "",
                                              plot_summary ? plot_summary : "",
@@ -6270,7 +6985,37 @@ int run_generation(void) {
     logw("No .mp4 files found in movies/. Put e.g. movies\\Citizen Kane.mp4 there and press START again.");
   }
 
+  /* Batch mode runs the movie list twice: the first pass collects every plan
+     request and submits them as one batch (50% cheaper), the second pass
+     renders the videos from the results that came back. */
+  bool batch = cfg.batch_planning &&
+               strcasestr_local(cfg.openai_base_url, "anthropic") != NULL;
+  if (cfg.batch_planning && !batch)
+    logw("\"batch_planning\" is on, but \"%s\" is not an Anthropic-compatible endpoint. "
+         "Batches are an Anthropic feature - running the normal live requests "
+         "instead.", cfg.openai_base_url);
+  if (batch) {
+    ensure_dir(BATCH_DIR);
+    logi("Batch planning is ON: every plan request is collected first and submitted "
+         "as one Anthropic Message Batch (50%% off input and output). The narration "
+         "itself is identical - same model, same prompt, same budget.");
+  }
+  int passes = batch ? 2 : 1;
+
   int processed = 0;
+  for (int pass = 0; pass < passes; pass++) {
+    if (batch) {
+      g_batch_collect = (pass == 0);
+      g_batch_render  = (pass == 1);
+      if (pass == 0) {
+        /* An earlier run may already have paid for a batch that never got
+           fetched - use that one instead of submitting a new one. */
+        bool cancelled = false;
+        if (batch_resume_pending(&cfg, &cancelled))
+          logi("Recovered plans from the earlier batch - nothing new to submit.");
+      }
+    }
+
   for (size_t i = 0; i < n_names; i++) {
     if (generator_cancel_requested()) {
       logw("Cancel requested - %zu of %zu movies left unprocessed.", n_names - i, n_names);
@@ -6342,14 +7087,55 @@ int run_generation(void) {
            "file(s) there to render one again.", title);
       continue;                       /* not a failure, just nothing to do */
     }
-    if (any_ok) {
+    if (g_batch_collect) {
+      if (g_batch_pending > 0)
+        snprintf(banner, sizeof(banner), "QUEUED: %s (%zu plan%s in the batch)",
+                 title, g_batch_pending, g_batch_pending == 1 ? "" : "s");
+      else
+        snprintf(banner, sizeof(banner), "Queued: %s (nothing new to ask for)", title);
+    } else if (any_ok) {
       processed++;
       snprintf(banner, sizeof(banner), "DONE: %s", title);
     } else {
       snprintf(banner, sizeof(banner), "FAILED: %s", title);
     }
     emit_line(banner);
+    g_batch_pending = 0;
   }
+
+    /* End of the collecting pass: send everything, wait, fetch the results. */
+    if (batch && pass == 0) {
+      if (generator_cancel_requested()) {
+        logw("Cancel requested before the batch was submitted - nothing was sent.");
+        break;
+      }
+      if (g_batch_n == 0) {
+        logi("Nothing new to ask the model for - every plan is already on disk.");
+        continue;             /* the rendering pass reads the fetched plans */
+      }
+      bool cancelled = false, in_flight = false;
+      char in_flight_id[128] = "";
+      bool got = batch_run_all(&cfg, &cancelled, &in_flight, in_flight_id,
+                               sizeof(in_flight_id));
+      if (!got) {
+        if (cancelled) break;
+        if (in_flight) {
+          /* The batch is submitted and paid for.  Asking live now would pay for
+             the same plans twice, so stop and let the next run fetch it. */
+          logw("Batch %s is submitted but not finished yet, so this run stops before "
+               "rendering instead of paying for the same plans twice. Run again later: "
+               "it will fetch batch %s (available for 29 days).", in_flight_id,
+               in_flight_id);
+          break;
+        }
+        logw("No batch results were fetched. The rendering pass will ask the model "
+             "live at the normal price, so your videos are still made.");
+        continue;
+      }
+      logok("Batch ready: rendering the videos from the batched plans now.");
+    }
+  }
+  batch_items_free();
   free_str_list(names, n_names);
 
   if (generator_cancel_requested()) report_progress(GEN_STAGE_CANCELLED, 0, 0, 0, 0, NULL);

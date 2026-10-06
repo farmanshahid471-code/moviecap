@@ -699,6 +699,30 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
     arrived instead of quietly shipping a half-length recap.
   - DeepSeek's gateway maps `claude-*` model names to its own models, so a `claude-sonnet-...` model
     works against `https://api.deepseek.com/anthropic` too.
+- **Batch planning (50% cheaper Claude runs)** — `"batch_planning": true` with an
+  Anthropic-compatible `openai_base_url` (or the checkbox in the panel).  The recap you watch is
+  identical; only the price and the waiting change:
+  - the run happens in two passes. First it prepares every plan (**per movie and per language** —
+    no "write English, then translate" shortcut, which would soften names and pacing), collects the
+    requests and submits them as **one Anthropic Message Batch**. Then it waits for the batch and
+    renders every video from those results.
+  - each batched request is the *same* request a live run would send: same model, same system
+    prompt, same subtitle text and plot summary, same `max_tokens`. Only `stream` is left out,
+    because the Batches API rejects it (the 10-minute streaming rule does not apply to an
+    asynchronous batch).
+  - **nothing is ever paid for twice.** A batch that was submitted but not fetched yet is remembered
+    in `scripts/plans/batch_state.json`; the next run fetches *that* batch instead of submitting a
+    new one (results stay available for 29 days). A plan that is already on disk is never queued
+    again, and a movie whose video already exists is not planned at all.
+  - **quality is never traded away:** a request that errored/expired, came back without a usable
+    plan, or stopped at the output limit (`stop_reason: max_tokens`) is re-asked **live** at the
+    normal price — streamed, with a doubled budget — so the recap is the same one you would have
+    got without batching. The language check and the length audit run on batched plans exactly as on
+    live ones, and a "write longer narrations" / "answer in <language>" correction always goes live.
+  - `"batch_max_wait_minutes"` (default 720 = 12 h) caps the wait. When a batch is not finished by
+    then, the run stops cleanly and the next run fetches the same batch — you are told the batch id.
+  - batches are chunked at 100 requests / 32 MB, so a big queue is safe; each chunk is fetched before
+    the next one is submitted. Set `"batch_planning": false` (default) for the normal live path.
 - **Captions ahead of / behind the voice?** Caption changes are aligned to the pauses of the
   narration itself (`narration_pauses` + `align_boundaries_to_pauses` in `src/generator.c`), and the
   log says `Caption timing: N of M sentence boundaries aligned ...` plus the spoken range it used

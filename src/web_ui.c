@@ -656,6 +656,7 @@ static cJSON *config_read_json(void) {
   ADD_STR("eleven_voice_id", "eleven_voice_id", "JBFqnCBsd6RMkjVDRZzb");
   ADD_STR("eleven_model_id", "eleven_model_id", "eleven_multilingual_v2");
   ADD_STR("openai_model",    "openai_model",    "gpt-5.2");
+  ADD_NUM("batch_max_wait_minutes", "batch_max_wait_minutes", 720);
   ADD_STR("openai_base_url", "openai_base_url", "https://api.openai.com/v1");
   ADD_STR("elevenlabs_base_url", "elevenlabs_base_url", "https://api.elevenlabs.io/v1");
 
@@ -701,6 +702,7 @@ static cJSON *config_read_json(void) {
   ADD_BOOL("auto_transcribe", "auto_transcribe", true);
   ADD_BOOL("use_wikipedia_plot", "use_wikipedia_plot", true);
   ADD_BOOL("offline_planner", "offline_planner", false);
+  ADD_BOOL("batch_planning", "batch_planning", false);
 
 #undef ADD_STR
 #undef ADD_NUM
@@ -722,7 +724,7 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
   if (!root) root = cJSON_CreateObject();
 
   const char *str_keys[] = {
-    "eleven_voice_id", "eleven_model_id", "openai_model",
+    "eleven_voice_id", "eleven_model_id", "openai_model", "batch_max_wait_minutes",
     "openai_base_url", "elevenlabs_base_url",
     "tts_provider", "tts_base_url", "tts_voice", "tts_language", "tts_model",
     "whisper_model", "caption_font", "caption_font_zh", "caption_font_ar", "caption_font_es",
@@ -764,7 +766,7 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
   }
 
   const char *bool_keys[] = { "bgm_enabled", "make_vertical", "retire_movies", "captions", "auto_transcribe",
-                             "use_wikipedia_plot", "offline_planner", NULL };
+                             "use_wikipedia_plot", "offline_planner", "batch_planning", NULL };
   for (int i = 0; bool_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, bool_keys[i]);
     if (!cJSON_IsBool(v)) continue;
@@ -1014,6 +1016,8 @@ static const char *PAGE_HTML[] = {
   "      <label class='f'>Wikipedia API <span class='hint'>empty = pick the language automatically from the narration language</span></label>",
   "      <input type='text' id='wikipedia_base_url' placeholder='https://en.wikipedia.org/w/api.php'>",
   "      <label class='chk'><input type='checkbox' id='offline_planner'> Keep the raw-subtitle fallback <span class='hint'>off = skip the movie instead of narrating the subtitles when the AI plan fails</span></label>",
+  "      <label class='chk'><input type='checkbox' id='batch_planning'> Batch the plans with Claude <span class='hint'>50% cheaper on the Anthropic API: all movies and languages go in as one Message Batch and the run waits for it. Same model, same prompt, same narration - only the price and the waiting change</span></label>",
+  "      <div><label class='f'>Batch wait limit (minutes) <span class='hint'>720 = 12 h. If the batch is not done by then the run stops; the next run fetches that same batch instead of paying again</span></label><input type='text' id='batch_max_wait_minutes'></div>",
   "      <label class='chk'><input type='checkbox' id='retire_movies'> Move processed movies to movies_retired</label>",
   "      <div class='row'>",
   "        <button id='btnSave' class='btn'>SAVE SETTINGS</button>",
@@ -1140,7 +1144,7 @@ static const char *PAGE_HTML[] = {
   "               'tts_base_url','tts_voice','tts_language','tts_model','whisper_model','caption_font',",
   "               'caption_font_zh','caption_font_ar','caption_font_es','wikipedia_base_url'];",
   "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','tts_rate'];",
-  "  var bools = ['bgm_enabled','make_vertical','retire_movies','captions','use_wikipedia_plot','offline_planner'];",
+  "  var bools = ['bgm_enabled','make_vertical','retire_movies','captions','use_wikipedia_plot','offline_planner','batch_planning'];",
   "  texts.forEach(function(k){ el(k).value = c[k] || ''; });",
   "  nums.forEach(function(k){ el(k).value = c[k]; });",
   "  bools.forEach(function(k){ el(k).checked = !!c[k]; });",
@@ -1269,7 +1273,7 @@ static const char *PAGE_HTML[] = {
   "  if (!rl.length) rl.push('');",
   "  body.recap_languages = rl;",
   "  ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','tts_rate'].forEach(function(k){ body[k] = Number(el(k).value); });",
-  "  ['bgm_enabled','make_vertical','retire_movies','captions','use_wikipedia_plot','offline_planner'].forEach(function(k){ body[k] = el(k).checked; });",
+  "  ['bgm_enabled','make_vertical','retire_movies','captions','use_wikipedia_plot','offline_planner','batch_planning'].forEach(function(k){ body[k] = el(k).checked; });",
   "  if (el('open_api_key').value) body.open_api_key = el('open_api_key').value;",
   "  if (el('elevenlabs_api_key').value) body.elevenlabs_api_key = el('elevenlabs_api_key').value;",
   "  if (el('tts_api_key').value) body.tts_api_key = el('tts_api_key').value;",
