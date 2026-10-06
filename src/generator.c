@@ -2025,6 +2025,10 @@ static MemBuf http_post_json_headers(const char *url, const char *const *headers
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_s);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
+  curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+  curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 60L);
+  curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
+
   CURLcode res = curl_easy_perform(curl);
   long code = 0;
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
@@ -2034,7 +2038,8 @@ static MemBuf http_post_json_headers(const char *url, const char *const *headers
   curl_easy_cleanup(curl);
 
   if (res != CURLE_OK) {
-    logw("HTTP POST failed: %s", curl_easy_strerror(res));
+    /* Transport error (no answer at all): the caller decides what to do. */
+    logw("HTTP POST failed for %s: %s", url, curl_easy_strerror(res));
     free(buf.data);
     return (MemBuf){0};
   }
@@ -2357,6 +2362,7 @@ static MemBuf anthropic_plan_request(const Config *cfg, const char *sys_prompt,
            "points at api.anthropic.com.");
   }
 
+  time_t t0 = time(NULL);
   MemBuf resp = {0};
   for (int attempt = 0; attempt < 6; attempt++) {
     resp = anthropic_post_messages(cfg, sys_prompt, prompt, budget, disable_thinking,
@@ -2400,6 +2406,9 @@ static MemBuf anthropic_plan_request(const Config *cfg, const char *sys_prompt,
         resp.size = 0;
         continue;
       }
+      logi("Anthropic endpoint answered HTTP %ld in %ld s (%zu bytes, stop_reason=%s)",
+           code, (long)(time(NULL) - t0), resp.size,
+           stop[0] ? stop : "none");
       return resp;
     }
 
