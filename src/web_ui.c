@@ -663,6 +663,7 @@ static cJSON *config_read_json(void) {
   ADD_STR("caption_font_zh", "caption_font_zh", "");
   ADD_STR("caption_font_ar", "caption_font_ar", "");
   ADD_STR("caption_font_es", "caption_font_es", "");
+  ADD_STR("wikipedia_base_url", "wikipedia_base_url", "");
   {
     cJSON *arr = cJSON_CreateArray();
     const cJSON *langs = cJSON_GetObjectItemCaseSensitive(root, "recap_languages");
@@ -692,6 +693,7 @@ static cJSON *config_read_json(void) {
   ADD_BOOL("captions",        "captions",        true);
   ADD_BOOL("retire_movies", "retire_movies", true);
   ADD_BOOL("auto_transcribe", "auto_transcribe", true);
+  ADD_BOOL("use_wikipedia_plot", "use_wikipedia_plot", true);
 
 #undef ADD_STR
 #undef ADD_NUM
@@ -716,7 +718,8 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
     "eleven_voice_id", "eleven_model_id", "openai_model",
     "openai_base_url", "elevenlabs_base_url",
     "tts_provider", "tts_base_url", "tts_voice", "tts_language", "tts_model",
-    "whisper_model", "caption_font", "caption_font_zh", "caption_font_ar", "caption_font_es", NULL
+    "whisper_model", "caption_font", "caption_font_zh", "caption_font_ar", "caption_font_es",
+    "wikipedia_base_url", NULL
   };
   for (int i = 0; str_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, str_keys[i]);
@@ -753,7 +756,8 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
     else cJSON_AddNumberToObject(root, num_keys[i], v->valuedouble);
   }
 
-  const char *bool_keys[] = { "bgm_enabled", "make_vertical", "retire_movies", "captions", "auto_transcribe", NULL };
+  const char *bool_keys[] = { "bgm_enabled", "make_vertical", "retire_movies", "captions", "auto_transcribe",
+                             "use_wikipedia_plot", NULL };
   for (int i = 0; bool_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, bool_keys[i]);
     if (!cJSON_IsBool(v)) continue;
@@ -999,6 +1003,9 @@ static const char *PAGE_HTML[] = {
   "      <label class='chk'><input type='checkbox' id='bgm_enabled'> Background music</label>",
   "      <label class='chk'><input type='checkbox' id='make_vertical'> Also render vertical 9:16</label>",
   "      <label class='chk'><input type='checkbox' id='captions'> Burn-in small subtitles</label>",
+  "      <label class='chk'><input type='checkbox' id='use_wikipedia_plot'> Fetch the plot summary from Wikipedia <span class='hint'>names come from a real text</span></label>",
+  "      <label class='f'>Wikipedia API <span class='hint'>empty = pick the language automatically from the narration language</span></label>",
+  "      <input type='text' id='wikipedia_base_url' placeholder='https://en.wikipedia.org/w/api.php'>",
   "      <label class='chk'><input type='checkbox' id='retire_movies'> Move processed movies to movies_retired</label>",
   "      <div class='row'>",
   "        <button id='btnSave' class='btn'>SAVE SETTINGS</button>",
@@ -1123,9 +1130,9 @@ static const char *PAGE_HTML[] = {
   "  cfgLoaded = true;",
   "  var texts = ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
   "               'tts_base_url','tts_voice','tts_language','tts_model','whisper_model','caption_font',",
-  "               'caption_font_zh','caption_font_ar','caption_font_es'];",
+  "               'caption_font_zh','caption_font_ar','caption_font_es','wikipedia_base_url'];",
   "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','tts_rate'];",
-  "  var bools = ['bgm_enabled','make_vertical','retire_movies','captions'];",
+  "  var bools = ['bgm_enabled','make_vertical','retire_movies','captions','use_wikipedia_plot'];",
   "  texts.forEach(function(k){ el(k).value = c[k] || ''; });",
   "  nums.forEach(function(k){ el(k).value = c[k]; });",
   "  bools.forEach(function(k){ el(k).checked = !!c[k]; });",
@@ -1244,7 +1251,7 @@ static const char *PAGE_HTML[] = {
   "  var body = {};",
   "  ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
   "   'tts_base_url','tts_voice','tts_language','tts_model','caption_font',",
-  "   'caption_font_zh','caption_font_ar','caption_font_es'].forEach(function(k){ body[k] = el(k).value; });",
+  "   'caption_font_zh','caption_font_ar','caption_font_es','wikipedia_base_url'].forEach(function(k){ body[k] = el(k).value; });",
   "  body.tts_provider = el('tts_provider').value;",
   "  var rl = [];",
   "  if (el('lang_en').checked) rl.push('');",
@@ -1254,7 +1261,7 @@ static const char *PAGE_HTML[] = {
   "  if (!rl.length) rl.push('');",
   "  body.recap_languages = rl;",
   "  ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','tts_rate'].forEach(function(k){ body[k] = Number(el(k).value); });",
-  "  ['bgm_enabled','make_vertical','retire_movies','captions'].forEach(function(k){ body[k] = el(k).checked; });",
+  "  ['bgm_enabled','make_vertical','retire_movies','captions','use_wikipedia_plot'].forEach(function(k){ body[k] = el(k).checked; });",
   "  if (el('open_api_key').value) body.open_api_key = el('open_api_key').value;",
   "  if (el('elevenlabs_api_key').value) body.elevenlabs_api_key = el('elevenlabs_api_key').value;",
   "  if (el('tts_api_key').value) body.tts_api_key = el('tts_api_key').value;",

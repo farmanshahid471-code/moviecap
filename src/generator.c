@@ -475,6 +475,10 @@ typedef struct {
   char caption_font_ar[256];
   char caption_font_es[256];
 
+  /* plot summary context (Wikipedia) - keeps character names correct */
+  bool   use_wikipedia_plot;  /* fetch the plot summary; default true */
+  char   wikipedia_base_url[256]; /* "" = derive from the narration language */
+
   /* optional pipeline tuning */
   int    min_clips;          /* default 20   */
   int    max_clips;          /* default 30   */
@@ -612,6 +616,9 @@ static Config load_config_json(const char *path) {
   cfg_set_str(c.caption_font_zh, sizeof(c.caption_font_zh), cJSON_GetObjectItemCaseSensitive(root, "caption_font_zh"));
   cfg_set_str(c.caption_font_ar, sizeof(c.caption_font_ar), cJSON_GetObjectItemCaseSensitive(root, "caption_font_ar"));
   cfg_set_str(c.caption_font_es, sizeof(c.caption_font_es), cJSON_GetObjectItemCaseSensitive(root, "caption_font_es"));
+  c.use_wikipedia_plot = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "use_wikipedia_plot"), true);
+  cfg_set_str(c.wikipedia_base_url, sizeof(c.wikipedia_base_url),
+              cJSON_GetObjectItemCaseSensitive(root, "wikipedia_base_url"));
   c.tts_rate = (int)cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "tts_rate"), 110, 50, 200);
   if (c.tts_provider == TTS_XTTS && c.tts_voice[0] == 0)
     die("config.json: tts_voice must name an XTTS speaker (a .wav in the server's speakers folder)");
@@ -1365,6 +1372,290 @@ static bool imsdb_fetch_script_to_file(const char *url, const char *dest_txt_pat
   }
 
   return true;
+}
+
+/* Declared here (defined further down): the Wikipedia fetch below scrubs the
+ * text it gets from the article before handing it to the model. */
+static char *sanitize_utf8_lossy(const char *in);
+
+/* ---------------------------------------------------------------------------
+ * Plot summary context (Wikipedia).
+ *
+ * Small and mid-size models mix up character names when they only have the
+ * title and the subtitles to work from.  The plot section of the movie's
+ * Wikipedia article is a reliable, citable text that spells the names
+ * correctly, so it is handed to the model as the source of truth for names,
+ * spelling and who does what.  Its absence is never fatal - the recap is still
+ * built from the subtitles.
+ * ------------------------------------------------------------------------ */
+
+#define WIKI_PLOT_MAX_CHARS 14000
+#define WIKI_PLOT_MIN_CHARS 400
+
+/* Wikipedia subdomain for the narration language (the article is then written in
+ * that language, so its names match what the narration says). */
+static void wiki_lang_for(const char *recap_language, char *out, size_t outsz) {
+  static const struct { const char *what; const char *code; } map[] = {
+    { "english", "en" }, { "spanish", "es" }, { "espanol", "es" }, { "french", "fr" },
+    { "german", "de" }, { "italian", "it" }, { "portuguese", "pt" }, { "russian", "ru" },
+    { "hindi", "hi" }, { "urdu", "ur" }, { "arabic", "ar" }, { "chinese", "zh" },
+    { "mandarin", "zh" }, { "japanese", "ja" }, { "korean", "ko" }, { "turkish", "tr" },
+    { "indonesian", "id" }, { "dutch", "nl" }, { "polish", "pl" }, { "vietnamese", "vi" },
+    { "thai", "th" }, { "bengali", "bn" }, { "tamil", "ta" }, { "filipino", "tl" },
+    { "tagalog", "tl" }, { "greek", "el" }, { "hebrew", "he" }, { "swedish", "sv" },
+    { "ukrainian", "uk" }, { "persian", "fa" }, { "farsi", "fa" }, { "malay", "ms" },
+    { NULL, NULL }
+  };
+  snprintf(out, outsz, "en");
+  if (!recap_language || !recap_language[0]) return;
+
+  char buf[64];
+  size_t i = 0;
+  for (; recap_language[i] && i + 1 < sizeof(buf); i++)
+    buf[i] = (char)tolower((unsigned char)recap_language[i]);
+  buf[i] = '\0';
+  if (!buf[0]) return;
+
+  for (int k = 0; map[k].what; k++) {
+    if (strcmp(buf, map[k].what) == 0) { snprintf(out, outsz, "%s", map[k].code); return; }
+  }
+  /* a plain two letter code was given ("es", "de", ...) */
+  if (strlen(buf) == 2 && isalpha((unsigned char)buf[0]) && isalpha((unsigned char)buf[1]))
+    snprintf(out, outsz, "%s", buf);
+}
+
+/* Cut the "Plot" (or "Synopsis") section out of a plain-text article extract.
+ * Wikipedia's plain text marks headings as "== Name ==" on their own line, so
+ * this walks the lines instead of matching one exact spelling. */
+static char *wiki_extract_plot_section(const char *extract, size_t *out_len) {
+  if (!extract || !extract[0]) return NULL;
+
+  struct { const char *p; size_t n; } line;
+  const char *start_body = NULL;
+  const char *end_body = NULL;
+  const char *p = extract;
+
+  while (*p) {
+    const char *nl = strchr(p, '\n');
+    line.p = p;
+    line.n = nl ? (size_t)(nl - p) : strlen(p);
+
+    const char *q = line.p;
+    const char *qe = line.p + line.n;
+    while (q < qe && (*q == ' ' || *q == '\t')) q++;
+    while (qe > q && (qe[-1] == ' ' || qe[-1] == '\t' || qe[-1] == '\r')) qe--;
+
+    bool heading = (qe - q >= 4 && q[0] == '=' && q[1] == '=' && qe[-1] == '=' && qe[-2] == '=');
+    if (heading) {
+      /* normalize the heading text to compare it */
+      const char *hs = q + 2, *he = qe - 2;
+      while (hs < he && (*hs == ' ' || *hs == '_')) hs++;
+      while (he > hs && (he[-1] == ' ' || he[-1] == '_')) he--;
+      char name[64];
+      size_t k = 0;
+      for (const char *t = hs; t < he && k + 1 < sizeof(name); t++)
+        name[k++] = (char)tolower((unsigned char)*t);
+      name[k] = 0;
+
+      if (start_body) { end_body = line.p; break; }   /* next heading ends it */
+      if (strcmp(name, "plot") == 0 || strcmp(name, "plot summary") == 0 ||
+          strcmp(name, "synopsis") == 0 || strcmp(name, "plot synopsis") == 0 ||
+          strcmp(name, "story") == 0 || strcmp(name, "premise") == 0) {
+        start_body = nl ? nl + 1 : NULL;
+        if (!start_body) break;
+      }
+    }
+    if (!nl) break;
+    p = nl + 1;
+  }
+
+  char *copy;
+  if (start_body) {
+    size_t n = end_body ? (size_t)(end_body - start_body) : strlen(start_body);
+    copy = (char *)malloc(n + 1);
+    if (!copy) return NULL;
+    memcpy(copy, start_body, n);
+    copy[n] = 0;
+  } else {
+    copy = str_dup(extract);          /* no Plot heading: use the whole extract */
+    if (!copy) return NULL;
+  }
+
+  /* trim leading/trailing whitespace */
+  char *z = copy;
+  while (*z == '\n' || *z == '\r' || *z == ' ' || *z == '\t') z++;
+  size_t n = strlen(z);
+  while (n > 0 && (z[n-1] == '\n' || z[n-1] == '\r' || z[n-1] == ' ' || z[n-1] == '\t')) z[--n] = 0;
+  if (z != copy) memmove(copy, z, n + 1);
+
+  if (out_len) *out_len = n;
+  return copy;
+}
+
+/* Percent-encode for a query string (Wikipedia titles have spaces, quotes,
+ * brackets and non-ASCII letters). */
+static void wiki_encode(const char *in, char *out, size_t outsz) {
+  size_t o = 0;
+  for (size_t i = 0; in[i] && o + 4 < outsz; i++) {
+    unsigned char c = (unsigned char)in[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out[o++] = (char)c;
+    } else if (c == ' ') {
+      out[o++] = '+';
+    } else {
+      static const char hex[] = "0123456789ABCDEF";
+      out[o++] = '%'; out[o++] = hex[c >> 4]; out[o++] = hex[c & 0x0F];
+    }
+  }
+  out[o] = 0;
+}
+
+/* First page title returned by a Wikipedia search. */
+static char *wiki_search_title(const char *base, const char *movie_title) {
+  char enc[1024], query[512];
+  snprintf(query, sizeof(query), "%s film", movie_title);
+  wiki_encode(query, enc, sizeof(enc));
+
+  char url[1600];
+  snprintf(url, sizeof(url),
+           "%s?action=query&list=search&srsearch=%s&srlimit=5&format=json", base, enc);
+
+  long code = 0;
+  MemBuf r = http_get_to_mem_ex(url, &code);
+  if (code != 200 || !r.data) { if (r.data) free(r.data); return NULL; }
+
+  char *title = NULL;
+  cJSON *root = cJSON_Parse(r.data);
+  if (root) {
+    cJSON *q = cJSON_GetObjectItemCaseSensitive(root, "query");
+    cJSON *list = q ? cJSON_GetObjectItemCaseSensitive(q, "search") : NULL;
+    if (cJSON_IsArray(list)) {
+      /* prefer an article that looks like the film (disambiguated or by year) */
+      int best = -1;
+      int n = cJSON_GetArraySize(list);
+      for (int i = 0; i < n; i++) {
+        cJSON *item = cJSON_GetArrayItem(list, (int)i);
+        cJSON *t = item ? cJSON_GetObjectItemCaseSensitive(item, "title") : NULL;
+        if (!cJSON_IsString(t) || !t->valuestring) continue;
+        if (best < 0) best = i;
+        if (strcasestr_local(t->valuestring, "(film") || strcasestr_local(t->valuestring, "film)")) {
+          best = i;
+          break;
+        }
+      }
+      if (best >= 0) {
+        cJSON *item = cJSON_GetArrayItem(list, best);
+        cJSON *t = item ? cJSON_GetObjectItemCaseSensitive(item, "title") : NULL;
+        if (cJSON_IsString(t) && t->valuestring) title = str_dup(t->valuestring);
+      }
+    }
+    cJSON_Delete(root);
+  }
+  free(r.data);
+  return title;
+}
+
+/* Plain-text article extract for a page title. */
+static char *wiki_fetch_extract(const char *base, const char *page_title) {
+  char enc[1024];
+  wiki_encode(page_title, enc, sizeof(enc));
+
+  char url[1600];
+  snprintf(url, sizeof(url),
+           "%s?action=query&prop=extracts&explaintext=1&redirects=1&format=json&titles=%s",
+           base, enc);
+
+  long code = 0;
+  MemBuf r = http_get_to_mem_ex(url, &code);
+  if (code != 200 || !r.data) { if (r.data) free(r.data); return NULL; }
+
+  char *text = NULL;
+  cJSON *root = cJSON_Parse(r.data);
+  if (root) {
+    cJSON *q = cJSON_GetObjectItemCaseSensitive(root, "query");
+    cJSON *pages = q ? cJSON_GetObjectItemCaseSensitive(q, "pages") : NULL;
+    if (cJSON_IsObject(pages)) {
+      cJSON *page = NULL;
+      cJSON_ArrayForEach(page, pages) {
+        cJSON *ex = cJSON_GetObjectItemCaseSensitive(page, "extract");
+        if (cJSON_IsString(ex) && ex->valuestring && ex->valuestring[0]) {
+          text = str_dup(ex->valuestring);
+          break;
+        }
+      }
+    }
+    cJSON_Delete(root);
+  }
+  free(r.data);
+  return text;
+}
+
+/* The plot summary of the movie, cached in scripts/srt_files/<Title>_plot.txt.
+ * Returns a malloc'd string or NULL (never fails the run). */
+static char *wikipedia_plot_summary(const Config *cfg, const char *movie_title) {
+  if (!cfg || !cfg->use_wikipedia_plot || !movie_title || !movie_title[0]) return NULL;
+
+  ensure_dir("scripts");
+  ensure_dir("scripts/srt_files");
+  char cache[PATH_MAX];
+  snprintf(cache, sizeof(cache), "scripts/srt_files/%s_plot.txt", movie_title);
+  if (file_exists(cache)) {
+    char *cached = read_entire_file(cache);
+    if (cached && strlen(cached) >= WIKI_PLOT_MIN_CHARS) {
+      logi("Plot summary: using the cached scripts/srt_files/%s_plot.txt (%zu chars)",
+           movie_title, strlen(cached));
+      return cached;
+    }
+    free(cached);
+  }
+
+  char base[320];
+  if (cfg->wikipedia_base_url[0]) {
+    snprintf(base, sizeof(base), "%s", cfg->wikipedia_base_url);
+  } else {
+    char wl[8];
+    wiki_lang_for(cfg->recap_language, wl, sizeof(wl));
+    snprintf(base, sizeof(base), "https://%s.wikipedia.org/w/api.php", wl);
+  }
+
+  char *title = wiki_search_title(base, movie_title);
+  if (!title) {
+    logw("Plot summary: Wikipedia has no article for \"%s\" - the recap will be built "
+         "from the subtitles alone, so double-check character names in the output. "
+         "(Add one by hand at scripts/srt_files/%s_plot.txt.)", movie_title, movie_title);
+    return NULL;
+  }
+
+  char *extract = wiki_fetch_extract(base, title);
+  if (!extract) {
+    logw("Plot summary: could not read the article \"%s\" - continuing without it.", title);
+    free(title);
+    return NULL;
+  }
+
+  size_t plot_len = 0;
+  char *plot = wiki_extract_plot_section(extract, &plot_len);
+  free(extract);
+  if (!plot || plot_len < WIKI_PLOT_MIN_CHARS) {
+    logw("Plot summary: the article \"%s\" has no usable plot section - continuing without it.", title);
+    free(plot);
+    free(title);
+    return NULL;
+  }
+
+  char *lossy = sanitize_utf8_lossy(plot);
+  free(plot);
+  plot = lossy ? lossy : NULL;
+  if (!plot) { free(title); return NULL; }
+
+  if (strlen(plot) > WIKI_PLOT_MAX_CHARS) plot[WIKI_PLOT_MAX_CHARS] = 0;
+
+  if (!write_entire_file(cache, plot, strlen(plot)))
+    logw("Plot summary: could not cache the summary at %s (continuing anyway).", cache);
+  logi("Plot summary: %zu chars from Wikipedia (%s) will be handed to the model so "
+       "character names come from a reliable text.", strlen(plot), title);
+  free(title);
+  return plot;
 }
 
 /* Try multiple URL families, including Movie%20Scripts/<Title>%20Script.html */
@@ -2210,6 +2501,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
                                      const char *movie_title,
                                      const char *subs_seconds_text,
                                      const char *optional_script_text,
+                                     const char *plot_summary,
                                      bool subs_placeholder,
                                      int num_clips,
                                      int per_clip_sec,
@@ -2251,6 +2543,28 @@ static ClipPlanList openai_make_plan(const Config *cfg,
              "one narration may be in English. Keep character names recognizable "
              "(common localized names or clean transliterations).\n",
              cfg->recap_language, cfg->recap_language);
+
+  /* INPUT C: the published plot summary (Wikipedia) is the authority on names.
+     When it could not be fetched, say so plainly instead of leaving a gap the
+     model might fill with invented names. */
+  char *plot_utf8 = NULL;
+  char *plot_trim = NULL;
+  const size_t MAX_PLOT_CHARS = 14000;
+  if (plot_summary && plot_summary[0]) {
+    plot_utf8 = sanitize_utf8_lossy(plot_summary);
+    if (plot_utf8) plot_trim = trim_copy_utf8_safe(plot_utf8, MAX_PLOT_CHARS);
+  }
+  char no_plot_note[600];
+  if (plot_trim && plot_trim[0]) {
+    no_plot_note[0] = '\0';
+  } else {
+    snprintf(no_plot_note, sizeof(no_plot_note),
+             "(no published plot summary was available - rely on the subtitles and on "
+             "your own knowledge of \"%s\", and if you are not sure of a name, use the "
+             "character's role instead of guessing)", movie_title);
+    plot_trim = str_dup(no_plot_note);
+    plot_utf8 = plot_utf8 ? plot_utf8 : str_dup("");
+  }
 
   char demand_note[320];
   demand_note[0] = '\0';
@@ -2395,21 +2709,27 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "INPUT B: script text without timestamps (optional, may be empty; use it for story context and to confirm who is who):\n"
     "%s\n"
     "\n"
+    "INPUT C: published plot summary of \"%s\" (the source of truth for names, spelling and who does what):\n"
+    "%s\n"
+    "\n"
     "STEP 1: BUILD A CHARACTER LIST FIRST (do this silently, never output it)\n"
     "\n"
-    "Before writing any narration, read INPUT A and INPUT B and work out who the characters are.\n"
+    "Before writing any narration, read INPUT A, INPUT B and INPUT C and work out who the characters are.\n"
     "\n"
     "- Subtitles rarely label speakers. Names appear when someone is addressed, introduced, or mentioned (\"Sergeant Reyes!\", \"Tell Anna I'm coming\"). Collect every name you find this way.\n"
-    "- Use INPUT B (character cues, scene headings) and your own knowledge of \"%s\" to confirm the correct full name and spelling of each major character. If the subtitles and your memory disagree, trust the subtitles.\n"
+    "- If INPUT C is present, it is the AUTHORITY on names: every character must be named exactly as INPUT C names them, spelled exactly the same way. Only fall back to INPUT B or your own knowledge of \"%s\" when INPUT C does not mention that character.\n"
+    "- Use the exact, officially correct name of each character. Do not invent a name, do not merge two characters into one, and never swap their roles or relationships.\n"
     "- For each character, fix ONE name and keep it for the entire video. Never switch between first name, surname, nickname and rank for the same person. Pick the form used most in the movie (e.g. \"Miller\", not \"Miller\" in one clip and \"John\" in the next).\n"
     "- Name a character in a narration only when that character takes part in the events of that clip's own time range. Never mention someone who is not part of the moment you are describing.\n"
-    "- On a character's first appearance, introduce them once with a short role plus their name, for example: \"a young radio operator, Private Daniels\". After that, use only the name.\n"
+    "- On a character's first appearance, introduce them once with a short role plus their name, for example: \"a young radio operator, Private Daniels\", or \"A man named John takes the key\". After that, use only the name.\n"
+    "- Introduce only the core characters. Do not mention unnecessary minor characters, and never name a person the listener has no reason to remember.\n"
+    "- Pronouns must always point at the right person: never write a sentence where \"he\", \"she\" or \"they\" could mean two different people. Repeat the name instead of risking confusion.\n"
     "- If you cannot tell who someone is, call them by their role and keep that same role label every time (\"the old farmer\", \"the colonel\"). Never guess a name. Never invent a name. Never use actor names.\n"
     "- Spell names exactly the same way every time. Check the whole list again before you finish.\n"
     "\n"
     "STEP 2: HOW THE NARRATION MUST SOUND (follow exactly)\n"
     "\n"
-    "- Third person, present tense, strictly chronological. You are telling the STORY, not describing the video.\n"
+    "- Third person, present tense, strictly chronological. You are telling the STORY, not describing the video. Write the action as it happens: \"Hank hits the gas and gets the car out of there\", not \"Hank hit the gas\" and not \"Hank will escape\".\n"
     "- One continuous voice. Each clip must feel like the next sentence of the same story, not a separate summary. The reader should never notice where one clip ends and the next begins.\n"
     "- Fast pace. Every sentence moves the plot forward: someone does something, something goes wrong, someone decides, something changes. No scenery, no mood-setting, no reflection.\n"
     "- Short, simple, spoken sentences (about 8-16 words each). Plain words. No long clauses, no semicolons, no brackets, no emojis, no stage directions. Write for the ear, not for the eye.\n"
@@ -2417,13 +2737,14 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "- Report dialogue instead of quoting it: \"He tells her the bridge is gone, but she refuses to turn back.\" Direct quotes only when a single short line is the turning point of the story.\n"
     "- Name the stakes early and keep them alive: what does the hero want, what is in the way, what happens if they fail.\n"
     "- Use concrete verbs: grabs, runs, hides, shoots, lies, betrays, discovers, escapes. Avoid vague words like \"things\", \"situation\", \"something happens\".\n"
-    "- NEVER describe the screen: no \"in this scene\", \"we see\", \"the camera\", \"the movie shows\", \"the audience\". No opinions, no analysis, no themes, no spoilers-warnings, no jokes about the movie, no rhetorical questions to the viewer.\n"
+    "- NEVER describe the screen: no \"in this scene\", \"we see\", \"the camera\", \"the movie shows\", \"the audience\". No opinions, no analysis, no themes, no cinematography, no spoilers-warnings, no jokes about the movie, no rhetorical questions to the viewer.\n"
+    "- The \"narration\" text is ONLY the spoken words. No timestamps, no character headings like \"JOHN:\", no scene labels, no director notes, no notes to yourself, no markdown, no quotes around the whole text.\n"
     "- No filler or trailer cliches: \"the stakes get raised\", \"everything changes\", \"little does he know\", \"will he survive?\".\n"
-    "- Do not invent anything. Every event must be supported by INPUT A (or INPUT B). If a stretch of subtitles is unclear, keep that narration short and factual instead of guessing.\n"
+    "- Do not invent anything. Every event must be supported by INPUT A (or INPUT B or INPUT C). If a stretch of subtitles is unclear, keep that narration short and factual instead of guessing.\n"
     "\n"
     "STEP 3: OPENING AND ENDING\n"
     "\n"
-    "- The FIRST narration starts immediately with \"The story begins...\" and in the first two sentences sets up who the main character is, where and when they are, and what they want or have lost. Then the story starts moving. No greeting, no channel intro, no \"welcome\", no \"today we\".\n"
+    "- The FIRST narration starts immediately with \"The story begins in...\" or \"The movie starts with...\" and in the first two sentences sets up who the main character is, where and when they are, and what they want or have lost. Then the story starts moving. No greeting, no channel intro, no \"welcome\", no \"today we\", no title, no year-only line.\n"
     "- The LAST narration finishes the story (the outcome for the main characters) and then ends EXACTLY with: \"%s\"\n"
     "%s"
     "\n"
@@ -2471,6 +2792,8 @@ static ClipPlanList openai_make_plan(const Config *cfg,
                       subs_trim,           /* INPUT A                   */
                       placeholder_note,
                       scr_trim,            /* INPUT B                   */
+                      title_utf8,          /* INPUT C: the movie name   */
+                      plot_trim,           /* INPUT C: the plot summary */
                       title_utf8,          /* STEP 1: your knowledge of */
                       closing_line,        /* STEP 3: closing sentence  */
                       closing_extra,
@@ -2482,17 +2805,22 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   /* demand_note (language retry) is appended separately: it is empty on the
      first attempt and only set when the model answered in the wrong language. */
   size_t demand_len = strlen(demand_note);
-  char *prompt = (char *)malloc((size_t)plen + demand_len + 1);
+  size_t plot_len = plot_trim ? strlen(plot_trim) : 0;
+  char *prompt = (char *)malloc((size_t)plen + plot_len + demand_len + 1);
   if (!prompt) die("OOM");
-  snprintf(prompt, (size_t)plen + 1, prompt_fmt,
+  snprintf(prompt, (size_t)plen + plot_len + 1, prompt_fmt,
            title_utf8, lang_label, num_clips, min_sec, max_sec, language_rule,
-           subs_trim, placeholder_note, scr_trim, title_utf8, closing_line,
-           closing_extra, pace_line, words_extra, num_clips, min_sec, max_sec);
+           subs_trim, placeholder_note, scr_trim, title_utf8, plot_trim,
+           title_utf8, closing_line, closing_extra, pace_line, words_extra,
+           num_clips, min_sec, max_sec);
+  plen = strlen(prompt);
   if (demand_len) memcpy(prompt + plen, demand_note, demand_len + 1);
 
   free(title_utf8);
   free(subs_trim);
   free(scr_trim);
+  free(plot_utf8);
+  free(plot_trim);
 
   cJSON *req = cJSON_CreateObject();
   cJSON_AddStringToObject(req, "model", cfg->openai_model);
@@ -4487,17 +4815,28 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   report_progress(GEN_STAGE_PLANNING, movie_index, movie_total, 0, 0, movie_title);
   logi("Requesting OpenAI clip plan (%d clips target)...", num_clips);
   warn_if_model_is_small(cfg);
+
+  /* The published plot summary gives the model a reliable text for character
+     names, so it does not have to rely on its memory of the film.  Optional:
+     when it cannot be fetched the run continues with the subtitles. */
+  char *plot_summary = wikipedia_plot_summary(cfg, movie_title);
+  if (!plot_summary && cfg->use_wikipedia_plot)
+    logw("Continuing without a plot summary - character names rely on the subtitles "
+         "and the model's memory. Set \"use_wikipedia_plot\": false to silence this, "
+         "or drop a summary at scripts/srt_files/%s_plot.txt.", movie_title);
+
   bool retry_no_script = false;
   ClipPlanList plan = openai_make_plan(cfg, movie_title, subs_seconds,
                                        imsdb_script ? imsdb_script : "",
+                                       plot_summary ? plot_summary : "",
                                        subs_placeholder,
                                        num_clips, per_clip_sec, &retry_no_script,
                                        false);
 
   if (plan.count == 0 && retry_no_script && imsdb_script && imsdb_script[0]) {
     logw("OpenAI request failed with IMSDb context; retrying without IMSDb script for %s", movie_title);
-    plan = openai_make_plan(cfg, movie_title, subs_seconds, "", subs_placeholder,
-                            num_clips, per_clip_sec, NULL, false);
+    plan = openai_make_plan(cfg, movie_title, subs_seconds, "", plot_summary ? plot_summary : "",
+                            subs_placeholder, num_clips, per_clip_sec, NULL, false);
   }
 
   if (plan.count > 0 && plan_language_mismatch(plan.items, plan.count, lang_code)) {
@@ -4505,7 +4844,8 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
          cfg->recap_language);
     free_clip_plan_list(&plan);
     plan = openai_make_plan(cfg, movie_title, subs_seconds,
-                            imsdb_script ? imsdb_script : "", subs_placeholder,
+                            imsdb_script ? imsdb_script : "",
+                            plot_summary ? plot_summary : "", subs_placeholder,
                             num_clips, per_clip_sec, NULL, true);
     if (plan.count > 0 && plan_language_mismatch(plan.items, plan.count, lang_code))
       logw("The AI is still answering in English - the %s recap may come out in "
@@ -4525,6 +4865,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
 
   free(subs_seconds);
   if (imsdb_script) free(imsdb_script);
+  free(plot_summary);
 
   if (plan.count == 0) {
     logw("No plan returned for %s", movie_title);

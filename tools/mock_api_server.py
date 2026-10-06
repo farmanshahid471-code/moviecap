@@ -14,6 +14,7 @@ Then point config.json at it:
     "elevenlabs_base_url": "http://127.0.0.1:9101/v1"
 
 - POST /v1/responses                 -> a clip plan in OpenAI "responses" shape
+- GET  /w/api.php  (port 9102)        -> a fake Wikipedia search + article extract
 - POST /v1/text-to-speech/<voice_id> -> a real MP3 (sine tone) of a varying length
 - POST /tts_to_audio/                -> WAV, the free XTTS v2 server contract
 - POST /synthesize                   -> WAV, the free Piper http_server contract
@@ -33,7 +34,7 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-STATE = {"plans": 0, "tts": 0, "lock": threading.Lock()}
+STATE = {"plans": 0, "tts": 0, "wiki_searches": 0, "wiki_extracts": 0, "lock": threading.Lock()}
 
 
 def make_tone_mp3(seconds, path, freq=440.0):
@@ -93,6 +94,10 @@ def build_plan(body, clips_wanted):
                         prompt)
     title = title_m.group(1).strip() if title_m else "this movie"
 
+    names = names_from_prompt(prompt)
+    if names:
+        print(f"[mock-openai] using character names from INPUT C: {', '.join(names)}", flush=True)
+
     clips = []
     for i in range(clips_wanted):
         start = int(lo + step * (i + 0.5))
@@ -109,8 +114,10 @@ def build_plan(body, clips_wanted):
                 f"This is mock narration number {i + 1}. "
                 f"Nothing exciting happens here, but the visuals keep moving. "
                 f"Let's keep going." if i == 0 else
-                f"Clip {i + 1} picks the story back up again. "
-                f"The scene changes and the tension builds. "
+                (f"Clip {i + 1} picks the story back up again and {names[i % len(names)]} "
+                 f"is right in the middle of it. " if names else
+                 f"Clip {i + 1} picks the story back up again. ")
+                + f"The scene changes and the tension builds. "
                 f"We are getting closer to the ending now."
             ),
         })
@@ -167,6 +174,82 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 "content": [{"type": "output_text", "text": text}],
             }],
         })
+
+
+
+# ---------------------------------------------------------------- Wikipedia ---
+
+WIKI_ARTICLE = {
+    "lead": "Test Movie is a 2026 thriller film directed by someone.",
+    "plot": (
+        "A detective named Mara Quinn tracks a thief named Axel Vance. "
+        "Her partner is a sergeant named Dale Ryker, a man who lost his brother to "
+        "Vance years earlier. The trail leads them from the flooded warehouse "
+        "district to the old docks, where Vance keeps the ledger he uses to "
+        "blackmail half the city. Quinn's chief, Commissioner Odell, orders her "
+        "to drop the case, because Vance pays him too. She refuses, and Ryker "
+        "backs her. They set a trap with a copy of the ledger. Vance sees through "
+        "it and takes Quinn hostage on the ferry. Ryker boards the ferry and "
+        "fights Vance on the deck. Quinn breaks free, grabs the ledger, and Vance "
+        "goes over the rail into the river. Odell is arrested that night. Quinn "
+        "hands in her badge, keeps the ledger, and walks away with Ryker."
+    ),
+    "cast": "Mara Quinn ... an unnamed actress\nAxel Vance ... an unnamed actor",
+}
+
+
+def wiki_article_text():
+    return (WIKI_ARTICLE["lead"] + "\n\n== Plot ==\n" + WIKI_ARTICLE["plot"] +
+            "\n\n== Cast ==\n" + WIKI_ARTICLE["cast"] + "\n")
+
+
+class WikiHandler(BaseHTTPRequestHandler):
+    """Offline stand-in for the Wikipedia action API the pipeline calls."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("[mock-wiki] " + (fmt % args) + "\n")
+
+    def _send(self, code, payload):
+        data = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        from urllib.parse import urlparse, parse_qs, unquote
+        q = parse_qs(urlparse(self.path).query)
+        action = (q.get("action") or [""])[0]
+        if action == "query" and (q.get("list") or [""])[0] == "search":
+            wanted = unquote((q.get("srsearch") or ["movie"])[0])
+            wanted = re.sub(r"\s*film\s*$", "", wanted, flags=re.I).strip() or "Test Movie"
+            title = wanted[:1].upper() + wanted[1:] + " (2026 film)"
+            with STATE["lock"]:
+                STATE["wiki_searches"] += 1
+            print(f"[mock-wiki] search -> {title}", flush=True)
+            return self._send(200, {"query": {"search": [
+                {"title": title, "pageid": 123, "snippet": "a film"},
+                {"title": wanted + " (soundtrack)", "pageid": 124, "snippet": "an album"},
+            ]}})
+        if action == "query" and "extracts" in q.get("prop", [""])[0]:
+            with STATE["lock"]:
+                STATE["wiki_extracts"] += 1
+            return self._send(200, {"query": {"pages": {"123": {
+                "pageid": 123, "title": "Test Movie (2026 film)",
+                "extract": wiki_article_text()}}}})
+        self._send(200, {"query": {}})
+
+
+def names_from_prompt(prompt):
+    """The character names the model was told to use, taken from INPUT C."""
+    if "INPUT C" not in prompt:
+        return []
+    block = prompt.split("INPUT C", 1)[1].split("STEP 1", 1)[0]
+    return re.findall(r"named ([A-Z][a-z]+ [A-Z][a-z]+)", block)
+
 
 
 class ElevenHandler(BaseHTTPRequestHandler):
@@ -307,17 +390,20 @@ def main():
     ap.add_argument("--openai-port", type=int, default=9100)
     ap.add_argument("--eleven-port", type=int, default=9101)
     ap.add_argument("--tts-port", type=int, default=8020)
+    ap.add_argument("--wiki-port", type=int, default=9102)
     args = ap.parse_args()
 
     a = ThreadingHTTPServer(("127.0.0.1", args.openai_port), OpenAIHandler)
     b = ThreadingHTTPServer(("127.0.0.1", args.eleven_port), ElevenHandler)
     c = ThreadingHTTPServer(("127.0.0.1", args.tts_port), TtsHandler)
+    d = ThreadingHTTPServer(("127.0.0.1", args.wiki_port), WikiHandler)
 
     print(f"[mock] OpenAI     -> http://127.0.0.1:{args.openai_port}/v1", flush=True)
     print(f"[mock] ElevenLabs -> http://127.0.0.1:{args.eleven_port}/v1", flush=True)
     print(f"[mock] XTTS/Piper -> http://127.0.0.1:{args.tts_port}/tts_to_audio/ and /synthesize", flush=True)
+    print(f"[mock] Wikipedia  -> http://127.0.0.1:{args.wiki_port}/w/api.php", flush=True)
 
-    for srv in (b, c):
+    for srv in (b, c, d):
         threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         a.serve_forever()

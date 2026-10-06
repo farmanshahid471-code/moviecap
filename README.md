@@ -267,6 +267,9 @@ Edit `config.json` in the project root (or use the **Settings** card in the web 
   "tts_model": "tts-1",
   "tts_api_key": "",
 
+  "use_wikipedia_plot": true,
+  "wikipedia_base_url": "",
+
   "min_clips": 20,
   "max_clips": 30,
   "max_video_speedup": 1.75,
@@ -300,6 +303,53 @@ Edit `config.json` in the project root (or use the **Settings** card in the web 
 | `bgm_enabled` | `true` | set `false` for narration-only output |
 | `make_vertical` | `true` | set `false` to skip the 9:16 render |
 | `retire_movies` | `true` | set `false` to leave processed files in `movies\` |
+| `use_wikipedia_plot` | `true` | download the movie's plot summary from Wikipedia and hand it to the model as the source of truth for character names (see *Character names*) |
+| `wikipedia_base_url` | empty | override the API endpoint; empty picks `https://<language>.wikipedia.org/w/api.php` from the narration language |
+
+### Character names (Wikipedia plot summary)
+
+The prompt already carries the two things the pipeline can fetch: the subtitles and, when
+available, the movie script. Neither of them reliably states who is who, and a model asked to
+recap a movie from memory regularly mixes names up, swaps two characters' roles, or invents a
+name that nobody in the film has.
+
+So the planner now also reads the film's **published plot summary**:
+
+1. `w/api.php?action=query&list=search&srsearch=<Title> film` on Wikipedia,
+   preferring a hit whose title carries a `(film)`/`(year film)` disambiguator.
+2. `action=query&prop=extracts&explaintext=1` for that article,
+3. the **Plot** section is cut out of the article (also accepted: *Plot summary*, *Synopsis*,
+   *Plot synopsis*, *Story*, *Premise* — other sections such as *Cast* are dropped), capped at
+   14000 characters,
+4. cached as `scripts\srt_files\<Title>_plot.txt`, so reruns and retries do not hit Wikipedia again.
+
+That text goes into the prompt as **INPUT C**, marked as the authority on names: every character
+must be spelled exactly the way the summary spells it, and names may only fall back to the
+subtitles/script knowledge when the summary does not mention that character. An extract shorter
+than 400 usable characters is treated as "no plot found" and ignored.
+
+Everything here is best effort and off the critical path — if Wikipedia is unreachable, or the film
+has no article, the log says so and the run continues with the subtitles alone:
+
+```
+Plot summary: 2611 chars from Wikipedia (Heat (1995)) will be handed to the model so character names come from a reliable text.
+Plot summary: the article "Some Obscure Film (2021 film)" has no usable plot section - continuing without it.
+```
+
+To fix a wrong or missing summary by hand, create the cache file yourself — it is read before any
+network call and never overwritten:
+
+```
+scripts\srt_files\<MovieTitle>_plot.txt
+```
+
+Set `"use_wikipedia_plot": false` to skip all of this and go back to the model's own memory,
+or point `"wikipedia_base_url"` at another MediaWiki API (a mirror, a proxy, a mock in tests).
+
+Character names also drive the naming rules in the prompt itself: one fixed name per character,
+a short introduction on first appearance, an explicit ban on inventing/merging/swapping names,
+pronouns that can never point at two people, and no mention of a character who is not part of the
+moment being narrated.
 
 ### Free narration (no ElevenLabs key)
 
@@ -472,14 +522,15 @@ Saved to `tiktok_output\`.
 | Working directory | had to be started from the project root | finds the project folder automatically |
 | Console | — | UTF-8 console output, app icon + version info |
 | Controlling a run | start only | **web control panel** + desktop **STOP** button: cancel at the next step boundary |
-| Settings | hand-edit `config.json` | clip count, speed cap, volumes, BGM/vertical/retire toggles and API base URLs are read from `config.json` and editable in the web panel |
+| Settings | hand-edit `config.json` | clip count, speed cap, volumes, BGM/vertical/retire toggles, the Wikipedia plot-summary switch and API base URLs are read from `config.json` and editable in the web panel |
 | Network errors | any transport failure (DNS/TLS/timeout) aborted the whole run with `exit(1)` | logged as a warning; the movie is skipped and the rest of the queue continues |
 | URLs | raw titles pasted into subtitle/script URLs | percent-encoded, so `Amélie's Test (2001)` works |
 | Testing | needs real API keys | `tools\mock_api_server.py` + the base-URL settings run the whole pipeline offline |
 
 The pipeline is the same shape: clip counts (20–30), durations, speed cap, FFmpeg filters, BGM mixing
 and vertical crop match the original. The recap prompt was rewritten (character list first, clip length
-targets in seconds x 2.6 words, strict JSON), the plan is force-sorted chronologically, the
+targets in seconds x 2.6 words, strict JSON), Wikipedia supplies the plot summary the names are
+taken from, the plan is force-sorted chronologically, the
 subtitle -> seconds conversion sorts out-of-order tracks, and caption changes are aligned to the
 pauses of the generated narration instead of a character count (measured with real ffmpeg against
 simulated TTS takes: worst caption change 0.04-0.05 s away from the moment the voice stops, against
@@ -501,6 +552,7 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
 
 ## Notes & troubleshooting
 
+- **"Plot summary: Wikipedia has no article for ..."** → the recap is built from the subtitles alone. Check the exact title (a year helps: `Heat (1995)`), drop the summary in by hand at `scripts\srt_files\<MovieTitle>_plot.txt`, or turn the feature off with `"use_wikipedia_plot": false`.
 - **Filename matters**: `movies\My Movie.mp4` → treated as title `My Movie`
 - **"ffmpeg/ffprobe not found in PATH"** → start the app with `run.bat`; it installs a portable FFmpeg into `F:\AI-Movie-Shorts\tools\ffmpeg\bin` and puts it on PATH for that session. If the download is blocked, run `install_tools.ps1` yourself or `winget install Gyan.FFmpeg`, then **close and reopen** the app/terminal. Check with `ffmpeg -version`.
 - **Windows SmartScreen** may warn about an unsigned `.exe` you built or downloaded. Click *More info → Run anyway*.
@@ -572,8 +624,8 @@ You can run the **entire** pipeline — plan, narration, clipping, concat, backg
 music, vertical render — without spending a cent, using the bundled mock API server:
 
 ```bash
-# 1. start the fake OpenAI + ElevenLabs endpoints, and the free-TTS ones
-python tools/mock_api_server.py --openai-port 9100 --eleven-port 9101 --tts-port 8020
+# 1. start the fake OpenAI + ElevenLabs + Wikipedia endpoints, and the free-TTS ones
+python tools/mock_api_server.py --openai-port 9100 --eleven-port 9101 --tts-port 8020 --wiki-port 9102
 ```
 
 Then point `config.json` (or the Settings card) at them and start a run as usual:
@@ -582,7 +634,8 @@ Then point `config.json` (or the Settings card) at them and start a run as usual
 "openai_base_url":     "http://127.0.0.1:9100/v1",
 "elevenlabs_base_url": "http://127.0.0.1:9101/v1",
 "tts_base_url":        "http://127.0.0.1:8020",
-"tts_voice":           "demo_speaker.wav"
+"tts_voice":           "demo_speaker.wav",
+"wikipedia_base_url":  "http://127.0.0.1:9102/w/api.php"
 ```
 
 Port 8020 answers all three free-narration contracts at once, so setting
@@ -592,6 +645,17 @@ XTTS and Piper return WAV, which also exercises the MP3 conversion path.
 The mock derives its clip timestamps from the subtitle text it is handed and returns
 real MP3 tones of varying length, so the speed cap, the BGM builder and the FFmpeg
 filters all get exercised. FFmpeg is still required.
+
+Port 9102 answers the two Wikipedia calls with a fake article that has a real `== Plot ==`
+section (and a `== Cast ==` section that must not leak into the prompt). The mock's clip
+narration then repeats the character names it finds in *INPUT C*, and prints them:
+
+```
+[mock-openai] using character names from INPUT C: Mara Quinn, Axel Vance
+```
+
+If that line shows the names from the fake plot rather than nothing, the plot-summary path
+works end to end without internet access.
 
 ## Legal
 

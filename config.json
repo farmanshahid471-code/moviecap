@@ -24,6 +24,8 @@
   "captions": true,
   "auto_transcribe": true,
   "whisper_model": "small",
+  "use_wikipedia_plot": true,
+  "wikipedia_base_url": "",
   "recap_languages": [""],
   "caption_font": "resources/Inter-Regular.ttf",
   "caption_font_zh": "",
