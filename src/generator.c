@@ -1479,6 +1479,10 @@ static char *sanitize_utf8_lossy(const char *in);
 /* Defined with the offline fallback helpers below; the planner needs the
    same numbers the prompt uses for the per-clip length. */
 static void clip_seconds_range(int per_clip_sec, int *min_sec, int *max_sec);
+/* Speech-length helpers (defined with the offline planner); the prompt builder
+ * needs them to talk about the right unit for the language. */
+static bool   lang_counts_chars(const char *code);
+static double lang_speech_units_per_sec(const char *code);
 
 /* ---------------------------------------------------------------------------
  * Plot summary context (Wikipedia).
@@ -2898,19 +2902,24 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     sent_hi = 5;
   }
 
-  /* Word counts are meaningless for Chinese (characters) and off for Arabic
-     (spoken slower), so those languages get an explicit override. */
-  char words_extra[360];
+  /* Word counts are meaningless for languages written without spaces and off
+     for Arabic (spoken slower), so those languages get an explicit override
+     that matches the unit the length audit measures. */
+  char words_extra[400];
   words_extra[0] = '\0';
   {
-    const char *wcode = recap_lang_code(cfg->recap_language);
-    if (!strcmp(wcode, "zh")) {
-      int clo = min_sec * 4, chi = max_sec * 5;
+    char wbuf[8];
+    snprintf(wbuf, sizeof(wbuf), "%s", recap_lang_code(cfg->recap_language));
+    const char *wlabel = recap_lang_label(wbuf);
+    if (lang_counts_chars(wbuf)) {
+      double cps = lang_speech_units_per_sec(wbuf);
+      int clo = (int)((double)min_sec * cps + 0.5);
+      int chi = (int)((double)max_sec * cps + 0.5);
       snprintf(words_extra, sizeof(words_extra),
-               "- In Chinese, count characters instead of words: each narration "
-               "needs about %d-%d Chinese characters, in %d-%d short sentences.\n",
-               clo, chi, sent_lo, sent_hi);
-    } else if (!strcmp(wcode, "ar")) {
+               "- %s is counted in characters, not words: each narration needs "
+               "about %d-%d characters, in %d-%d short sentences.\n",
+               wlabel[0] ? wlabel : "This language", clo, chi, sent_lo, sent_hi);
+    } else if (!strcmp(wbuf, "ar")) {
       int wlo = min_sec * 21 / 10, whi = max_sec * 3;
       snprintf(words_extra, sizeof(words_extra),
                "- Arabic is spoken a little slower: aim for %d-%d words, in %d-%d "
