@@ -80,7 +80,7 @@ jobs:
           if (-not (Select-String -Path smoke.log -Pattern "Processing: Amélie's Test \(2001\)" -Quiet)) { throw "unicode movie was not picked up" }
           if (-not (Select-String -Path smoke.log -Pattern "All done" -Quiet)) { throw "run did not finish" }
           if (-not (Select-String -Path smoke.log -Pattern "NO REAL SUBTITLES" -Quiet)) { throw "no-subtitle placeholder warning did not run" }
-          if (-not (Select-String -Path smoke.log -Pattern "local clip plan" -Quiet)) { throw "free local planner did not run" }
+          if (-not (Select-String -Path smoke.log -Pattern "offline planner" -Quiet)) { throw "free local planner did not run" }
 
       - name: Test the portable FFmpeg lookup (nothing on PATH)
         shell: pwsh
