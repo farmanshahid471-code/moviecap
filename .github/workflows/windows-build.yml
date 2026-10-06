@@ -578,6 +578,78 @@ jobs:
             Write-Host "::error title=pbatch::the batched recap collapsed to $dur s"; exit 1 }
           Write-Host "batch planning OK: 1 request batched, results fetched, video rendered from the batched plan"
 
+      - name: "Test the OpenAI-compatible path with a thinking model (DeepSeek-style)"
+        shell: pwsh
+        run: |
+          # The reported failure: a reasoning model spent the provider's whole
+          # output allowance on its reasoning (status=incomplete,
+          # incomplete_details.reason=max_output_tokens, no answer text at all)
+          # and the movie was skipped.  The app must (a) not impose a token limit
+          # of its own and (b) ask again with a big explicit budget when the
+          # provider says the answer never got written.
+          $ErrorActionPreference = 'Continue'
+          $pt = Join-Path (Get-Location) "pthink"
+          New-Item -ItemType Directory -Force "$pt\movies" | Out-Null
+          New-Item -ItemType Directory -Force "$pt\scripts\srt_files" | Out-Null
+          Copy-Item build\Release\movie_summary_cli.exe $pt\
+          Copy-Item -Recurse resources $pt\resources
+          '{"open_api_key":"sk-deepseek-mock","openai_base_url":"http://127.0.0.1:9100/v1","openai_model":"deepseek-v4-pro","tts_provider":"piper","min_clips":2,"max_clips":2,"recap_minutes":1,"use_wikipedia_plot":false,"auto_transcribe":false}' | Set-Content "$pt\config.json"
+          $lines = @()
+          $idx = 1
+          for ($t = 0; $t -lt 58; $t += 2) {
+            $lines += "$idx"
+            $lines += ("00:00:{0:D2},000 --> 00:00:{1:D2},000" -f $t, ($t + 2))
+            $lines += "Scene $t - the story moves forward here."
+            $lines += ""
+            $idx++
+          }
+          ($lines -join "`r`n") | Set-Content "$pt\scripts\srt_files\Think Run 2026 1080p.srt"
+          & "C:\ProgramData\chocolatey\bin\ffmpeg.exe" -hide_banner -loglevel error -f lavfi -i testsrc=size=640x360:duration=60 -c:v libx264 "$pt\movies\Think Run (2026).mp4"
+          if ($LASTEXITCODE -ne 0) { throw "ffmpeg could not build the test movie" }
+
+          $srv = Start-Process -FilePath "python" `
+            -ArgumentList "tools/mock_api_server.py","--openai-port","9100","--eleven-port","9101","--tts-port","8020","--reasoning-first-reply" `
+            -PassThru -RedirectStandardOutput "mockthink.log" -RedirectStandardError "mockthink.err"
+          Start-Sleep -Seconds 4
+          try {
+            $env:Path = "C:\ProgramData\chocolatey\bin;C:\Windows\System32;C:\Windows"
+            Push-Location $pt
+            .\movie_summary_cli.exe 2>&1 | Tee-Object -FilePath ..\pthink.log
+            $rc = $LASTEXITCODE
+            Pop-Location
+          } finally {
+            Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+          }
+          $tail = (Get-Content pthink.log -Tail 12) -join " ||| "
+          Write-Host "::warning title=pthink-tail::$tail"
+          Get-Content mockthink.log -Tail 10 | ForEach-Object { Write-Host "::notice title=mockthink:: $_" }
+          if ($rc -ne 0) { Write-Host "::error title=pthink::cli exited $rc"; exit 1 }
+
+          # 1. our request must not carry an output-token limit
+          if (-not (Select-String -Path mockthink.log -Pattern "plan request carries no output-token limit" -Quiet)) {
+            Write-Host "::error title=pthink::the plan request imposed an output-token limit"
+            exit 1 }
+          if (Select-String -Path mockthink.log -Pattern "WARNING: plan request carried an output-token limit" -Quiet) {
+            Write-Host "::error title=pthink::a request carried an output-token limit"; exit 1 }
+          # 2. the thinking-model reply must be retried, with an explicit budget
+          if (-not (Select-String -Path mockthink.log -Pattern "replying like a thinking model out of output room" -Quiet)) {
+            Write-Host "::error title=pthink::the thinking-model reply was never served - the test did not run"
+            exit 1 }
+          if (-not (Select-String -Path pthink.log -Pattern "did not write the plan before the output ran out" -Quiet)) {
+            Write-Host "::error title=pthink::the reasoning-only reply was not recognised as an unfinished answer"
+            exit 1 }
+          if (-not (Select-String -Path pthink.log -Pattern "max_output_tokens=128000" -Quiet)) {
+            Write-Host "::error title=pthink::the retry did not name a big output budget"
+            exit 1 }
+          # 3. the recap must be finished - not skipped
+          if (-not (Select-String -Path pthink.log -Pattern "All done. Processed: 1" -Quiet)) {
+            Write-Host "::error title=pthink::the run did not finish the movie"; exit 1 }
+          if (Select-String -Path pthink.log -Pattern "skipping this movie" -Quiet) {
+            Write-Host "::error title=pthink::the movie was skipped instead of retried"; exit 1 }
+          $vid = Get-Item "$pt\output\Think Run (2026).mp4" -ErrorAction SilentlyContinue
+          if (-not $vid) { Write-Host "::error title=pthink::no video was rendered"; exit 1 }
+          Write-Host "thinking-model recovery OK: no token limit imposed, unfinished reply retried with 128000, video rendered"
+
       - name: "Test run.bat web brings the control panel up"
         shell: pwsh
         run: |

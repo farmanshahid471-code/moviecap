@@ -3066,6 +3066,90 @@ static bool openai_body_hit_output_limit(const char *body) {
   return hit;
 }
 
+static char *openai_extract_output_text(const char *resp_json);   /* further down */
+
+/* A thinking model can spend a provider's whole output allowance on its
+ * reasoning and never write the JSON: the API answers 200 with
+ * status="incomplete", incomplete_details.reason="max_output_tokens" and an
+ * output array holding nothing but a reasoning item.  Nothing was charged for a
+ * usable plan, so the question is simply asked again with a bigger explicit
+ * budget.  Returns true when that is what happened. */
+static bool openai_reply_needs_more_room(const char *body) {
+  if (!body) return false;
+  cJSON *root = cJSON_Parse(body);
+  if (!root) return false;
+
+  bool out = false;
+  const cJSON *details = cJSON_GetObjectItemCaseSensitive(root, "incomplete_details");
+  const cJSON *reason = details ? cJSON_GetObjectItemCaseSensitive(details, "reason") : NULL;
+  if (cJSON_IsString(reason) && reason->valuestring &&
+      strcmp(reason->valuestring, "max_output_tokens") == 0)
+    out = true;
+
+  /* reasoning items but no message item: the model never started the answer */
+  const cJSON *output = cJSON_GetObjectItemCaseSensitive(root, "output");
+  if (!out && cJSON_IsArray(output)) {
+    bool any_reasoning = false, any_message = false;
+    const cJSON *item = NULL;
+    cJSON_ArrayForEach(item, output) {
+      const cJSON *ty = cJSON_GetObjectItemCaseSensitive(item, "type");
+      if (!cJSON_IsString(ty) || !ty->valuestring) continue;
+      if (strcmp(ty->valuestring, "reasoning") == 0) any_reasoning = true;
+      if (strcmp(ty->valuestring, "message") == 0) any_message = true;
+    }
+    if (any_reasoning && !any_message) out = true;
+  }
+  /* no answer text at all, but the body itself says the output ran out */
+  if (!out) {
+    char *text = openai_extract_output_text(body);
+    if (text) {
+      free(text);
+    } else if (openai_body_hit_output_limit(body)) {
+      out = true;
+    }
+  }
+  cJSON_Delete(root);
+  return out;
+}
+
+/* Reasoning-heavy models burn the allowance before writing anything (that is
+ * exactly what deepseek-v4-pro did), so the first retry names this much room. */
+static int openai_reasoning_budget(const Config *cfg) {
+  char mdl[160];
+  size_t i = 0;
+  for (; cfg->openai_model[i] && i + 1 < sizeof(mdl); i++)
+    mdl[i] = (char)tolower((unsigned char)cfg->openai_model[i]);
+  mdl[i] = '\0';
+  if (strstr(mdl, "reason") || strstr(mdl, "thinking") || strstr(mdl, "deepseek") ||
+      strcasestr_local(cfg->openai_base_url, "deepseek"))
+    return 128000;
+  return 64000;
+}
+
+/* The same request body with an explicit output budget, in the field the given
+ * API uses, and optionally a different reasoning effort ("" removes the field,
+ * NULL keeps whatever was there). */
+static char *openai_body_with_budget(const char *base_body, int budget, bool responses,
+                                     const char *effort, bool set_effort) {
+  cJSON *root = cJSON_Parse(base_body ? base_body : "");
+  if (!root) return NULL;
+  const char *field = responses ? "max_output_tokens" : "max_completion_tokens";
+  cJSON_DeleteItemFromObjectCaseSensitive(root, "max_output_tokens");
+  cJSON_DeleteItemFromObjectCaseSensitive(root, "max_completion_tokens");
+  if (budget > 0) cJSON_AddNumberToObject(root, field, budget);
+  if (set_effort && responses) {
+    cJSON_DeleteItemFromObjectCaseSensitive(root, "reasoning");
+    if (effort && effort[0]) {
+      cJSON *r = cJSON_CreateObject();
+      cJSON_AddStringToObject(r, "effort", effort);
+      cJSON_AddItemToObject(root, "reasoning", r);
+    }
+  }
+  char *out = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  return out;
+}
+
 /* Say out loud when a 200 reply stopped at the provider's output limit: the
  * plan that comes out is then only as long as the provider let it be. */
 static void warn_if_plan_was_cut_short(const char *resp_body, size_t clips) {
@@ -3874,27 +3958,130 @@ static void warn_if_model_is_small(const Config *cfg) {
 
 /* POST an OpenAI-style chat body that carries an output-token limit; retry the
  * plain body once when the provider rejects the parameter name. */
+/* POST to a chat/completions endpoint.  The body carries no output-token limit
+ * (the provider's own maximum applies); if the provider answers that the reply
+ * ran out of room, the same question is asked once more with an explicit, big
+ * budget.  A provider that does not know the newer field name gets max_tokens
+ * instead. */
 static MemBuf openai_post_chat_tokens(const char *endpoint, const char *key,
-                                      const char *chat_body_limited,
-                                      const char *chat_body_plain,
+                                      const char *chat_body, const Config *cfg,
                                       long *http_code, long timeout_s) {
-  MemBuf r = http_post_json_to_mem(endpoint, key,
-                                   chat_body_limited ? chat_body_limited : "{}",
+  MemBuf r = http_post_json_to_mem(endpoint, key, chat_body ? chat_body : "{}",
                                    http_code, timeout_s);
   long code = http_code ? *http_code : 0;
-  if (code == 400 && r.data && chat_body_plain &&
+  if (code < 200 || code >= 300) return r;
+  if (!openai_reply_needs_more_room(r.data)) {
+    /* a plan came back cut off mid-JSON: same problem, same cure */
+    char *text = openai_extract_output_text(r.data ? r.data : "");
+    bool cut = openai_body_hit_output_limit(r.data) &&
+               (!text || !strstr(text, "\"clips\""));
+    free(text);
+    if (!cut) return r;
+  }
+
+  int budget = openai_reasoning_budget(cfg);
+  logw("The reply ran out of output room before the plan was complete - asking the "
+       "chat endpoint again with max_completion_tokens=%d.", budget);
+  char *limited = openai_body_with_budget(chat_body, budget, false, NULL, false);
+  if (!limited) return r;
+  free(r.data);
+  r = http_post_json_to_mem(endpoint, key, limited, http_code, timeout_s);
+  free(limited);
+
+  /* older gateways only know max_tokens */
+  code = http_code ? *http_code : 0;
+  if ((code == 400 || code == 422) && r.data &&
       (strcasestr_local(r.data, "max_completion_tokens") ||
        strcasestr_local(r.data, "unsupported parameter") ||
        strcasestr_local(r.data, "unrecognized") ||
        strcasestr_local(r.data, "unknown parameter"))) {
-    logw("The provider rejected max_completion_tokens - retrying the chat endpoint "
-         "without an output-token limit.");
-    free(r.data);
-    r.data = NULL;
-    r.size = 0;
-    r = http_post_json_to_mem(endpoint, key, chat_body_plain, http_code, timeout_s);
+    logw("The provider does not know max_completion_tokens - retrying with max_tokens.");
+    char *alt = openai_body_with_budget(chat_body, budget, false, NULL, false);
+    if (alt) {
+      cJSON *root = cJSON_Parse(alt);
+      if (root) {
+        cJSON_DeleteItemFromObjectCaseSensitive(root, "max_completion_tokens");
+        cJSON_AddNumberToObject(root, "max_tokens", budget);
+        char *fixed = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+        if (fixed) {
+          free(alt);
+          alt = fixed;
+        }
+      }
+      free(r.data);
+      r = http_post_json_to_mem(endpoint, key, alt, http_code, timeout_s);
+      free(alt);
+    }
   }
+  code = http_code ? *http_code : 0;
+  if (code >= 200 && code < 300 && openai_reply_needs_more_room(r.data))
+    logw("The chat endpoint still stopped before the JSON. If this keeps happening, "
+         "raise the model's output limit in your provider's dashboard - the plan "
+         "cannot be longer than the model is allowed to write.");
   return r;
+}
+
+/* POST to the Responses endpoint.  No output-token limit goes out (the provider
+ * uses its own maximum); if it comes back saying the reply ran out of room, the
+ * question is asked again with a big explicit budget, then with less reasoning
+ * effort, then with none - so a thinking model can never cost the movie its
+ * recap.  A limit the provider names itself is obeyed from then on. */
+static MemBuf openai_post_plan_responses(const Config *cfg, const char *endpoint,
+                                         const char *base_body, long *http_code,
+                                         long timeout_s) {
+  MemBuf resp = http_post_json_to_mem(endpoint, cfg->openai_key, base_body,
+                                      http_code, timeout_s);
+  long code = http_code ? *http_code : 0;
+  if (code < 200 || code >= 300 || !openai_reply_needs_more_room(resp.data)) {
+    if (!(code < 200 || code >= 300) && openai_body_hit_output_limit(resp.data))
+      logw("The reply stopped at the provider's output limit - if the plan is short, "
+           "raise that limit in your provider's dashboard.");
+    return resp;
+  }
+
+  int budget = openai_reasoning_budget(cfg);
+  int ceiling = 0;                                  /* named by the provider */
+  /* effort_keep keeps the model thinking, effort "low" is the compromise,
+     "" drops the field for gateways/models that only finish once thinking is off */
+  static const char *efforts[3] = { NULL, "low", "" };
+  static const bool  set_effort[3] = { false, true, true };
+
+  for (int step = 0; step < 3; step++) {
+    int ask = budget;
+    if (ceiling > 0 && ask > ceiling) ask = ceiling;
+
+    char *body = openai_body_with_budget(base_body, ask, true, efforts[step],
+                                         set_effort[step]);
+    if (!body) break;
+    logw("The model did not write the plan before the output ran out (that reply is "
+         "not billable as an answer) - asking once more with max_output_tokens=%d%s.",
+         ask, set_effort[step] ? (efforts[step][0] ? ", reasoning effort low"
+                                                   : ", no reasoning field") : "");
+    free(resp.data);
+    resp = http_post_json_to_mem(endpoint, cfg->openai_key, body, http_code, timeout_s);
+    free(body);
+    code = http_code ? *http_code : 0;
+
+    if ((code < 200 || code >= 300) && resp.data &&
+        (anthropic_error_mentions(resp.data, "max_output_tokens") ||
+         anthropic_error_mentions(resp.data, "output tokens"))) {
+      long limit = anthropic_limit_from_error(resp.data, budget);
+      if (limit > 0 && (ceiling == 0 || limit < ceiling)) {
+        logw("The provider caps the output at %ld tokens (HTTP %ld) - obeying that.",
+             limit, code);
+        ceiling = (int)limit;
+        continue;                  /* same step, smaller number */
+      }
+    }
+    if (code < 200 || code >= 300) break;             /* a real error: the caller decides */
+    if (!openai_reply_needs_more_room(resp.data)) break;
+  }
+  if (openai_reply_needs_more_room(resp.data))
+    logw("The model still did not reach the plan. Its output allowance is too small "
+         "for this recap - raise the model's output limit in your provider's "
+         "dashboard, or set a smaller \"max_clips\" in config.json.");
+  return resp;
 }
 
 static ClipPlanList openai_make_plan(const Config *cfg,
@@ -4251,9 +4438,10 @@ static ClipPlanList openai_make_plan(const Config *cfg,
 
   cJSON *req = cJSON_CreateObject();
   cJSON_AddStringToObject(req, "model", cfg->openai_model);
-  /* A 20-30 clip plan is several thousand tokens; without an explicit limit the
-     provider's default can cut the JSON off mid-array. */
-  cJSON_AddNumberToObject(req, "max_output_tokens", 32000);
+  /* Deliberately NO output-token limit: the provider uses its own maximum, so
+     the plan is never cut short by a number this app picked.  If the provider's
+     allowance turns out to be too small, it says so and the request is repeated
+     with a big explicit budget - see openai_post_plan_responses. */
 
   cJSON *reasoning = cJSON_CreateObject();
   cJSON_AddStringToObject(reasoning, "effort", "high");
@@ -4308,18 +4496,15 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   cJSON_AddStringToObject(rfmt, "type", "json_object");
   cJSON_AddItemToObject(creq, "response_format", rfmt);
 
-  /* A 20-30 clip plan needs a few thousand output tokens.  Newer OpenAI models
-     only accept max_completion_tokens (max_tokens is an error there), while
-     some compatible providers do not know the newer name at all - so the plain
-     body is kept around and used if the provider complains. */
+  /* Deliberately NO output-token limit (neither max_completion_tokens nor
+     max_tokens): the provider's own maximum applies.  If it turns out to be too
+     small for the plan, the provider says so and the request is repeated with an
+     explicit, bigger budget - see openai_post_chat_tokens. */
   char *chat_body = cJSON_PrintUnformatted(creq);
-  cJSON_AddNumberToObject(creq, "max_completion_tokens", 32000);
-  char *chat_body_limited = cJSON_PrintUnformatted(creq);
   cJSON_Delete(creq);
 
   if (!body) {
     free(chat_body);
-    free(chat_body_limited);
     free(prompt);
     ClipPlanList empty = {0};
     return empty;
@@ -4346,7 +4531,6 @@ static ClipPlanList openai_make_plan(const Config *cfg,
            movie_title, batch_lang_label(cfg));
       free(prompt);
       free(chat_body);
-      free(chat_body_limited);
       ClipPlanList empty = {0};
       return empty;
     }
@@ -4366,7 +4550,6 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     }
     free(prompt);
     free(chat_body);
-    free(chat_body_limited);
     ClipPlanList empty = {0};
     return empty;
   }
@@ -4404,7 +4587,6 @@ static ClipPlanList openai_make_plan(const Config *cfg,
                 free(txt);
                 free(prompt);
                 free(chat_body);
-                free(chat_body_limited);
                 return plan;
               }
             }
@@ -4447,8 +4629,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
         logw("api.anthropic.com has no OpenAI-style /chat/completions endpoint, "
              "so there is nothing to fall back to.");
         free(chat_body);
-        free(chat_body_limited);
-        free(prompt);
+          free(prompt);
         ClipPlanList empty = {0};
         return empty;
       }
@@ -4459,9 +4640,8 @@ static ClipPlanList openai_make_plan(const Config *cfg,
       anthropic_openai_base(cfg->openai_base_url, base2, sizeof(base2));
       snprintf(endpoint, sizeof(endpoint), "%s/chat/completions", base2);
       logi("Anthropic endpoint failed - trying the OpenAI-style endpoint instead: %s", endpoint);
-      resp = openai_post_chat_tokens(endpoint, cfg->openai_key,
-                                     chat_body_limited ? chat_body_limited : chat_body,
-                                     chat_body, &http_code, timeout_s);
+      resp = openai_post_chat_tokens(endpoint, cfg->openai_key, chat_body, cfg,
+                                     &http_code, timeout_s);
       if (http_code < 200 || http_code >= 300) {
         logw("Chat-completions HTTP %ld", http_code);
         if (resp.data && resp.size) logw("Chat raw body: %.800s", resp.data);
@@ -4470,8 +4650,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
         }
         if (resp.data) free(resp.data);
         free(chat_body);
-        free(chat_body_limited);
-        free(prompt);
+          free(prompt);
         ClipPlanList empty = {0};
         return empty;
       }
@@ -4480,7 +4659,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   }
 
   snprintf(endpoint, sizeof(endpoint), "%s/responses", cfg->openai_base_url);
-  resp = http_post_json_to_mem(endpoint, cfg->openai_key, body, &http_code, timeout_s);
+  resp = openai_post_plan_responses(cfg, endpoint, body, &http_code, timeout_s);
   free(body);
 
   if (http_code < 200 || http_code >= 300) {
@@ -4497,15 +4676,13 @@ static ClipPlanList openai_make_plan(const Config *cfg,
 
     logi("Trying the provider's /chat/completions endpoint instead (DeepSeek and other OpenAI-compatible APIs)...");
     snprintf(endpoint, sizeof(endpoint), "%s/chat/completions", cfg->openai_base_url);
-    resp = openai_post_chat_tokens(endpoint, cfg->openai_key,
-                                   chat_body_limited ? chat_body_limited : chat_body,
-                                   chat_body, &http_code, timeout_s);
+    resp = openai_post_chat_tokens(endpoint, cfg->openai_key, chat_body, cfg,
+                                   &http_code, timeout_s);
     if (http_code < 200 || http_code >= 300) {
       logw("Chat-completions HTTP %ld", http_code);
       if (resp.data && resp.size) logw("Chat raw body: %.800s", resp.data);
       if (resp.data) free(resp.data);
       free(chat_body);
-      free(chat_body_limited);
       free(prompt);
       ClipPlanList empty = {0};
       return empty;
@@ -4544,9 +4721,8 @@ have_response:;
     snprintf(endpoint, sizeof(endpoint), "%s/chat/completions", base2);
     logi("Trying the OpenAI-style endpoint instead: %s", endpoint);
     long code2 = 0;
-    MemBuf r2 = openai_post_chat_tokens(endpoint, cfg->openai_key,
-                                        chat_body_limited ? chat_body_limited : chat_body,
-                                        chat_body, &code2, timeout_s);
+    MemBuf r2 = openai_post_chat_tokens(endpoint, cfg->openai_key, chat_body, cfg,
+                                        &code2, timeout_s);
     if (code2 >= 200 && code2 < 300) {
       char *t2 = openai_extract_output_text(r2.data ? r2.data : "");
       if (t2) {
@@ -4564,7 +4740,6 @@ have_response:;
 
   free(out_text);
   free(chat_body);
-  free(chat_body_limited);
   free(resp.data);
   return plan;
 }

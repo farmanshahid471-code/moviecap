@@ -699,6 +699,17 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
     arrived instead of quietly shipping a half-length recap.
   - DeepSeek's gateway maps `claude-*` model names to its own models, so a `claude-sonnet-...` model
     works against `https://api.deepseek.com/anthropic` too.
+
+- **DeepSeek / OpenAI-compatible endpoints, thinking models** — the app sends **no output-token limit**
+  of its own: your provider's own maximum applies, so a long plan is never cut short by a number
+  this app picked. If the provider answers that the reply ran out of room (`status: incomplete`,
+  `incomplete_details.reason: max_output_tokens`, or a reasoning-only reply with no text at all —
+  what a thinking model does when the allowance is small), the request is repeated with a big
+  explicit budget (128000 for reasoner/deepseek models, else 64000) that keeps the high reasoning
+  effort; if that still is not enough, the app lowers the reasoning effort rather than the quality of
+  the recap, and it obeys any ceiling the provider names (e.g. "maximum 8192"). The model's own
+  output limit is the only limit in play — raise it in your provider's dashboard if a very long recap
+  still cannot be written in one reply.
 - **Batch planning (50% cheaper Claude runs)** — `"batch_planning": true` with an
   Anthropic-compatible `openai_base_url` (or the checkbox in the panel).  The recap you watch is
   identical; only the price and the waiting change:

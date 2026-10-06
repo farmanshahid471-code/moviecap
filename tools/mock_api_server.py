@@ -35,8 +35,9 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 _TRUNCATE_FIRST_BATCH = False      # set from --truncate-first-batch
+_REASONING_FIRST_REPLY = False     # set from --reasoning-first-reply
 
-STATE = {"plans": 0, "tts": 0, "wiki_searches": 0, "wiki_extracts": 0,
+STATE = {"plans": 0, "responses": 0, "tts": 0, "wiki_searches": 0, "wiki_extracts": 0,
          "batches": {}, "batch_seq": 0, "truncate_first_batch": False,
          "lock": threading.Lock()}
 
@@ -269,6 +270,19 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         with STATE["lock"]:
             STATE["plans"] += 1
+            if self.path.endswith("/responses"):
+                STATE["responses"] += 1
+
+        # The app must not impose an output-token limit (the provider's own
+        # maximum applies).  Say so in the log so CI can assert it.
+        if self.path.endswith("/responses") or self.path.endswith("/chat/completions"):
+            if ("max_output_tokens" not in body and "max_completion_tokens" not in body
+                    and "max_tokens" not in body):
+                print("[mock-openai] plan request carries no output-token limit",
+                      flush=True)
+            else:
+                print("[mock-openai] WARNING: plan request carried an output-token limit",
+                      flush=True)
 
         # --- Anthropic Message Batches: create ---------------------------
         if self.path == "/anthropic/v1/messages/batches":
@@ -295,6 +309,27 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         if not self.path.endswith("/responses"):
             return self._send(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
+
+        # A thinking model that spent the whole allowance on its reasoning: 200 OK
+        # with no answer text at all (this is what deepseek-v4-pro did).
+        if _REASONING_FIRST_REPLY and STATE["responses"] <= 1:
+            print("[mock-openai] replying like a thinking model out of output room",
+                  flush=True)
+            return self._send(200, {
+                "id": "resp_reasoning_only",
+                "object": "response",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "model": body.get("model", "mock"),
+                "output": [{
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "status": "incomplete",
+                    "content": [{"type": "reasoning_text",
+                                 "text": "We need answer JSON only. Need build narration "
+                                         "for every clip. Need choose ranges from INPUT A..."}],
+                }],
+            })
 
         wanted = 8
         plan = build_plan(body, wanted)
@@ -530,6 +565,12 @@ def main():
     ap.add_argument("--eleven-port", type=int, default=9101)
     ap.add_argument("--tts-port", type=int, default=8020)
     ap.add_argument("--wiki-port", type=int, default=9102)
+    ap.add_argument("--reasoning-first-reply", action="store_true",
+                    help="answer the FIRST /responses call the way a thinking "
+                         "model with a small output allowance does: status="
+                         "incomplete, incomplete_details.reason=max_output_tokens, "
+                         "and an output array holding nothing but a reasoning "
+                         "item. Later calls answer normally.")
     ap.add_argument("--truncate-first-batch", action="store_true",
                     help="answer the FIRST batch with a reply that stops at the "
                          "output limit (stop_reason=max_tokens), the way an "
@@ -537,8 +578,9 @@ def main():
                          "completely. Used to test the escalation path.")
     args = ap.parse_args()
 
-    global _TRUNCATE_FIRST_BATCH
+    global _TRUNCATE_FIRST_BATCH, _REASONING_FIRST_REPLY
     _TRUNCATE_FIRST_BATCH = bool(args.truncate_first_batch)
+    _REASONING_FIRST_REPLY = bool(args.reasoning_first_reply)
 
     a = ThreadingHTTPServer(("127.0.0.1", args.openai_port), OpenAIHandler)
     b = ThreadingHTTPServer(("127.0.0.1", args.eleven_port), ElevenHandler)

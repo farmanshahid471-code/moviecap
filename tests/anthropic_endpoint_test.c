@@ -1045,6 +1045,128 @@ static void test_batch_in_flight_is_not_paid_for_twice(void) {
      "the manifest says the batch is still to be fetched");
 }
 
+/* -------------------------------------------------------------------------
+ * The OpenAI-compatible path (DeepSeek et al.): no output-token limit is
+ * imposed, and a thinking model that spends the provider's whole allowance on
+ * its reasoning gets asked again instead of costing the movie its recap.
+ * ---------------------------------------------------------------------- */
+
+static void test_openai_plan_imposes_no_token_limit(void) {
+  stub_reset();
+  Config c = cfg_for("https://api.deepseek.com/v1", "deepseek-v4-pro", "sk-ds-mock");
+
+  queue_ok(PLAN_JSON);                 /* a normal, complete reply */
+  ClipPlanList plan = openai_make_plan(&c, "No Limit Movie", "1\n5 --> 9\nStory.\n\n",
+                                       "", "", false, 2, 12, NULL, NULL, NULL);
+
+  ck(plan.count == 1, "the plan comes back");
+  ck(stub_request_count() == 1, "a complete reply costs exactly one request");
+
+  const char *body = stub_request_body(0);
+  ck(body && !body_has(body, "max_output_tokens"),
+     "the /responses request carries NO max_output_tokens");
+  ck(body && !body_has(body, "max_completion_tokens"),
+     "and no max_completion_tokens either");
+  ck(body && !body_has(body, "\"max_tokens\""),
+     "and no max_tokens: the provider's own maximum applies");
+  ck(body && body_has(body, "\"reasoning\""),
+     "the reasoning request itself is untouched");
+  ck(stub_request_url(0) != NULL && strstr(stub_request_url(0), "/responses"),
+     "it is the Responses endpoint");
+
+  free_clip_plan_list(&plan);
+}
+
+static void test_openai_reasoning_model_asked_again_with_room(void) {
+  /* Exactly what deepseek-v4-pro did: 200 OK, status=incomplete,
+   * reason=max_output_tokens, and nothing in the output but reasoning. */
+  stub_reset();
+  Config c = cfg_for("https://api.deepseek.com/v1", "deepseek-v4-pro", "sk-ds-mock");
+
+  stub_queue_reply(200,
+    "{\"id\":\"r1\",\"object\":\"response\",\"status\":\"incomplete\","
+    "\"incomplete_details\":{\"reason\":\"max_output_tokens\"},"
+    "\"output\":[{\"type\":\"reasoning\",\"content\":[{\"type\":\"reasoning_text\","
+    "\"text\":\"We need answer JSON only. Need build narration for 96 clips...\"}]}]}");
+  queue_ok(PLAN_JSON);                 /* the second attempt writes the plan */
+
+  ClipPlanList plan = openai_make_plan(&c, "Thinking Movie", "1\n5 --> 9\nStory.\n\n",
+                                       "", "", false, 2, 12, NULL, NULL, NULL);
+
+  ck(plan.count == 1, "the reasoning-only reply is retried and the plan arrives");
+  ck(stub_request_count() == 2, "exactly one extra request was made");
+  const char *again = stub_request_body(1);
+  ck(again && body_has(again, "\"max_output_tokens\":128000"),
+     "the retry names a big output budget (128000 for a reasoner)");
+  ck(again && body_has(again, "\"effort\":\"high\""),
+     "and keeps the high reasoning effort - quality first");
+  free_clip_plan_list(&plan);
+}
+
+static void test_openai_reasoning_model_then_drops_effort(void) {
+  /* The model burns the big budget too: the next asks lower the reasoning
+   * effort rather than the quality of the answer itself. */
+  stub_reset();
+  Config c = cfg_for("https://api.deepseek.com/v1", "deepseek-v4-pro", "sk-ds-mock");
+
+  const char *only_reasoning =
+    "{\"id\":\"r1\",\"object\":\"response\",\"status\":\"incomplete\","
+    "\"incomplete_details\":{\"reason\":\"max_output_tokens\"},"
+    "\"output\":[{\"type\":\"reasoning\",\"content\":[]}]}";
+  stub_queue_reply(200, only_reasoning);
+  stub_queue_reply(200, only_reasoning);
+  queue_ok(PLAN_JSON);
+
+  ClipPlanList plan = openai_make_plan(&c, "Stubborn Movie", "1\n5 --> 9\nStory.\n\n",
+                                       "", "", false, 2, 12, NULL, NULL, NULL);
+
+  ck(plan.count == 1, "the third attempt finally produces the plan");
+  ck(stub_request_count() == 3, "two extra asks, no more");
+  ck(body_has(stub_request_body(2), "\"effort\":\"low\""),
+     "the last ask lowers the reasoning effort");
+  ck(body_has(stub_request_body(2), "\"max_output_tokens\":128000"),
+     "while keeping the big output budget");
+  free_clip_plan_list(&plan);
+}
+
+static void test_openai_provider_ceiling_is_obeyed(void) {
+  /* A provider that names its own maximum must not be asked for more again. */
+  stub_reset();
+  Config c = cfg_for("https://api.deepseek.com/v1", "deepseek-v4-pro", "sk-ds-mock");
+
+  stub_queue_reply(200,
+    "{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},"
+    "\"output\":[{\"type\":\"reasoning\",\"content\":[]}]}");
+  stub_queue_reply(400,
+    "{\"error\":{\"message\":\"max_output_tokens: 128000 > 8192, which is the maximum "
+    "allowed number of output tokens for this model\",\"type\":\"invalid_request_error\"}}");
+  queue_ok(PLAN_JSON);
+
+  ClipPlanList plan = openai_make_plan(&c, "Capped Movie", "1\n5 --> 9\nStory.\n\n",
+                                       "", "", false, 2, 12, NULL, NULL, NULL);
+
+  ck(plan.count == 1, "the ceiling is obeyed and the plan still arrives");
+  ck(stub_request_count() == 3, "the rejected budget costs one extra request");
+  const char *third = stub_request_body(2);
+  ck(third && body_has(third, "\"max_output_tokens\":8192"),
+     "the third ask uses the 8192 the provider named");
+  free_clip_plan_list(&plan);
+}
+
+static void test_openai_no_limit_means_no_extra_requests(void) {
+  /* The 20-minute case from the report: 96 clips of narration in one reply.
+   * Nothing about the request may push the model into a second call. */
+  stub_reset();
+  Config c = cfg_for("https://api.deepseek.com/v1", "deepseek-v4-pro", "sk-ds-mock");
+  queue_ok(PLAN_JSON);
+
+  ClipPlanList plan = openai_make_plan(&c, "Long Movie", "1\n5 --> 9\nStory.\n\n",
+                                       "", "", false, 96, 12, NULL, NULL, NULL);
+  ck(plan.count > 0, "a 96-clip plan is accepted in one request");
+  ck(stub_request_count() == 1, "no retry was needed");
+  free_clip_plan_list(&plan);
+}
+
 int main(void) {
   test_endpoint_shapes();
   test_native_claude_request();
@@ -1063,6 +1185,11 @@ int main(void) {
   test_native_failure_says_why();
   test_gateway_rescue_url();
   test_batch_in_flight_is_not_paid_for_twice();
+  test_openai_plan_imposes_no_token_limit();
+  test_openai_reasoning_model_asked_again_with_room();
+  test_openai_reasoning_model_then_drops_effort();
+  test_openai_provider_ceiling_is_obeyed();
+  test_openai_no_limit_means_no_extra_requests();
   test_batch_custom_id_shape();
   test_batch_collect_then_render();
   test_batch_failure_falls_back_live();
