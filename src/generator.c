@@ -822,6 +822,51 @@ static bool srt_seconds_file_is_ordered(const char *path) {
   return ok;
 }
 
+/* A subtitle track that only covers part of the movie (a per-CD file, a
+ * trailer, a subtitle sheet for another release) is the number one reason a
+ * recap talks about characters and events that are not on screen: the story
+ * is retold from the wrong timestamps.  Say so instead of shipping it. */
+static void warn_if_subtitles_cover_wrong_span(const char *subs_seconds_text,
+                                               double movie_dur,
+                                               const char *movie_title) {
+  if (!subs_seconds_text || !subs_seconds_text[0] || movie_dur < 120.0) return;
+
+  int first = -1, last = -1;
+  char *work = str_dup(subs_seconds_text);
+  if (!work) return;
+  char *cur = work;
+  while (cur) {
+    char *nl = strchr(cur, '\n');
+    if (nl) *nl = '\0';
+    int s1 = 0, s2 = 0;
+    if (sscanf(cur, "%d --> %d", &s1, &s2) == 2) {
+      if (first < 0) first = s1;
+      if (s2 > last) last = s2;
+    }
+    cur = nl ? nl + 1 : NULL;
+  }
+  free(work);
+  if (first < 0 || last <= 0) return;
+
+  char span[64];
+  snprintf(span, sizeof(span), "%d:%02d to %d:%02d",
+           first / 60, first % 60, last / 60, last % 60);
+
+  if ((double)last < movie_dur * 0.5 || (double)first > movie_dur * 0.30) {
+    logw("The subtitles only cover %s, but the movie is %d:%02d long. This looks "
+         "like the wrong file (another cut/release, or only part of the movie), "
+         "so the narration will describe moments that are not on screen. Put the "
+         "full subtitle track at scripts/srt_files/%s.srt, delete "
+         "scripts/srt_files/%s_modified.srt and run again.",
+         span, (int)(movie_dur / 60.0), ((int)movie_dur) % 60, movie_title, movie_title);
+  } else if ((double)last > movie_dur * 1.05) {
+    logw("The subtitles run to %d:%02d but the movie ends at %d:%02d - they are "
+         "probably for a longer/extended release, so the clip times will drift "
+         "away from the picture after a while.",
+         last / 60, last % 60, (int)(movie_dur / 60.0), ((int)movie_dur) % 60);
+  }
+}
+
 static bool convert_srt_timestamps_to_seconds(const char *input_srt, const char *output_srt) {
   char *data = read_entire_file(input_srt);
   if (!data) return false;
@@ -3882,6 +3927,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     return false;
   }
   logok("Loaded subtitles for planning: %s (%zu bytes)", srt_mod, strlen(subs_seconds));
+  warn_if_subtitles_cover_wrong_span(subs_seconds, ffprobe_duration_seconds(movie_path), movie_title);
 
   char *imsdb_script = NULL;
   if (file_exists(script_txt)) {
