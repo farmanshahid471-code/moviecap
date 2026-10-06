@@ -61,12 +61,30 @@ jobs:
       - name: Unit tests (subtitles, captions, languages)
         shell: pwsh
         run: |
+          # The log of a failed build step cannot be downloaded with gh, so every
+          # step below turns the interesting lines into an annotation.
+          # MSVC writes warnings to stderr: keep them from terminating the step.
+          $ErrorActionPreference = 'Continue'
+          function Show-Tail([string]$text, [string]$title) {
+            $keep = ($text -split "`n" |
+                     Where-Object { $_ -match 'error|Error|FAIL|failed|Test #|exception|Exception|assert' } |
+                     Select-Object -First 25) -join ' ||| '
+            if (-not $keep) { $keep = ($text -split "`n" | Select-Object -Last 25) -join ' ||| ' }
+            if ($keep.Length -gt 12000) { $keep = $keep.Substring(0, 12000) }
+            Write-Host ("::error title={0}::{1}" -f $title, $keep)
+          }
+
           # Same build folder as build.bat, so the dependencies are already there.
-          cmake -S . -B build -DBUILD_UNIT_TESTS=ON
-          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
-          cmake --build build --config Release --target caption_language_test srt_structure_test
-          if ($LASTEXITCODE -ne 0) { throw "building the unit tests failed" }
-          ctest --test-dir build -C Release --output-on-failure
+          $cfg = & cmake -S . -B build -DBUILD_UNIT_TESTS=ON 2>&1 | Out-String
+          Write-Host $cfg
+          if ($LASTEXITCODE -ne 0) { Show-Tail $cfg "cmake configure"; exit 1 }
+
+          $bld = & cmake --build build --config Release --target caption_language_test srt_structure_test 2>&1 | Out-String
+          Write-Host $bld
+          if ($LASTEXITCODE -ne 0) { Show-Tail $bld "building the unit tests"; exit 1 }
+
+          $run = & ctest --test-dir build -C Release --output-on-failure 2>&1 | Out-String
+          Write-Host $run
           $code = $LASTEXITCODE
           $log = "build/Testing/Temporary/LastTest.log"
           if (Test-Path $log) {
@@ -75,10 +93,12 @@ jobs:
           }
           if ($code -ne 0) {
             if (Test-Path $log) {
-              Select-String -Path $log -Pattern '\[FAIL\]' | Select-Object -First 15 |
+              Select-String -Path $log -Pattern '\[FAIL\]|FAILED|Assertion|Segmentation|abort' |
+                Select-Object -First 15 |
                 ForEach-Object { Write-Host ("::error title=Unit test::{0}" -f $_.Line) }
             }
-            throw "unit tests failed"
+            Show-Tail $run "unit tests failed"
+            exit 1
           }
 
       - name: Install FFmpeg for smoke test

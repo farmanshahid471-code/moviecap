@@ -223,13 +223,26 @@ if(BUILD_UNIT_TESTS)
   enable_testing()
 
   foreach(_t caption_language_test srt_structure_test)
-    add_executable(${_t} tests/${_t}.c src/platform.c src/platform_open.c)
+    # cJSON is compiled straight into the target, exactly like movie_core does.
+    add_executable(${_t}
+      tests/${_t}.c
+      src/platform.c
+      src/platform_open.c
+      "${cjson_SOURCE_DIR}/cJSON.c"
+    )
     target_include_directories(${_t} PRIVATE "${cjson_SOURCE_DIR}")
     target_link_libraries(${_t} PRIVATE CURL::libcurl miniz Threads::Threads)
     if(WIN32)
       target_compile_definitions(${_t} PRIVATE
         UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX CJSON_HIDE_SYMBOLS)
       target_link_libraries(${_t} PRIVATE shell32)
+    endif()
+    if(MSVC)
+      target_compile_definitions(${_t} PRIVATE _CRT_SECURE_NO_WARNINGS)
+      target_compile_options(${_t} PRIVATE /W3 /utf-8)
+    else()
+      target_compile_options(${_t} PRIVATE
+        -Wall -Wextra -Wno-unused-parameter -Wno-unused-const-variable)
     endif()
     add_test(NAME ${_t} COMMAND ${_t}
              WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${_t}_run")

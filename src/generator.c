@@ -968,15 +968,15 @@ static bool srt_text_ends_sentence(const char *t) {
   unsigned char c = (unsigned char)t[n - 1];
   if (c == '.' || c == '!' || c == '?') return true;
   if (n >= 3) {
-    if (c == 0x82 && (unsigned char)t[n - 2] == 0x80 && (unsigned char)t[n - 3] == 0xE3) return true;  /* 。 */
-    if (c == 0x81 && (unsigned char)t[n - 2] == 0xBC && (unsigned char)t[n - 3] == 0xEF) return true;  /* ！ */
-    if (c == 0x9F && (unsigned char)t[n - 2] == 0xBC && (unsigned char)t[n - 3] == 0xEF) return true;  /* ？ */
+    if (c == 0x82 && (unsigned char)t[n - 2] == 0x80 && (unsigned char)t[n - 3] == 0xE3) return true;  /* ideographic full stop */
+    if (c == 0x81 && (unsigned char)t[n - 2] == 0xBC && (unsigned char)t[n - 3] == 0xEF) return true;  /* fullwidth exclamation mark */
+    if (c == 0x9F && (unsigned char)t[n - 2] == 0xBC && (unsigned char)t[n - 3] == 0xEF) return true;  /* fullwidth question mark */
   }
-  if (n >= 2 && c == 0x9F && (unsigned char)t[n - 2] == 0xD8) return true;                            /* ؟ */
+  if (n >= 2 && c == 0x9F && (unsigned char)t[n - 2] == 0xD8) return true;                            /* Arabic question mark */
   return false;
 }
 
-/* "- " / "– " at the start of a cue marks a different speaker: never join it
+/* "- " / en dash at the start of a cue marks a different speaker: never join it
  * onto the line before it. */
 static bool srt_text_is_speaker_change(const char *t) {
   if (!t) return false;
@@ -5189,12 +5189,6 @@ static char *trim_ws(char *t) {
   return t;
 }
 
-static bool line_is_digits(const char *t) {
-  if (!*t) return false;
-  for (; *t; t++) if (*t < '0' || *t > '9') return false;
-  return true;
-}
-
 /* Build a clip plan without any API: sample the subtitle cues evenly across
  * the file and use the cue text itself as the narration. */
 static ClipPlanList local_make_plan(const char *subs_seconds_text, int num_clips, int per_clip_sec) {
@@ -5233,7 +5227,11 @@ static ClipPlanList local_make_plan(const char *subs_seconds_text, int num_clips
       continue;
     }
 
-    if (pend && !line_is_digits(ln)) {
+    /* Every text line belongs to the open cue.  A cue number is a digits line
+       that arrives while no cue is open (the previous one was closed by the
+       blank line), so it is skipped by the "pend" test - and a line that is
+       only digits ("1944", "42") stays dialogue instead of being dropped. */
+    if (pend) {
       if (pend_text) {
         size_t a = strlen(pend_text), b = strlen(ln);
         char *m = (char *)realloc(pend_text, a + b + 2);

@@ -261,7 +261,26 @@ int main(void) {
   ck(j && count_cues(j) == 3, "both cues of an overlap survive");
   free(j);
 
-  /* ---- 11. a cached file from the old code is recognised as out of date -- */
+  /* ---- 11. the offline planner keeps digits-only dialogue too ----------- */
+  const char *off =
+    "1\n"
+    "60 --> 70\n"
+    "1944\n\n"
+    "2\n"
+    "71 --> 75\n"
+    "The story starts here.\n\n";
+  ClipPlanList lp = local_make_plan(off, 2, 30);
+  ck(lp.count >= 1, "the offline planner builds a plan from the converted file");
+  bool keeps_digits = false;
+  for (size_t k = 0; k < lp.count; k++)
+    if (lp.items[k].narration && strstr(lp.items[k].narration, "1944")) keeps_digits = true;
+  ck(keeps_digits, "the offline planner narration keeps digits-only dialogue");
+  for (size_t k = 0; k < lp.count; k++)
+    if (lp.items[k].narration) printf("       offline clip %zu: [%d-%d] \"%s\"\n",
+                                      k, lp.items[k].start, lp.items[k].end, lp.items[k].narration);
+  free_clip_plan_list(&lp);
+
+  /* ---- 12. a cached file from the old code is recognised as out of date -- */
   write_file_("old_mod.srt",
               "1\n100 --> 100\nI\n\n"
               "2\n100 --> 101\ncan't\n\n"
