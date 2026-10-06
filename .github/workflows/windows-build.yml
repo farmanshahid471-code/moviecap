@@ -381,7 +381,49 @@ jobs:
           Write-Host "pfree final duration: $dur s (target ~60 s)"
           if ($dur -lt 40) {
             Write-Host "::error title=pfree::recap collapsed to $dur s - the length target is broken"; exit 1 }
-          Write-Host "free keyless generation OK (auto-started Piper, fallback SRT, local plan)"
+
+          # Burnt-in captions: the log lists every caption chunk in the order it
+          # appears, with the seconds it is on screen and the rows its lines were
+          # drawn in. Inside one chunk the FIRST line must be drawn ABOVE the
+          # second (rows must count down), the chunks must run forward in time and
+          # the first chunk of a clip must start at the start of the narration -
+          # that is exactly the "it shows the next sentence before the present
+          # sentence" bug. The clips only exist if ffmpeg accepted the whole
+          # drawtext chain, so this covers the escaping too.
+          $lastEnd = -1.0
+          $chunks = 0
+          $capsSeen = 0
+          foreach ($line in (Get-Content pfree.log)) {
+            if ($line -match 'Building clip \d+:') { $lastEnd = -1.0; continue }
+            $cm = [regex]::Match($line, 'Captions: \d+ chunk\(s\) \| (.*)$')
+            if (-not $cm.Success) { continue }
+            $body = $cm.Groups[1].Value
+            if ($capsSeen -eq 0 -and $body -notmatch '[0-9]+\.[0-9]+-[0-9]+\.[0-9]+s rows\[[0-9,]+\] "Scene ') {
+              Write-Host "::error title=captions::the first caption does not start at the start of the narration: $body"
+              exit 1
+            }
+            $capsSeen++
+            foreach ($w in [regex]::Matches($body, '([0-9.]+)-([0-9.]+)s rows\[([0-9,]+)\]')) {
+              $t0 = [double]$w.Groups[1].Value
+              $t1 = [double]$w.Groups[2].Value
+              if ($t0 -lt $lastEnd - 0.02) {
+                Write-Host "::error title=captions::caption windows go backwards ($t0 s starts before the previous chunk ended at $lastEnd s)"
+                exit 1
+              }
+              $lastEnd = $t1
+              $rows = $w.Groups[3].Value.Split(',')
+              for ($r = 1; $r -lt $rows.Count; $r++) {
+                if ([int]$rows[$r] -ge [int]$rows[$r - 1]) {
+                  Write-Host "::error title=captions::caption lines are stacked in the wrong order (rows $($w.Groups[3].Value)) - the lower line would be read first"
+                  exit 1
+                }
+              }
+              $chunks++
+            }
+          }
+          if ($capsSeen -eq 0) { Write-Host "::error title=captions::no caption line in the log"; exit 1 }
+          Write-Host "captions OK: $chunks chunks in speech order, first line of every multi-line chunk drawn on top"
+          Write-Host "free keyless generation OK (auto-started Piper, fallback SRT, local plan, captions)"
 
       - name: "Test run.bat web brings the control panel up"
         shell: pwsh

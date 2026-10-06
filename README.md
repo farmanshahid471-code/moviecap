@@ -134,7 +134,11 @@ no browser extension, nothing to install. The page gives you:
   estimated per sentence (syllables, digits that are read out loud, punctuation pauses)
   and those boundaries are then snapped onto the real pauses `ffmpeg`'s `silencedetect`
   finds in the narration audio, so the text never runs ahead of the words or lags
-  behind them
+  behind them. A two-line sentence is drawn **top line first** and the line length is
+  sized to the middle 60% of the frame that the vertical (9:16) render keeps, so the
+  Short does not cut the caption off at the sides. Chinese/Japanese/Korean captions get
+  shorter lines (24 characters) and a system CJK font is picked automatically when
+  `caption_font_zh` is empty
 - **file management** for `movies\`, `scripts\srt_files\`, `backgroundmusic\`,
   `output\`, `tiktok_output\`, `movies_retired\`, `clips\`:
   drag-and-drop **upload**, **delete**, **download**
@@ -307,6 +311,28 @@ Edit `config.json` in the project root (or use the **Settings** card in the web 
 | `use_wikipedia_plot` | `true` | download the movie's plot summary from Wikipedia and hand it to the model as the source of truth for character names (see *Character names*) |
 | `wikipedia_base_url` | empty | override the API endpoint; empty picks `https://<language>.wikipedia.org/w/api.php` from the narration language |
 | `offline_planner` | `false` | set `true` to keep the old fallback that narrates the **raw subtitle lines** when no AI plan arrives; by default such a movie is skipped with the reason in the log |
+
+### Recap languages
+
+`recap_languages` is the list of languages to render, one recap each, in order (max 4),
+and the whole pipeline follows it: the subtitle file tag (`Toy Story.fr.srt`),
+the Wikipedia subdomain, the narration language, the caption font and the Edge voice.
+Chinese, Arabic, Spanish, French, German, Italian, Portuguese, Russian, Hindi, Urdu,
+Japanese, Korean, Turkish, Indonesian, Dutch, Polish, Vietnamese and more are in the
+language table; anything else falls back to English.
+
+Two guards keep a language pass honest:
+
+- the AI plan is checked for the requested language (writing system for Chinese,
+  Japanese, Korean, Arabic, Persian, Urdu, Hebrew, Russian, Ukrainian, Greek, Hindi,
+  Bengali, Tamil and Thai; function words for Spanish, French, German, Italian and
+  Portuguese). A plan that comes back in the wrong language is rejected once and
+  re-requested with an explicit "every narration must be in <language>" demand;
+- the speech length of a plan is measured in the right unit (words, or characters
+  for Chinese/Japanese/Korean/Thai) before it is compared with `recap_minutes`.
+
+Each language writes its own output file (`Title.mp4`, `Title (Chinese).mp4`, ...), so
+adding a language later only renders the missing one.
 
 ### Character names (Wikipedia plot summary)
 

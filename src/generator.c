@@ -538,26 +538,111 @@ static void cfg_trim_trailing_slash(char *s) {
   while (n > 0 && s[n - 1] == '/') s[--n] = 0;
 }
 
-/* Language helpers for the multi-language recap pass. */
-static const char *recap_lang_code(const char *lang) {
-  if (!lang || !lang[0]) return "en";
-  if (strstr(lang, "Chinese")) return "zh";
-  if (strstr(lang, "Arabic"))  return "ar";
-  if (strstr(lang, "Spanish")) return "es";
-  return "en";
+/* Language helpers for the multi-language recap pass.
+ *
+ * ONE table decides what every part of the pipeline means by a language: the
+ * subtitle file tag (Title.fr.srt), the Wikipedia subdomain, the caption font,
+ * the Edge voice and the right-to-left handling.  Before this table the only
+ * languages the app really knew were Chinese, Arabic and Spanish - anything
+ * else silently became "English" and got an English voice. */
+static const struct { const char *name; const char *code; } k_langs[] = {
+  { "english", "en" }, { "spanish", "es" }, { "espanol", "es" }, { "french", "fr" },
+  { "german", "de" }, { "italian", "it" }, { "portuguese", "pt" }, { "russian", "ru" },
+  { "hindi", "hi" }, { "urdu", "ur" }, { "arabic", "ar" }, { "chinese", "zh" },
+  { "mandarin", "zh" }, { "japanese", "ja" }, { "korean", "ko" }, { "turkish", "tr" },
+  { "indonesian", "id" }, { "dutch", "nl" }, { "polish", "pl" }, { "vietnamese", "vi" },
+  { "thai", "th" }, { "bengali", "bn" }, { "tamil", "ta" }, { "filipino", "tl" },
+  { "tagalog", "tl" }, { "greek", "el" }, { "hebrew", "he" }, { "swedish", "sv" },
+  { "ukrainian", "uk" }, { "persian", "fa" }, { "farsi", "fa" }, { "malay", "ms" },
+  { NULL, NULL }
+};
+
+/* A small ring of buffers so several of these can be alive at once (a code is
+ * often kept in a local while other code is looked up); anything that lives
+ * longer than a few lines copies the result. */
+static const char *lang_code_of(const char *lang) {
+  static char buf[8][8];
+  static unsigned turn = 0;
+  char *out = buf[turn & 7u];
+  turn++;
+  snprintf(out, 8, "en");
+  if (!lang || !lang[0]) return out;
+
+  char low[64];
+  size_t i = 0;
+  for (; lang[i] && i + 1 < sizeof(low); i++)
+    low[i] = (char)tolower((unsigned char)lang[i]);
+  low[i] = '\0';
+
+  for (int k = 0; k_langs[k].name; k++)
+    if (!strcmp(low, k_langs[k].name)) { snprintf(out, 8, "%s", k_langs[k].code); return out; }
+
+  /* a plain two letter code was given ("es", "zh", "de", ...) */
+  if (strlen(low) == 2 && isalpha((unsigned char)low[0]) && isalpha((unsigned char)low[1])) {
+    snprintf(out, 8, "%s", low);
+    return out;
+  }
+
+  /* "Chinese (Simplified)", "Spanish (Latin America)", ... */
+  for (int k = 0; k_langs[k].name; k++)
+    if (strstr(low, k_langs[k].name)) { snprintf(out, 8, "%s", k_langs[k].code); return out; }
+  return out;
 }
+
+static const char *recap_lang_code(const char *lang) { return lang_code_of(lang); }
+
+/* Label used in the output file name ("Title (Chinese).mp4") and the banner. */
 static const char *recap_lang_label(const char *lang) {
   const char *c = recap_lang_code(lang);
+  if (!strcmp(c, "en")) return "";
   if (!strcmp(c, "zh")) return "Chinese";
   if (!strcmp(c, "ar")) return "Arabic";
   if (!strcmp(c, "es")) return "Spanish";
-  return "";
+  if (!strcmp(c, "fr")) return "French";
+  if (!strcmp(c, "de")) return "German";
+  if (!strcmp(c, "it")) return "Italian";
+  if (!strcmp(c, "pt")) return "Portuguese";
+  if (!strcmp(c, "ru")) return "Russian";
+  if (!strcmp(c, "hi")) return "Hindi";
+  if (!strcmp(c, "ur")) return "Urdu";
+  if (!strcmp(c, "ja")) return "Japanese";
+  if (!strcmp(c, "ko")) return "Korean";
+  if (!strcmp(c, "tr")) return "Turkish";
+  if (!strcmp(c, "id")) return "Indonesian";
+  if (!strcmp(c, "nl")) return "Dutch";
+  if (!strcmp(c, "pl")) return "Polish";
+  if (!strcmp(c, "vi")) return "Vietnamese";
+  if (!strcmp(c, "th")) return "Thai";
+  if (!strcmp(c, "bn")) return "Bengali";
+  if (!strcmp(c, "ta")) return "Tamil";
+  if (!strcmp(c, "el")) return "Greek";
+  if (!strcmp(c, "he")) return "Hebrew";
+  if (!strcmp(c, "sv")) return "Swedish";
+  if (!strcmp(c, "uk")) return "Ukrainian";
+  if (!strcmp(c, "fa")) return "Persian";
+  if (!strcmp(c, "ms")) return "Malay";
+  if (!strcmp(c, "tl")) return "Filipino";
+  return "Other";
 }
+
+/* A voice that actually speaks the language; Edge TTS voice names are
+ * <locale>-<Name>Neural. */
 static const char *edge_voice_for_language(const char *lang) {
+  static const struct { const char *code; const char *voice; } v[] = {
+    { "zh", "zh-CN-YunxiNeural" },   { "ar", "ar-EG-ShakirNeural" },
+    { "es", "es-MX-JorgeNeural" },   { "fr", "fr-FR-HenriNeural" },
+    { "de", "de-DE-ConradNeural" },  { "it", "it-IT-DiegoNeural" },
+    { "pt", "pt-BR-AntonioNeural" }, { "ru", "ru-RU-DmitryNeural" },
+    { "hi", "hi-IN-MadhurNeural" },  { "ur", "ur-PK-AsadNeural" },
+    { "ja", "ja-JP-KeitaNeural" },   { "ko", "ko-KR-InJoonNeural" },
+    { "tr", "tr-TR-AhmetNeural" },   { "id", "id-ID-ArdiNeural" },
+    { "nl", "nl-NL-MaartenNeural" }, { "pl", "pl-PL-MarekNeural" },
+    { "vi", "vi-VN-NamMinhNeural" }, { "th", "th-TH-NiwatNeural" },
+    { NULL, NULL }
+  };
   const char *c = recap_lang_code(lang);
-  if (!strcmp(c, "zh")) return "zh-CN-YunxiNeural";
-  if (!strcmp(c, "ar")) return "ar-EG-ShakirNeural";
-  if (!strcmp(c, "es")) return "es-MX-JorgeNeural";
+  for (int k = 0; v[k].code; k++)
+    if (!strcmp(c, v[k].code)) return v[k].voice;
   return "en-US-ChristopherNeural";
 }
 
@@ -1412,33 +1497,7 @@ static void clip_seconds_range(int per_clip_sec, int *min_sec, int *max_sec);
 /* Wikipedia subdomain for the narration language (the article is then written in
  * that language, so its names match what the narration says). */
 static void wiki_lang_for(const char *recap_language, char *out, size_t outsz) {
-  static const struct { const char *what; const char *code; } map[] = {
-    { "english", "en" }, { "spanish", "es" }, { "espanol", "es" }, { "french", "fr" },
-    { "german", "de" }, { "italian", "it" }, { "portuguese", "pt" }, { "russian", "ru" },
-    { "hindi", "hi" }, { "urdu", "ur" }, { "arabic", "ar" }, { "chinese", "zh" },
-    { "mandarin", "zh" }, { "japanese", "ja" }, { "korean", "ko" }, { "turkish", "tr" },
-    { "indonesian", "id" }, { "dutch", "nl" }, { "polish", "pl" }, { "vietnamese", "vi" },
-    { "thai", "th" }, { "bengali", "bn" }, { "tamil", "ta" }, { "filipino", "tl" },
-    { "tagalog", "tl" }, { "greek", "el" }, { "hebrew", "he" }, { "swedish", "sv" },
-    { "ukrainian", "uk" }, { "persian", "fa" }, { "farsi", "fa" }, { "malay", "ms" },
-    { NULL, NULL }
-  };
-  snprintf(out, outsz, "en");
-  if (!recap_language || !recap_language[0]) return;
-
-  char buf[64];
-  size_t i = 0;
-  for (; recap_language[i] && i + 1 < sizeof(buf); i++)
-    buf[i] = (char)tolower((unsigned char)recap_language[i]);
-  buf[i] = '\0';
-  if (!buf[0]) return;
-
-  for (int k = 0; map[k].what; k++) {
-    if (strcmp(buf, map[k].what) == 0) { snprintf(out, outsz, "%s", map[k].code); return; }
-  }
-  /* a plain two letter code was given ("es", "de", ...) */
-  if (strlen(buf) == 2 && isalpha((unsigned char)buf[0]) && isalpha((unsigned char)buf[1]))
-    snprintf(out, outsz, "%s", buf);
+  snprintf(out, outsz, "%s", lang_code_of(recap_language));
 }
 
 /* Cut the "Plot" (or "Synopsis") section out of a plain-text article extract.
@@ -1673,6 +1732,16 @@ static char *wikipedia_plot_summary(const Config *cfg, const char *movie_title) 
        "character names come from a reliable text.", strlen(plot), title);
   free(title);
   return plot;
+}
+
+/* Is this two letter suffix a subtitle language tag rather than a marker such
+ * as ".cc" or a piece of the title? */
+static bool lang_tag_is_known(const char *tag) {
+  for (int k = 0; k_langs[k].name; k++)
+    if (k_langs[k].code[0] && k_langs[k].code[1] && !k_langs[k].code[2] &&
+        !strcmp(k_langs[k].code, tag))
+      return true;
+  return false;
 }
 
 /* Try multiple URL families, including Movie%20Scripts/<Title>%20Script.html */
@@ -2506,16 +2575,71 @@ static char *trim_copy_utf8_safe(const char *s, size_t max_bytes) {
   return out;
 }
 
-/* Latin-script languages cannot be told apart by their character ranges, so
- * Spanish is checked with the function words of both languages.  This only
- * decides whether to send ONE more request demanding the right language - a
- * false positive costs a retry, never a failed run. */
-static bool looks_english_not_spanish(const ClipPlan *items, size_t n) {
-  static const char *en[] = { " the ", " and ", " of ", " to ", " is ", " that ",
-                              " he ", " she ", " they ", " with ", NULL };
+/* Languages with a writing system of their own can be recognised from the code
+ * points alone; Latin-script languages are checked with function words.
+ *
+ * A wrong-language plan used to ship silently - which is how an English recap
+ * could come out of a Chinese run.  A false positive costs ONE retry with an
+ * explicit demand, never a failed run. */
+static bool lang_script_hit(const char *code, unsigned v) {
+  if (!strcmp(code, "zh"))
+    return (v >= 0x4E00 && v <= 0x9FFF) || (v >= 0x3400 && v <= 0x4DBF) ||
+           (v >= 0xF900 && v <= 0xFAFF);
+  if (!strcmp(code, "ja"))
+    return (v >= 0x3040 && v <= 0x30FF) || (v >= 0x31F0 && v <= 0x31FF) ||
+           (v >= 0x4E00 && v <= 0x9FFF);
+  if (!strcmp(code, "ko"))
+    return (v >= 0xAC00 && v <= 0xD7AF) || (v >= 0x1100 && v <= 0x11FF) ||
+           (v >= 0x3130 && v <= 0x318F);
+  if (!strcmp(code, "ar") || !strcmp(code, "fa") || !strcmp(code, "ur"))
+    return (v >= 0x0600 && v <= 0x06FF) || (v >= 0x0750 && v <= 0x077F) ||
+           (v >= 0xFB50 && v <= 0xFDFF) || (v >= 0xFE70 && v <= 0xFEFF);
+  if (!strcmp(code, "he")) return (v >= 0x0590 && v <= 0x05FF);
+  if (!strcmp(code, "ru") || !strcmp(code, "uk") || !strcmp(code, "bg") ||
+      !strcmp(code, "sr"))  return (v >= 0x0400 && v <= 0x04FF);
+  if (!strcmp(code, "el"))  return (v >= 0x0370 && v <= 0x03FF);
+  if (!strcmp(code, "hi") || !strcmp(code, "mr") || !strcmp(code, "ne"))
+    return (v >= 0x0900 && v <= 0x097F);
+  if (!strcmp(code, "bn"))  return (v >= 0x0980 && v <= 0x09FF);
+  if (!strcmp(code, "ta"))  return (v >= 0x0B80 && v <= 0x0BFF);
+  if (!strcmp(code, "th"))  return (v >= 0x0E00 && v <= 0x0E7F);
+  return false;
+}
+
+static bool lang_has_own_script(const char *code) {
+  static const char *codes[] = { "zh", "ja", "ko", "ar", "fa", "ur", "he",
+                                 "ru", "uk", "bg", "sr", "el", "hi", "mr",
+                                 "ne", "bn", "ta", "th", NULL };
+  for (int k = 0; codes[k]; k++) if (!strcmp(codes[k], code)) return true;
+  return false;
+}
+
+/* The function words of the target language versus English.  Any narration in
+ * the target language cannot avoid them; text written in English collects
+ * " the / and / of / to / is" instead. */
+static bool looks_english_not_latin_lang(const ClipPlan *items, size_t n, const char *code) {
   static const char *es[] = { " el ", " la ", " de ", " que ", " y ", " los ",
                               " una ", " con ", " para ", " su ", NULL };
-  size_t hit_en = 0, hit_es = 0, chars = 0;
+  static const char *fr[] = { " le ", " la ", " de ", " et ", " les ", " un ",
+                              " une ", " des ", " que ", " qui ", " dans ", NULL };
+  static const char *de[] = { " der ", " die ", " das ", " und ", " ein ",
+                              " eine ", " mit ", " auf ", " ist ", " zu ",
+                              " sich ", NULL };
+  static const char *it[] = { " il ", " la ", " di ", " che ", " e ", " un ",
+                              " una ", " per ", " con ", " non ", " sono ", NULL };
+  static const char *pt[] = { " o ", " a ", " de ", " que ", " e ", " um ",
+                              " uma ", " com ", " para ", " seu ", NULL };
+  const char **target = NULL;
+  if (!strcmp(code, "es")) target = es;
+  else if (!strcmp(code, "fr")) target = fr;
+  else if (!strcmp(code, "de")) target = de;
+  else if (!strcmp(code, "it")) target = it;
+  else if (!strcmp(code, "pt")) target = pt;
+  if (!target) return false;
+
+  static const char *en[] = { " the ", " and ", " of ", " to ", " is ", " that ",
+                              " he ", " she ", " they ", " with ", NULL };
+  size_t hit_en = 0, hit_other = 0, chars = 0;
   for (size_t i = 0; i < n; i++) {
     const char *p = items[i].narration;
     if (!p) continue;
@@ -2524,26 +2648,40 @@ static bool looks_english_not_spanish(const ClipPlan *items, size_t n) {
       const char *q = p;
       while ((q = strcasestr_local(q, en[k])) != NULL) { hit_en++; q += strlen(en[k]); }
     }
-    for (int k = 0; es[k]; k++) {
+    for (int k = 0; target[k]; k++) {
       const char *q = p;
-      while ((q = strcasestr_local(q, es[k])) != NULL) { hit_es++; q += strlen(es[k]); }
+      while ((q = strcasestr_local(q, target[k])) != NULL) { hit_other++; q += strlen(target[k]); }
     }
-    if (strcasestr_local(p, "\xC3\xA1") || strcasestr_local(p, "\xC3\xB1") ||
-        strcasestr_local(p, "\xC2\xBF") || strcasestr_local(p, "\xC2\xA1")) hit_es += 2;
+    /* accents the language cannot avoid either */
+    if (!strcmp(code, "es") && (strcasestr_local(p, "\xC3\xA1") ||
+                                strcasestr_local(p, "\xC3\xB1") ||
+                                strcasestr_local(p, "\xC2\xBF") ||
+                                strcasestr_local(p, "\xC2\xA1"))) hit_other += 2;
+    if (!strcmp(code, "fr") && (strcasestr_local(p, "\xC3\xA9") ||
+                                strcasestr_local(p, "\xC3\xA8") ||
+                                strcasestr_local(p, "\xC3\xA7") ||
+                                strcasestr_local(p, "\xC3\xA0"))) hit_other += 2;
+    if (!strcmp(code, "de") && (strcasestr_local(p, "\xC3\xBC") ||
+                                strcasestr_local(p, "\xC3\xB6") ||
+                                strcasestr_local(p, "\xC3\xA4") ||
+                                strcasestr_local(p, "\xC3\x9F"))) hit_other += 2;
+    if (!strcmp(code, "it") && (strcasestr_local(p, "\xC3\xA0") ||
+                                strcasestr_local(p, "\xC3\xB2") ||
+                                strcasestr_local(p, "\xC3\xAC"))) hit_other += 2;
+    if (!strcmp(code, "pt") && (strcasestr_local(p, "\xC3\xA3") ||
+                                strcasestr_local(p, "\xC3\xB5") ||
+                                strcasestr_local(p, "\xC3\xA7"))) hit_other += 2;
   }
   if (chars < 80) return false;
-  return hit_en >= 8 && hit_en > hit_es * 3;
+  return hit_en >= 8 && hit_en > hit_other * 3;
 }
 
-/* True when the recap must be Chinese/Arabic/Spanish but the plan's narrations
- * are mostly in another language - i.e. the model ignored the language rule. */
+/* True when the recap had to be in `code` but the plan's narrations are mostly
+ * written in something else - i.e. the model ignored the language rule. */
 static bool plan_language_mismatch(const ClipPlan *items, size_t n, const char *code) {
-  bool want_cjk = !strcmp(code, "zh");
-  bool want_ar  = !strcmp(code, "ar");
-  if (!want_cjk && !want_ar) {
-    if (!strcmp(code, "es")) return looks_english_not_spanish(items, n);
-    return false;
-  }
+  if (!code || !strcmp(code, "en")) return false;
+  if (!lang_has_own_script(code)) return looks_english_not_latin_lang(items, n, code);
+
   size_t total = 0, hit = 0;
   for (size_t i = 0; i < n; i++) {
     const unsigned char *p = (const unsigned char *)items[i].narration;
@@ -2555,10 +2693,7 @@ static bool plan_language_mismatch(const ClipPlan *items, size_t n, const char *
       else if ((*p & 0xF0) == 0xE0)  { v = ((unsigned)(*p & 0x0F) << 12) | ((unsigned)(p[1] & 0x3F) << 6) | (p[2] & 0x3F); l = 3; total++; }
       else if ((*p & 0xF8) == 0xF0)  { v = 0x10000u; l = 4; total++; }
       else                            { l = 1; continue; }
-      if (l > 1) {
-        if (want_cjk && ((v >= 0x4E00 && v <= 0x9FFF) || (v >= 0x3400 && v <= 0x4DBF))) hit++;
-        if (want_ar  && v >= 0x0600 && v <= 0x06FF) hit++;
-      }
+      if (l > 1 && lang_script_hit(code, v)) hit++;
       p += l;
     }
   }
@@ -3600,6 +3735,56 @@ static bool caption_font_available(const char *font) {
   return file_exists(font);
 }
 
+/* A font that actually has the glyphs of this language.  The per-language
+ * setting in the panel wins; without it a Windows system font for that script
+ * is used, because the bundled Inter font has no CJK and no Arabic letters at
+ * all - the captions would come out as a row of empty boxes.  Returns "" when
+ * nothing suitable was found (the caller then falls back and warns). */
+static const char *caption_font_for_language(const Config *cfg, const char *lang) {
+  const char *code = recap_lang_code(lang);
+
+  if (!strcmp(code, "zh") && cfg->caption_font_zh[0]) return cfg->caption_font_zh;
+  if (!strcmp(code, "ar") && cfg->caption_font_ar[0]) return cfg->caption_font_ar;
+  if (!strcmp(code, "es") && cfg->caption_font_es[0]) return cfg->caption_font_es;
+
+  static const char *zh_fonts[] = {
+    "C:/Windows/Fonts/msyh.ttc",      /* Microsoft YaHei  */
+    "C:/Windows/Fonts/msyhbd.ttc",
+    "C:/Windows/Fonts/msjh.ttc",      /* Microsoft JhengHei */
+    "C:/Windows/Fonts/simhei.ttf",    /* SimHei           */
+    "C:/Windows/Fonts/simsun.ttc",    /* SimSun           */
+    "C:/Windows/Fonts/meiryo.ttc",    /* Meiryo (kana)    */
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    NULL
+  };
+  static const char *ko_fonts[] = {
+    "C:/Windows/Fonts/malgun.ttf",    /* Malgun Gothic (Hangul) */
+    "C:/Windows/Fonts/malgunbd.ttf",
+    NULL
+  };
+  static const char *ar_fonts[] = {
+    "C:/Windows/Fonts/arial.ttf",
+    "C:/Windows/Fonts/segoeui.ttf",
+    "C:/Windows/Fonts/tahoma.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    NULL
+  };
+  const char **cand = NULL;
+  if (!strcmp(code, "ko")) cand = ko_fonts;
+  else if (!strcmp(code, "zh") || !strcmp(code, "ja")) cand = zh_fonts;
+  else if (!strcmp(code, "ar") || !strcmp(code, "fa") || !strcmp(code, "ur")) cand = ar_fonts;
+  if (cand) {
+    for (int k = 0; cand[k]; k++)
+      if (file_exists(cand[k])) return cand[k];
+    if (!strcmp(code, "ko")) {          /* fall back to a CJK font for Hangul */
+      for (int k = 0; zh_fonts[k]; k++)
+        if (file_exists(zh_fonts[k])) return zh_fonts[k];
+    }
+    return "";
+  }
+  return cfg->caption_font;
+}
+
 /* Build a chain of up to three stacked drawtext filters for the caption.
  * Two ffmpeg tokenizers see this string.  Level 1 (the filtergraph parser)
  * copies single-quoted sections verbatim but ends them at a raw apostrophe;
@@ -3608,8 +3793,11 @@ static bool caption_font_available(const char *font) {
  * splitter chokes on " and \ too), and every ':' is written \: so it
  * survives level 2 as a literal colon.  Wrapped lines become separate
  * drawtext filters - no newline characters anywhere. */
-#define CAP_MAX_SEG  48
-#define CAP_MAX_LINE 96
+/* Word-wrapped captions: one segment = one sentence-ish chunk (at most two
+ * lines), one line = one drawtext filter.  The limits are generous because the
+ * character budget per line shrinks for wide scripts (see caption_line_cap). */
+#define CAP_MAX_SEG  512
+#define CAP_MAX_LINE 1024
 
 /* ---------------------------------------------------------------------------
  * Caption timing.
@@ -3652,6 +3840,52 @@ static bool cp_is_letter(unsigned v) {
 static unsigned cp_lower(unsigned v) {
   if (v >= 'A' && v <= 'Z') return v + 32;
   return v;
+}
+
+/* How wide is a character of this script on screen, in units of the font size?
+ * CJK characters are square, Latin letters average about half the height and
+ * Arabic a little more than half.  This is what decides how many characters fit
+ * on one caption line, so a Chinese caption does not run off both sides of the
+ * frame and a Latin one is not cut in half by the vertical (9:16) crop. */
+static double cp_width_factor(unsigned v) {
+  if (v == ' ' || v == '\t') return 0.30;
+  if (cp_is_cjk(v)) return 1.00;
+  if (cp_is_arabic(v)) return 0.58;
+  if (v >= '0' && v <= '9') return 0.60;
+  if (v >= 'A' && v <= 'Z') return 0.62;
+  if (!cp_is_letter(v)) return 0.40;      /* punctuation */
+  return 0.52;
+}
+
+static double caption_avg_width_factor(const unsigned *cp, size_t n) {
+  if (n == 0) return 0.52;
+  double sum = 0;
+  size_t counted = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (cp[i] == ' ' || cp[i] == '\t') continue;   /* spaces do not decide width */
+    sum += cp_width_factor(cp[i]);
+    counted++;
+  }
+  if (counted == 0) return 0.52;
+  return sum / (double)counted;
+}
+
+/* Characters per caption line.  Sized for the NARROW CENTRE STRIP that the
+ * vertical render keeps: ffmpeg_make_vertical crops to the middle 60% of the
+ * width, so anything wider would be cut off at the sides in the Short. */
+static int caption_line_cap(const unsigned *cp, size_t nr, int frame_w, int frame_h) {
+  double w = frame_w > 0 ? (double)frame_w : 1280.0;
+  double h = frame_h > 0 ? (double)frame_h : 720.0;
+  double font_px = h * 0.035;
+  double usable = w * 0.56;
+  double avg = caption_avg_width_factor(cp, nr);
+  int cap = (int)(usable / (avg * font_px + 1e-9));
+  if (cap > 42) cap = 42;      /* never a wall of text, whatever the frame is */
+  /* Square characters read best with fewer of them per line, and 24 of them
+     still fit the middle 60% of a 1080p frame with room to spare. */
+  if (avg >= 0.85 && cap > 24) cap = 24;
+  if (cap < 12) cap = 12;      /* never one word per line either */
+  return cap;
 }
 
 /* Vowel groups are a good enough stand-in for syllables: "extraordinary" (5)
@@ -3992,7 +4226,7 @@ static void align_boundaries_to_pauses(double *bound, const double *w_cum, int n
 }
 
 static char *caption_filter_chain(const char *text, const char *font, double dur,
-                                  const CaptionAudio *au) {
+                                  const CaptionAudio *au, int frame_w, int frame_h) {
   if (!text || !text[0] || dur <= 0.1) return NULL;
 
   /* Clean: curly apostrophe for ', space for " \\ and newlines. */
@@ -4036,8 +4270,12 @@ static char *caption_filter_chain(const char *text, const char *font, double dur
   }
   if (nr == 0) { free(clean); free(cp); free(cl); free(boff); return NULL; }
 
-  /* Split into sentence chunks (Latin, CJK and Arabic terminators), <= 78
-     runes each, so every sentence of the narration gets its own window. */
+  /* Split into sentence chunks (Latin, CJK and Arabic terminators).  One chunk
+     holds at most two lines, and how many characters fit on a line depends on
+     the script and the frame - see caption_line_cap. */
+  const int line_cap = caption_line_cap(cp, nr, frame_w, frame_h);
+  const size_t seg_cap = (size_t)line_cap * 2;
+
   size_t seg_s[CAP_MAX_SEG], seg_e[CAP_MAX_SEG];
   int nseg = 0;
   size_t cur = 0;
@@ -4045,36 +4283,41 @@ static char *caption_filter_chain(const char *text, const char *font, double dur
     while (cur < nr && cp[cur] == ' ') cur++;
     if (cur >= nr) break;
     size_t j = cur, soft = 0;
-    while (j < nr && j - cur < 78) {
+    while (j < nr && j - cur < seg_cap) {
       unsigned v = cp[j];
       bool term = (v == '.' || v == '!' || v == '?' || v == 0x3002u ||
                    v == 0xFF01u || v == 0xFF1Fu || v == 0x061Fu || v == 0x061Bu);
       bool softp = (v == ',' || v == ';' || v == ':' || v == ' ' ||
                     v == 0xFF0Cu || v == 0x3001u || v == 0x060Cu);
-      if (softp) soft = j + 1;
+      /* Break before a space (the space belongs to neither line) but after a
+         comma or colon, which stay with the words they follow. */
+      if (v == ' ') soft = j;
+      else if (softp) soft = j + 1;
       j++;
       if (term && j - cur >= 16) break;
     }
     if (j >= nr) j = nr;
-    else if (j - cur >= 78 && soft > cur + 8) j = soft;
+    else if (j - cur >= seg_cap && soft > cur + 8) j = soft;
     seg_s[nseg] = cur; seg_e[nseg] = j; nseg++;
     cur = j;
   }
   if (nseg == 0) { free(clean); free(cp); free(cl); free(boff); return NULL; }
 
-  /* Wrap each chunk into <= 2 lines of <= 42 runes (space break if any). */
+  /* Wrap each chunk into <= 2 lines of <= line_cap runes (break on a space when
+     there is one, never in the middle of a word unless the word is too long). */
   size_t ls[CAP_MAX_LINE], le[CAP_MAX_LINE], lseg[CAP_MAX_LINE];
+  int lrow[CAP_MAX_LINE];       /* which stacked slot the line was drawn in */
   int nline = 0;
   for (int g = 0; g < nseg && nline + 2 <= CAP_MAX_LINE; g++) {
     size_t w0 = seg_s[g], we = seg_e[g];
     int nl = 0;
     while (we > w0 && nl < 2) {
       size_t take = we - w0;
-      if (take > 42) {
-        take = 42;
+      if (take > (size_t)line_cap) {
+        take = (size_t)line_cap;
         size_t t2 = take;
-        while (t2 > 20 && cp[w0 + t2] != ' ') t2--;
-        if (t2 > 20) take = t2;
+        while (t2 > (size_t)line_cap / 2 && cp[w0 + t2] != ' ') t2--;
+        if (t2 > (size_t)line_cap / 2) take = t2;
       }
       ls[nline] = w0; le[nline] = w0 + take; lseg[nline] = (size_t)g; nline++;
       w0 += take;
@@ -4123,7 +4366,7 @@ static char *caption_filter_chain(const char *text, const char *font, double dur
   }
   font_esc[fo] = '\0';
 
-  size_t chain_cap = (size_t)nline * 320 + 1024;
+  size_t chain_cap = (size_t)nline * 400 + 1024;
   char *chain = (char *)malloc(chain_cap);
   if (!chain) die("OOM");
   chain[0] = '\0';
@@ -4131,11 +4374,21 @@ static char *caption_filter_chain(const char *text, const char *font, double dur
   for (int g = 0; g < nseg; g++) {
     double t0 = bound[g];
     double t1 = (g == nseg - 1) ? au->stop : bound[g + 1];
+
+    /* How many lines does this chunk use?  The FIRST line goes on top: ffmpeg
+       stacks drawtext filters upward, and numbering them the other way round
+       put the second line of a sentence above the first - so the viewer read
+       the end of a sentence before its beginning ("it shows the next sentence
+       before the present one"). */
+    int lines_here = 0;
+    for (int pj = 0; pj < nline; pj++) if (lseg[pj] == (size_t)g) lines_here++;
+
     for (int li = 0; li < nline; li++) {
       if (lseg[li] != (size_t)g) continue;
       int stack = 0;
       for (int pj = 0; pj < li; pj++) if (lseg[pj] == lseg[li]) stack++;
-      char line_txt[300];
+      int row = lines_here - 1 - stack;      /* 0 = bottom line of the chunk */
+      char line_txt[600];
       size_t b0 = boff[ls[li]], b1 = boff[le[li]];
       size_t eo = 0;
       for (size_t q = b0; q < b1 && eo + 2 < sizeof(line_txt); q++) {
@@ -4143,17 +4396,51 @@ static char *caption_filter_chain(const char *text, const char *font, double dur
         line_txt[eo++] = clean[q];
       }
       line_txt[eo] = '\0';
+      lrow[li] = row;
       int w = snprintf(chain + off, chain_cap - off,
                        ",drawtext=fontfile='%s':expansion=none:"
                        "text='%s':fontcolor=white:borderw=2:bordercolor=black:"
                        "fontsize=h*0.035:x=(w-text_w)/2:y=h-h*0.07-th-%d*h*0.045:"
                        "enable='between(t,%.2f,%.2f)'",
-                       font_esc, line_txt, stack, t0, t1);
+                       font_esc, line_txt, row, t0, t1);
       if (w < 0 || (size_t)w >= chain_cap - off) goto cap_done;
       off += (size_t)w;
     }
   }
 cap_done:
+
+  /* One log line per clip so caption problems can be spotted (and tested) from
+     the log instead of from the finished video: the chunks in the order they
+     appear, each with the seconds it is on screen and its first words. */
+  {
+    char line[900];
+    size_t o = 0;
+    o += (size_t)snprintf(line + o, sizeof(line) - o, "Captions: %d chunk(s)", nseg);
+    for (int g = 0; g < nseg && g < 5 && o + 140 < sizeof(line); g++) {
+      size_t ra = seg_s[g], rb = seg_e[g];
+      if (rb - ra > 26) rb = ra + 26;
+      char seg_txt[128];
+      size_t so = 0;
+      for (size_t q = boff[ra]; q < boff[rb] && so + 1 < sizeof(seg_txt); q++) {
+        char ch = clean[q];
+        if (ch == '"' || ch == '\\' || ch == '\n' || ch == '\r') ch = ' ';
+        seg_txt[so++] = ch;
+      }
+      seg_txt[so] = '\0';
+      o += (size_t)snprintf(line + o, sizeof(line) - o, " | %.2f-%.2fs rows[",
+                            bound[g], (g == nseg - 1) ? au->stop : bound[g + 1]);
+      bool first_row = true;
+      for (int li = 0; li < nline && o + 8 < sizeof(line); li++) {
+        if (lseg[li] != (size_t)g) continue;
+        o += (size_t)snprintf(line + o, sizeof(line) - o, "%s%d", first_row ? "" : ",", lrow[li]);
+        first_row = false;
+      }
+      o += (size_t)snprintf(line + o, sizeof(line) - o, "] \"%s%s\"",
+                            seg_txt, (seg_e[g] - seg_s[g] > 26) ? "..." : "");
+    }
+    if (nseg > 5) o += (size_t)snprintf(line + o, sizeof(line) - o, " | +%d more", nseg - 5);
+    logi("%s", line);
+  }
   free(clean); free(cp); free(cl); free(boff);
   return chain;
 }
@@ -4161,7 +4448,8 @@ cap_done:
 static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
                                       int start_s, int end_s,
                                       const char *narration_mp3, double narration_dur,
-                                      const char *out_mp4, const char *caption) {
+                                      const char *out_mp4, const char *caption,
+                                      int frame_w, int frame_h) {
   const double max_speedup = cfg->max_video_speedup;
 
   double orig_seg_dur = (double)(end_s - start_s);
@@ -4220,7 +4508,8 @@ static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
     if (npauses == 0)
       logw("No pauses could be found in the narration of this clip - caption timing "
            "stays estimated (is the portable ffmpeg complete?).");
-    cap_esc = caption_filter_chain(caption, cfg->caption_font, narration_dur, &au);
+    cap_esc = caption_filter_chain(caption, cfg->caption_font, narration_dur, &au,
+                                   frame_w, frame_h);
     free(pauses);
     free(plens);
   }
@@ -4506,15 +4795,26 @@ static void clip_seconds_range(int per_clip_sec, int *min_sec, int *max_sec) {
  * model to write 2.6 words per second of clip (see STEP 4); Chinese is counted
  * in characters (about 4 per second), Arabic is spoken a little slower. */
 static double lang_speech_units_per_sec(const char *code) {
-  if (!strcmp(code, "zh")) return 4.0;
-  if (!strcmp(code, "ar")) return 2.1;
+  if (!strcmp(code, "zh")) return 4.0;      /* characters per second */
+  if (!strcmp(code, "ja")) return 4.5;
+  if (!strcmp(code, "ko")) return 4.0;
+  if (!strcmp(code, "th")) return 4.0;
+  if (!strcmp(code, "ar")) return 2.1;      /* words per second */
   return 2.6;
 }
 
-/* Words for a space-separated language, CJK codepoints for Chinese. */
+/* Languages that are not written with spaces between words are measured in
+ * characters, not words. */
+static bool lang_counts_chars(const char *code) {
+  return !strcmp(code, "zh") || !strcmp(code, "ja") ||
+         !strcmp(code, "ko") || !strcmp(code, "th");
+}
+
+/* Words for a space-separated language, characters for Chinese/Japanese/Korean/
+ * Thai. */
 static double count_speech_units(const char *text, const char *code) {
   if (!text) return 0.0;
-  if (strcmp(code, "zh") != 0) {
+  if (!lang_counts_chars(code)) {
     double words = 0.0;
     bool in_word = false;
     for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
@@ -4532,10 +4832,11 @@ static double count_speech_units(const char *text, const char *code) {
     else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) {
       v = ((unsigned)(*p & 0x0F) << 12) | ((unsigned)(p[1] & 0x3F) << 6) | (p[2] & 0x3F); l = 3;
     } else if ((*p & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) { v = 0x10000u; l = 4; }
-    /* CJK ideographs, kana and radicals count as one character each; CJK
+    /* CJK ideographs, kana and Hangul count as one character each; CJK
        punctuation and Latin letters do not count (Latin words are not what the
        Chinese narration is measured in anyway). */
-    if (v >= 0x2E80 && v <= 0x9FFF && !(v >= 0x3000 && v <= 0x303F)) chars += 1.0;
+    if ((v >= 0x2E80 && v <= 0x9FFF && !(v >= 0x3000 && v <= 0x303F)) ||
+        (v >= 0xAC00 && v <= 0xD7AF) || (v >= 0x0E00 && v <= 0x0E7F)) chars += 1.0;
     p += l;
   }
   return chars;
@@ -4577,15 +4878,28 @@ static bool find_subtitle_srt(const char *movie_title, char *out, size_t outsz, 
     if (bl > 12 && str_icmp(base + bl - 12, "_modified.srt") == 0) continue;
     if (bl > 15 && str_icmp(base + bl - 15, "_placeholder.srt") == 0) continue;
 
-    /* Language-tagged files ("... .zh.srt"): keep only the wanted language. */
+    /* Language-tagged files: two letter tags are languages, so "Toy Story.fr.srt"
+       belongs to a French run, "Toy Story.en.cc.srt" is an English file and
+       "Toy Story.zh.srt" is not English.  Strip the tags and keep the file only
+       when the language that was asked for is among them. */
     size_t name_end = bl - 4; /* without ".srt" */
-    if (name_end >= 3 && base[name_end - 3] == '.') {
-      char tag[3] = { base[name_end - 2], base[name_end - 1], 0 };
-      if (!strcmp(tag, "en") || !strcmp(tag, "zh") || !strcmp(tag, "ar") || !strcmp(tag, "es")) {
-        if (strcmp(tag, code) != 0) continue;
-        name_end -= 3;
+    bool wanted = false, other_lang = false;
+    while (name_end >= 3 && base[name_end - 3] == '.') {
+      char c0 = base[name_end - 2], c1 = base[name_end - 1];
+      if (!isalpha((unsigned char)c0) || !isalpha((unsigned char)c1)) break;
+      char tag[3];
+      tag[0] = (char)tolower((unsigned char)c0);
+      tag[1] = (char)tolower((unsigned char)c1);
+      tag[2] = 0;
+      bool is_lang = lang_tag_is_known(tag);
+      if (!is_lang && strcmp(tag, "cc") != 0) break;   /* ".sdh", ".part1", ... */
+      if (is_lang) {
+        if (!strcmp(tag, code)) wanted = true;
+        else other_lang = true;
       }
+      name_end -= 3;
     }
+    if (other_lang && !wanted) continue;
 
     char cand[256];
     size_t co = 0;
@@ -4868,7 +5182,10 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   else
     snprintf(out_base, sizeof(out_base), "%s", movie_title);
 
-  const char *lang_code = recap_lang_code(cfg->recap_language);
+  char lang_code_buf[8];
+  snprintf(lang_code_buf, sizeof(lang_code_buf), "%s",
+           recap_lang_code(cfg->recap_language));
+  const char *lang_code = lang_code_buf;
   char srt_in[PATH_MAX], srt_mod[PATH_MAX], script_txt[PATH_MAX];
   if (strcmp(lang_code, "en") != 0)
     snprintf(srt_in, sizeof(srt_in), "scripts/srt_files/%s.%s.srt", movie_title, lang_code);
@@ -5059,17 +5376,18 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
          cfg->recap_language);
     char lang_note[600];
     snprintf(lang_note, sizeof(lang_note),
-             "CRITICAL: the previous answer was written in English and was rejected. "
-             "EVERY narration string MUST be written entirely in %s. Do not output "
-             "English.", cfg->recap_language);
+             "CRITICAL: the previous answer was written in the wrong language and was "
+             "rejected. EVERY narration string MUST be written entirely in %s, in that "
+             "language's own characters. Do not output English.", cfg->recap_language);
     free_clip_plan_list(&plan);
     plan = openai_make_plan(cfg, movie_title, subs_seconds,
                             imsdb_script ? imsdb_script : "",
                             plot_summary ? plot_summary : "", subs_placeholder,
                             num_clips, per_clip_sec, NULL, NULL, lang_note);
     if (plan.count > 0 && plan_language_mismatch(plan.items, plan.count, lang_code))
-      logw("The AI is still answering in English - the %s recap may come out in "
-           "English. Try a stronger model for this language.", cfg->recap_language);
+      logw("The AI is still answering in the wrong language - the %s recap may come "
+           "out in that language instead. Try a stronger model for this language.",
+           cfg->recap_language);
   }
 
   /* Length audit.  With "recap_minutes" set, the narrations have to add up to
@@ -5086,8 +5404,8 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
       int mn = 0, mx = 0;
       clip_seconds_range(per_clip_sec, &mn, &mx);
       double per_sec = lang_speech_units_per_sec(lang_code);
-      bool in_chars = !strcmp(lang_code, "zh");
-      const char *unit = in_chars ? "Chinese characters" : "words";
+      bool in_chars = lang_counts_chars(lang_code);
+      const char *unit = in_chars ? "characters" : "words";
       char len_note[900];
       snprintf(len_note, sizeof(len_note),
                "CRITICAL LENGTH RULE: the narrations of the previous answer added up to "
@@ -5172,10 +5490,26 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   bool non_en = cfg->recap_language[0] && str_icmp(cfg->recap_language, "english") != 0;
   if (non_en && cfg->tts_provider == TTS_PIPER)
     logw("Recap language is %s but the installed Piper voice speaks English - switch to Edge TTS or install a matching Piper voice.", cfg->recap_language);
-  if (cfg->captions && non_en)
-    logw("Captions use %s - if %s characters render as boxes, set the per-language caption font in the panel (caption_font_zh / caption_font_ar / caption_font_es) to a font with those glyphs (Noto Sans SC for Chinese, Noto Sans Arabic for Arabic).", cfg->caption_font, cfg->recap_language);
+  if (cfg->captions && non_en && lang_has_own_script(recap_lang_code(cfg->recap_language))) {
+    const char *lf = caption_font_for_language(cfg, cfg->recap_language);
+    if (lf && lf[0] && strcmp(lf, cfg->caption_font) != 0)
+      logi("Caption font for %s: %s", recap_lang_code(cfg->recap_language), lf);
+    else
+      logw("Captions for %s use %s, which has no %s glyphs - they will render as "
+           "boxes. Set the per-language caption font in the panel (caption_font_zh "
+           "for Chinese/Japanese/Korean, caption_font_ar for Arabic/Persian/Urdu) "
+           "to e.g. C:/Windows/Fonts/msyh.ttc or C:/Windows/Fonts/arial.ttf.",
+           cfg->recap_language, cfg->caption_font, cfg->recap_language);
+  }
   if (cfg->captions && !caption_font_available(cfg->caption_font))
     logw("Captions are on but resources/Inter-Regular.ttf is missing - skipping burnt-in subtitles.");
+
+  /* Caption wrapping is sized from the frame: the vertical (9:16) render keeps
+     only the middle 60% of the width, so a caption that is wider than that
+     would be cut off at the sides of the Short. */
+  int frame_w = 0, frame_h = 0;
+  if (!ffprobe_video_dimensions(movie_path, &frame_w, &frame_h)) { frame_w = 1280; frame_h = 720; }
+  logi("Movie frame: %dx%d", frame_w, frame_h);
 
   size_t made = 0;
   for (size_t i = 0; i < plan.count; i++) {
@@ -5214,7 +5548,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     report_progress(GEN_STAGE_CLIP, movie_index, movie_total, (int)(i + 1), (int)plan.count, movie_title);
     logi("Building clip %zu: %d -> %d sec (narr=%.2fs) => %s", i + 1, start_s, end_s, nar_dur, out_clip);
     if (!ffmpeg_make_adjusted_clip(cfg, movie_path, start_s, end_s, nar_mp3, nar_dur, out_clip,
-                                     plan.items[i].narration)) {
+                                     plan.items[i].narration, frame_w, frame_h)) {
       logw("Failed to build adjusted clip %zu", i + 1);
       continue;
     }
@@ -5417,9 +5751,13 @@ after_bgm:
   return true;
 }
 
-static bool output_already_exists(const char *movie_title) {
+/* One recap per language, so each language has its own file ("Title.mp4" for
+ * English, "Title (Chinese).mp4" for the Chinese pass).  Checking only the
+ * English file used to skip the whole movie, and with it every other language
+ * the user had just asked for. */
+static bool output_file_exists(const char *file_name) {
   char out[PATH_MAX];
-  snprintf(out, sizeof(out), "output/%s.mp4", movie_title);
+  snprintf(out, sizeof(out), "output/%s", file_name);
   return file_exists(out);
 }
 
@@ -5556,12 +5894,6 @@ int run_generation(void) {
     char title[PATH_MAX];
     strip_ext(names[i], title, sizeof(title));
 
-    if (output_already_exists(title)) {
-      logi("Skipping %s: output/%s.mp4 already exists.", title, title);
-      logi("Delete that file (or move the movie back from movies_retired/) to render it again.");
-      continue;
-    }
-
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "movies/%s", names[i]);
 
@@ -5575,6 +5907,7 @@ int run_generation(void) {
 
     int nl = cfg.n_recap_languages > 0 ? cfg.n_recap_languages : 1;
     bool any_ok = false;
+    int ran = 0;
     for (int li = 0; li < nl; li++) {
       if (generator_cancel_requested()) break;
       Config lcfg = cfg;
@@ -5582,12 +5915,17 @@ int run_generation(void) {
       if (lcfg.tts_provider == TTS_EDGE && cfg.tts_voice_auto)
         snprintf(lcfg.tts_voice, sizeof(lcfg.tts_voice), "%s",
                  edge_voice_for_language(lcfg.recap_language));
-      const char *lcode = recap_lang_code(lcfg.recap_language);
-      const char *lfont = !strcmp(lcode, "zh") ? cfg.caption_font_zh
-                        : !strcmp(lcode, "ar") ? cfg.caption_font_ar
-                        : !strcmp(lcode, "es") ? cfg.caption_font_es : "";
-      if (lfont[0])
+      char lcode_buf[8];
+      snprintf(lcode_buf, sizeof(lcode_buf), "%s", recap_lang_code(lcfg.recap_language));
+      const char *lcode = lcode_buf;
+      const char *lfont = caption_font_for_language(&cfg, lcfg.recap_language);
+      if (lfont && lfont[0])
         snprintf(lcfg.caption_font, sizeof(lcfg.caption_font), "%s", lfont);
+      else if (lang_has_own_script(lcode))
+        logw("No caption font with %s glyphs was found on this machine (checked the "
+             "panel setting and the usual system fonts) - captions will fall back to "
+             "%s and %s characters may show as boxes.", lcfg.recap_language,
+             cfg.caption_font, lcfg.recap_language);
       const char *label = recap_lang_label(lcfg.recap_language);
       if (nl > 1) {
         snprintf(banner, sizeof(banner), "--- Recap %d/%d: %s ---", li + 1, nl,
@@ -5595,12 +5933,28 @@ int run_generation(void) {
         emit_line("");
         emit_line(banner);
       }
+
+      char out_name[PATH_MAX];
+      if (label[0]) snprintf(out_name, sizeof(out_name), "%s (%s).mp4", title, label);
+      else          snprintf(out_name, sizeof(out_name), "%s.mp4", title);
+      if (output_file_exists(out_name)) {
+        logi("Skipping %s: output/%s already exists.", title, out_name);
+        logi("Delete that file (or move the movie back from movies_retired/) to render it again.");
+        continue;
+      }
+
+      ran++;
       if (process_movie(&lcfg, path, title, num_clips, (int)(i + 1), (int)n_names,
                         label, li == nl - 1)) {
         any_ok = true;
       } else {
         break;
       }
+    }
+    if (ran == 0) {
+      logi("Skipping %s: every requested recap already exists in output/. Delete the "
+           "file(s) there to render one again.", title);
+      continue;                       /* not a failure, just nothing to do */
     }
     if (any_ok) {
       processed++;
