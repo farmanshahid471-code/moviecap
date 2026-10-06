@@ -3014,6 +3014,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "STEP 3: OPENING AND ENDING\n"
     "\n"
     "- The FIRST narration starts immediately with \"The story begins in...\" or \"The movie starts with...\" and in the first two sentences sets up who the main character is, where and when they are, and what they want or have lost. Then the story starts moving. No greeting, no channel intro, no \"welcome\", no \"today we\", no title, no year-only line.\n"
+    "- The opening must describe what happens at the START of the movie (the first clip's own time range), and the character named first is the film's protagonist in those first scenes - the one INPUT C introduces first. Never open on a side character or on a later scene, and never name a character before the moment they actually appear.\n"
     "- The LAST narration finishes the story (the outcome for the main characters) and then ends EXACTLY with: \"%s\"\n"
     "%s"
     "\n"
