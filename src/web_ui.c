@@ -590,14 +590,20 @@ static int count_files(const char *dir, const char *ext1, const char *ext2) {
 
 static const char *CONFIG_PATH = "config.json";
 
+/* Never show more of an API key than the caller needs: the "sk-" prefix says
+   which provider the key belongs to and the last four characters let the user
+   tell two keys apart, but nothing else is exposed (the panel page can end up
+   on a screenshot or a stream). */
 static void mask_key(const char *in, char *out, size_t outsz) {
   if (!in || !in[0]) { snprintf(out, outsz, "%s", ""); return; }
   size_t n = strlen(in);
   if (n <= 8) { snprintf(out, outsz, "********"); return; }
-  char head[8], tail[8];
-  snprintf(head, sizeof(head), "%s", in);
+  char tail[8];
   snprintf(tail, sizeof(tail), "%s", in + n - 4);
-  snprintf(out, outsz, "%s...%s", head, tail);
+  if (n >= 3 && in[0] == 's' && in[1] == 'k' && in[2] == '-')
+    snprintf(out, outsz, "sk-****%s", tail);
+  else
+    snprintf(out, outsz, "****%s", tail);
 }
 
 static cJSON *config_read_json(void) {
@@ -694,6 +700,7 @@ static cJSON *config_read_json(void) {
   ADD_BOOL("retire_movies", "retire_movies", true);
   ADD_BOOL("auto_transcribe", "auto_transcribe", true);
   ADD_BOOL("use_wikipedia_plot", "use_wikipedia_plot", true);
+  ADD_BOOL("offline_planner", "offline_planner", false);
 
 #undef ADD_STR
 #undef ADD_NUM
@@ -757,7 +764,7 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
   }
 
   const char *bool_keys[] = { "bgm_enabled", "make_vertical", "retire_movies", "captions", "auto_transcribe",
-                             "use_wikipedia_plot", NULL };
+                             "use_wikipedia_plot", "offline_planner", NULL };
   for (int i = 0; bool_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, bool_keys[i]);
     if (!cJSON_IsBool(v)) continue;
@@ -1006,6 +1013,7 @@ static const char *PAGE_HTML[] = {
   "      <label class='chk'><input type='checkbox' id='use_wikipedia_plot'> Fetch the plot summary from Wikipedia <span class='hint'>names come from a real text</span></label>",
   "      <label class='f'>Wikipedia API <span class='hint'>empty = pick the language automatically from the narration language</span></label>",
   "      <input type='text' id='wikipedia_base_url' placeholder='https://en.wikipedia.org/w/api.php'>",
+  "      <label class='chk'><input type='checkbox' id='offline_planner'> Keep the raw-subtitle fallback <span class='hint'>off = skip the movie instead of narrating the subtitles when the AI plan fails</span></label>",
   "      <label class='chk'><input type='checkbox' id='retire_movies'> Move processed movies to movies_retired</label>",
   "      <div class='row'>",
   "        <button id='btnSave' class='btn'>SAVE SETTINGS</button>",
@@ -1132,7 +1140,7 @@ static const char *PAGE_HTML[] = {
   "               'tts_base_url','tts_voice','tts_language','tts_model','whisper_model','caption_font',",
   "               'caption_font_zh','caption_font_ar','caption_font_es','wikipedia_base_url'];",
   "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','tts_rate'];",
-  "  var bools = ['bgm_enabled','make_vertical','retire_movies','captions','use_wikipedia_plot'];",
+  "  var bools = ['bgm_enabled','make_vertical','retire_movies','captions','use_wikipedia_plot','offline_planner'];",
   "  texts.forEach(function(k){ el(k).value = c[k] || ''; });",
   "  nums.forEach(function(k){ el(k).value = c[k]; });",
   "  bools.forEach(function(k){ el(k).checked = !!c[k]; });",
@@ -1261,7 +1269,7 @@ static const char *PAGE_HTML[] = {
   "  if (!rl.length) rl.push('');",
   "  body.recap_languages = rl;",
   "  ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','tts_rate'].forEach(function(k){ body[k] = Number(el(k).value); });",
-  "  ['bgm_enabled','make_vertical','retire_movies','captions','use_wikipedia_plot'].forEach(function(k){ body[k] = el(k).checked; });",
+  "  ['bgm_enabled','make_vertical','retire_movies','captions','use_wikipedia_plot','offline_planner'].forEach(function(k){ body[k] = el(k).checked; });",
   "  if (el('open_api_key').value) body.open_api_key = el('open_api_key').value;",
   "  if (el('elevenlabs_api_key').value) body.elevenlabs_api_key = el('elevenlabs_api_key').value;",
   "  if (el('tts_api_key').value) body.tts_api_key = el('tts_api_key').value;",

@@ -269,6 +269,7 @@ Edit `config.json` in the project root (or use the **Settings** card in the web 
 
   "use_wikipedia_plot": true,
   "wikipedia_base_url": "",
+  "offline_planner": false,
 
   "min_clips": 20,
   "max_clips": 30,
@@ -305,6 +306,7 @@ Edit `config.json` in the project root (or use the **Settings** card in the web 
 | `retire_movies` | `true` | set `false` to leave processed files in `movies\` |
 | `use_wikipedia_plot` | `true` | download the movie's plot summary from Wikipedia and hand it to the model as the source of truth for character names (see *Character names*) |
 | `wikipedia_base_url` | empty | override the API endpoint; empty picks `https://<language>.wikipedia.org/w/api.php` from the narration language |
+| `offline_planner` | `false` | set `true` to keep the old fallback that narrates the **raw subtitle lines** when no AI plan arrives; by default such a movie is skipped with the reason in the log |
 
 ### Character names (Wikipedia plot summary)
 
@@ -351,6 +353,49 @@ Character names also drive the naming rules in the prompt itself: one fixed name
 a short introduction on first appearance, an explicit ban on inventing/merging/swapping names,
 pronouns that can never point at two people, and no mention of a character who is not part of the
 moment being narrated.
+
+### When the AI plan fails
+
+The narration must come from the model. If no usable clip plan arrives, the app **skips the
+movie** and says why, because the only thing the offline fallback can do is read the subtitle
+lines out loud - a recap that is really just the subtitles:
+
+```
+No AI clip plan for Heat - skipping this movie instead of turning the raw subtitle lines into the narration.
+The messages above name the exact failure (API key, model id, base URL, quota, output limit).
+```
+
+Before giving up it retries in this order (each one is a single extra request):
+
+1. without the IMSDb script, when the provider rejects the request size;
+2. the provider's OpenAI-style `/chat/completions` endpoint, when an Anthropic-style
+   `/anthropic` endpoint fails;
+3. **bare JSON** - when the answer arrived but was not a usable clip plan (markdown fences,
+   prose around the JSON, `"start": "120"` as text, a bare array, ...; all of those are
+   accepted directly now as well);
+4. a bigger output budget, when the provider says the reply stopped at `max_tokens`;
+5. full-length narrations, when `recap_minutes` is set and the total speech came out far
+   short of it.
+
+Set `"offline_planner": true` if you prefer a raw-subtitle video over no video.
+
+### Recap length (`recap_minutes`)
+
+`"recap_minutes": 20` divides the target by the clip count and asks the model for that many
+seconds of *speech* per clip (`20 min / 30 clips => 40 s per clip => about 90-125 words`).
+The prompt says so twice (STEP 4 and STEP 5), and the run checks afterwards that the plan's
+narrations really add up to the requested speaking time. If they do not, it asks the model
+once more for full-length narrations, and then reports the truth:
+
+```
+Plan speech: about 6.9 min of narration for the 20 min target (30 clips).
+The narrations are much shorter than the 20 minute target (6.9 min of speech) - asking the model once more for full-length narrations.
+Recap length: 12.1 min of the 20 min target (60%).
+```
+
+The reason the number matters: each clip's video is sped up (at most `max_video_speedup`) to
+fit its narration, so **the finished recap can never be longer than the narrations are** - a
+short script shortens the video, it does not stretch.
 
 ### Free narration (no ElevenLabs key)
 
@@ -484,6 +529,10 @@ If no music files exist, output will be narration-only.
   tracks, per-CD files glued together) is sorted first and the log says so, because scrambled timestamps
   make the whole recap (clip ranges, narration and captions) come out in the wrong order. An already
   cached `_modified.srt` from an older run is re-converted automatically when its cues are not in order.
+- The plan is checked for the requested language: Chinese and Arabic by script, Spanish against the
+  English function words. A plan that comes back in the wrong language is rejected once and
+  re-requested with an explicit "every narration must be in <language>" demand.
+
 - Script fetching (IMSDb) is **best effort** and **optional**. If it fails, the program continues with subtitles only.
   If OpenAI rejects the request because the script makes it too large, it automatically retries without the script.
 
@@ -523,7 +572,10 @@ Saved to `tiktok_output\`.
 | Working directory | had to be started from the project root | finds the project folder automatically |
 | Console | — | UTF-8 console output, app icon + version info |
 | Controlling a run | start only | **web control panel** + desktop **STOP** button: cancel at the next step boundary |
-| Settings | hand-edit `config.json` | clip count, speed cap, volumes, BGM/vertical/retire toggles, the Wikipedia plot-summary switch and API base URLs are read from `config.json` and editable in the web panel |
+| Settings | hand-edit `config.json` | clip count, speed cap, volumes, BGM/vertical/retire toggles, the Wikipedia plot-summary switch, the raw-subtitle fallback switch and API base URLs are read from `config.json` and editable in the web panel |
+| API keys in the panel | the key was echoed back with its first characters | only `****` plus the last four characters are shown |
+| No usable AI plan | quietly narrated the raw subtitle lines | the movie is skipped with the reason in the log, unless `"offline_planner": true` |
+| Clip-plan parsing | numbers only, `"clips"` only | also accepts `"start": "120"`, floats, a bare array, `[start, end, text]` triples and `text`/`voiceover` narration keys, and says which objects it dropped |
 | Network errors | any transport failure (DNS/TLS/timeout) aborted the whole run with `exit(1)` | logged as a warning; the movie is skipped and the rest of the queue continues |
 | URLs | raw titles pasted into subtitle/script URLs | percent-encoded, so `Amélie's Test (2001)` works |
 | Testing | needs real API keys | `tools\mock_api_server.py` + the base-URL settings run the whole pipeline offline |

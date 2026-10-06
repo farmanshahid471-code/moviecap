@@ -500,6 +500,7 @@ typedef struct {
   bool   bgm_enabled;        /* default true */
   bool   make_vertical;      /* default true */
   bool   retire_movies;      /* default true */
+  bool   offline_planner;    /* default false: never ship raw subtitle text */
 } Config;
 
 static void cfg_set_str(char *dst, size_t dstsz, const cJSON *node) {
@@ -668,6 +669,9 @@ static Config load_config_json(const char *path) {
   c.bgm_enabled       = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "bgm_enabled"), true);
   c.make_vertical     = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "make_vertical"), true);
   c.retire_movies     = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "retire_movies"), true);
+  /* The offline planner narrates the raw subtitle lines.  That is not a recap,
+     so it is off unless the user explicitly asks for it. */
+  c.offline_planner   = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "offline_planner"), false);
 
   if (c.min_clips > c.max_clips) c.min_clips = c.max_clips;
 
@@ -1387,6 +1391,9 @@ static bool imsdb_fetch_script_to_file(const char *url, const char *dest_txt_pat
 /* Declared here (defined further down): the Wikipedia fetch below scrubs the
  * text it gets from the article before handing it to the model. */
 static char *sanitize_utf8_lossy(const char *in);
+/* Defined with the offline fallback helpers below; the planner needs the
+   same numbers the prompt uses for the per-clip length. */
+static void clip_seconds_range(int per_clip_sec, int *min_sec, int *max_sec);
 
 /* ---------------------------------------------------------------------------
  * Plot summary context (Wikipedia).
@@ -2273,6 +2280,36 @@ static void plan_normalize(ClipPlanList *lst) {
     logw("Dropped %zu unusable or overlapping clip(s) from the plan.", dropped);
 }
 
+/* A number, or a string that holds one ("120", "120.5", " 120 s"). */
+static bool json_int_value(const cJSON *v, int *out) {
+  if (cJSON_IsNumber(v)) { *out = (int)((double)v->valuedouble + (v->valuedouble < 0 ? -0.5 : 0.5)); return true; }
+  if (cJSON_IsString(v) && v->valuestring) {
+    const char *p = v->valuestring;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!(*p == '-' || (*p >= '0' && *p <= '9'))) return false;
+    char *endp = NULL;
+    double d = strtod(p, &endp);
+    if (endp == p) return false;
+    *out = (int)(d + (d < 0 ? -0.5 : 0.5));
+    return true;
+  }
+  return false;
+}
+
+/* The first of the given keys that holds a non-empty string. */
+static cJSON *json_first_string(cJSON *obj, ...) {
+  va_list ap;
+  va_start(ap, obj);
+  const char *key;
+  cJSON *found = NULL;
+  while ((key = va_arg(ap, const char *)) != NULL) {
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsString(v) && v->valuestring && v->valuestring[0]) { found = v; break; }
+  }
+  va_end(ap);
+  return found;
+}
+
 static ClipPlanList parse_clip_plan_json(const char *json_text) {
   ClipPlanList out = {0};
   cJSON *root = cJSON_Parse(json_text);
@@ -2297,7 +2334,10 @@ static ClipPlanList parse_clip_plan_json(const char *json_text) {
   }
   if (!root) return out;
 
+  /* Accept the array under "clips" - or the bare array, which some models
+     return when they drop the wrapper. */
   cJSON *clips = cJSON_GetObjectItemCaseSensitive(root, "clips");
+  if (!cJSON_IsArray(clips) && cJSON_IsArray(root)) clips = root;
   if (!cJSON_IsArray(clips)) {
     cJSON_Delete(root);
     return out;
@@ -2309,22 +2349,55 @@ static ClipPlanList parse_clip_plan_json(const char *json_text) {
   out.items = (ClipPlan *)calloc(n, sizeof(ClipPlan));
   if (!out.items) die("OOM");
   out.count = 0;
+  size_t skipped = 0;
 
   for (size_t i = 0; i < n; i++) {
     cJSON *obj = cJSON_GetArrayItem(clips, (int)i);
-    if (!cJSON_IsObject(obj)) continue;
+    if (cJSON_IsArray(obj) && cJSON_GetArraySize(obj) >= 3) {
+      /* ["start", "end", "narration"] - a shape some models fall back to. */
+      cJSON *s3 = cJSON_GetArrayItem(obj, 0);
+      cJSON *e3 = cJSON_GetArrayItem(obj, 1);
+      cJSON *t3 = cJSON_GetArrayItem(obj, 2);
+      int st3 = 0, en3 = 0;
+      if (json_int_value(s3, &st3) && json_int_value(e3, &en3) &&
+          cJSON_IsString(t3) && t3->valuestring && t3->valuestring[0]) {
+        out.items[out.count].start = st3;
+        out.items[out.count].end = en3;
+        out.items[out.count].narration = str_dup(t3->valuestring);
+        out.count++;
+      } else {
+        skipped++;
+      }
+      continue;
+    }
+    if (!cJSON_IsObject(obj)) { skipped++; continue; }
 
     cJSON *s = cJSON_GetObjectItemCaseSensitive(obj, "start");
     cJSON *e = cJSON_GetObjectItemCaseSensitive(obj, "end");
-    cJSON *nar = cJSON_GetObjectItemCaseSensitive(obj, "narration");
+    cJSON *nar = json_first_string(obj, "narration", "text", "narration_text", "voiceover", NULL);
 
-    if (!cJSON_IsNumber(s) || !cJSON_IsNumber(e) || !cJSON_IsString(nar) || !nar->valuestring) continue;
+    /* Numbers are what the prompt asks for, but models do send "start": "120"
+       (or 120.5, or with a stray space) - that must not throw the whole plan
+       away, because an empty plan is what drops a run onto the offline
+       subtitle planner. */
+    int st = 0, en = 0;
+    if (!json_int_value(s, &st) || !json_int_value(e, &en) ||
+        !nar || !nar->valuestring || !nar->valuestring[0]) {
+      skipped++;
+      continue;
+    }
 
-    out.items[out.count].start = s->valueint;
-    out.items[out.count].end = e->valueint;
+    out.items[out.count].start = st;
+    out.items[out.count].end = en;
     out.items[out.count].narration = str_dup(nar->valuestring);
     out.count++;
   }
+
+  if (skipped)
+    logw("%zu clip object(s) in the reply had an unusable shape and were dropped "
+         "(expected {\"start\":<number>,\"end\":<number>,\"narration\":\"...\"}).", skipped);
+  if (clips == root)
+    logw("The model returned the bare clips array instead of {\"clips\":[...]} - accepted it anyway.");
 
   cJSON_Delete(root);
   plan_normalize(&out);
@@ -2433,12 +2506,44 @@ static char *trim_copy_utf8_safe(const char *s, size_t max_bytes) {
   return out;
 }
 
-/* True when the recap must be Chinese/Arabic but the plan's narrations are
- * mostly other scripts - i.e. the model ignored the language rule. */
+/* Latin-script languages cannot be told apart by their character ranges, so
+ * Spanish is checked with the function words of both languages.  This only
+ * decides whether to send ONE more request demanding the right language - a
+ * false positive costs a retry, never a failed run. */
+static bool looks_english_not_spanish(const ClipPlan *items, size_t n) {
+  static const char *en[] = { " the ", " and ", " of ", " to ", " is ", " that ",
+                              " he ", " she ", " they ", " with ", NULL };
+  static const char *es[] = { " el ", " la ", " de ", " que ", " y ", " los ",
+                              " una ", " con ", " para ", " su ", NULL };
+  size_t hit_en = 0, hit_es = 0, chars = 0;
+  for (size_t i = 0; i < n; i++) {
+    const char *p = items[i].narration;
+    if (!p) continue;
+    chars += strlen(p);
+    for (int k = 0; en[k]; k++) {
+      const char *q = p;
+      while ((q = strcasestr_local(q, en[k])) != NULL) { hit_en++; q += strlen(en[k]); }
+    }
+    for (int k = 0; es[k]; k++) {
+      const char *q = p;
+      while ((q = strcasestr_local(q, es[k])) != NULL) { hit_es++; q += strlen(es[k]); }
+    }
+    if (strcasestr_local(p, "\xC3\xA1") || strcasestr_local(p, "\xC3\xB1") ||
+        strcasestr_local(p, "\xC2\xBF") || strcasestr_local(p, "\xC2\xA1")) hit_es += 2;
+  }
+  if (chars < 80) return false;
+  return hit_en >= 8 && hit_en > hit_es * 3;
+}
+
+/* True when the recap must be Chinese/Arabic/Spanish but the plan's narrations
+ * are mostly in another language - i.e. the model ignored the language rule. */
 static bool plan_language_mismatch(const ClipPlan *items, size_t n, const char *code) {
   bool want_cjk = !strcmp(code, "zh");
   bool want_ar  = !strcmp(code, "ar");
-  if (!want_cjk && !want_ar) return false;
+  if (!want_cjk && !want_ar) {
+    if (!strcmp(code, "es")) return looks_english_not_spanish(items, n);
+    return false;
+  }
   size_t total = 0, hit = 0;
   for (size_t i = 0; i < n; i++) {
     const unsigned char *p = (const unsigned char *)items[i].narration;
@@ -2516,8 +2621,10 @@ static ClipPlanList openai_make_plan(const Config *cfg,
                                      int num_clips,
                                      int per_clip_sec,
                                      bool *out_retry_without_script,
-                                     bool demand_language) {
+                                     bool *out_retry_json_only,
+                                     const char *correction_note) {
   if (out_retry_without_script) *out_retry_without_script = false;
+  if (out_retry_json_only) *out_retry_json_only = false;
 
   const size_t MAX_SUB_CHARS    = 320000;
   const size_t MAX_SCRIPT_CHARS = 80000;
@@ -2576,13 +2683,13 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     plot_utf8 = plot_utf8 ? plot_utf8 : str_dup("");
   }
 
-  char demand_note[320];
+  /* A note appended to the end of the prompt on a retry: the language demand,
+     a "your narrations are far too short" complaint, or "send JSON only".
+     Built by the caller so every retry goes through the same path. */
+  char demand_note[1800];
   demand_note[0] = '\0';
-  if (demand_language && non_en_lang)
-    snprintf(demand_note, sizeof(demand_note),
-             "\nCRITICAL: the previous answer was written in English and was "
-             "rejected. EVERY narration string MUST be written entirely in %s. "
-             "Do not output English.\n", cfg->recap_language);
+  if (correction_note && correction_note[0])
+    snprintf(demand_note, sizeof(demand_note), "\n%s\n", correction_note);
 
   char sys_lang_extra[160];
   sys_lang_extra[0] = '\0';
@@ -2645,21 +2752,16 @@ static ClipPlanList openai_make_plan(const Config *cfg,
      tts_rate = 110 (see config.json); the tuning band is 2.4 (audio gets cut
      off / sped up too much) to 2.8 (voice ends before the clip does). */
   const double wps = 2.6;
-  int min_sec, max_sec, sent_lo, sent_hi;
+  int min_sec = 0, max_sec = 0, sent_lo, sent_hi;
+  clip_seconds_range(per_clip_sec, &min_sec, &max_sec);
   if (per_clip_sec >= 20) {
-    min_sec = per_clip_sec * 8 / 10;
-    max_sec = per_clip_sec * 12 / 10;
     sent_lo = per_clip_sec / 12;
     sent_hi = sent_lo + 2;
     if (sent_lo < 3) sent_lo = 3;
   } else {
-    min_sec = 8;
-    max_sec = 16;
     sent_lo = 3;
     sent_hi = 5;
   }
-  if (min_sec < 6) min_sec = 6;
-  if (max_sec < min_sec + 3) max_sec = min_sec + 3;
 
   /* Word counts are meaningless for Chinese (characters) and off for Arabic
      (spoken slower), so those languages get an explicit override. */
@@ -2695,15 +2797,36 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   snprintf(lang_label, sizeof(lang_label), "%s",
            cfg->recap_language[0] ? cfg->recap_language : "English");
 
-  /* STEP 4: words = seconds x 2.6, at least 25 words per clip. */
-  char pace_line[340];
+  /* STEP 4.  These numbers MUST follow min_sec/max_sec.  With a fixed
+     "12 s = 31 words, 16 s = 42 words" example in front of it, a model asked
+     for 40-second clips writes 12-second narrations: the clip is then sped up
+     (at most max_video_speedup) and cut down to the narration, which is how a
+     20-minute recap came out at 12 minutes. */
+  char pace_line[520];
+  int wlo = (int)((double)min_sec * wps + 0.5);
+  int whi = (int)((double)max_sec * wps + 0.5);
+  int wmin = wlo < 25 ? 25 : wlo;
   snprintf(pace_line, sizeof(pace_line),
-           "- The voice speaks about %.1f words per second. Aim for narration "
-           "word count = clip length in seconds x %.1f (for example 12 s = about "
-           "%d words, 16 s = about %d words). Never fewer than 25 words per clip. "
+           "- The voice speaks about %.1f words per second. A %d-second narration "
+           "needs about %d words and a %d-second one about %d words, so aim for "
+           "%d-%d words per narration. Never fewer than %d words in one clip: a "
+           "narration that is too short for its clip gets the clip shortened to "
+           "match, and the finished recap then comes out shorter than asked. "
            "Use %d-%d short sentences per clip.\n",
-           wps, wps, (int)(12.0 * wps + 0.5), (int)(16.0 * wps + 0.5),
-           sent_lo, sent_hi);
+           wps, min_sec, wlo, max_sec, whi, wlo, whi, wmin, sent_lo, sent_hi);
+
+  /* With a recap-minutes target the model also needs to know the total, or it
+     spreads a short script over many clips and the video comes out short. */
+  char total_line[400];
+  total_line[0] = '\0';
+  if (per_clip_sec > 0) {
+    int total_words = (int)((double)num_clips * (double)per_clip_sec * wps + 0.5);
+    snprintf(total_line, sizeof(total_line),
+             "- Together the %d narrations must add up to about %.1f minutes of "
+             "speech (roughly %d words). Each clip carries its own full narration: "
+             "no one-line summaries, no empty narrations.\n",
+             num_clips, (double)num_clips * (double)per_clip_sec / 60.0, total_words);
+  }
 
   const char *prompt_fmt =
     "Movie: %s\n"
@@ -2741,6 +2864,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "\n"
     "- Third person, present tense, strictly chronological. You are telling the STORY, not describing the video. Write the action as it happens: \"Hank hits the gas and gets the car out of there\", not \"Hank hit the gas\" and not \"Hank will escape\".\n"
     "- One continuous voice. Each clip must feel like the next sentence of the same story, not a separate summary. The reader should never notice where one clip ends and the next begins.\n"
+    "- Never copy a subtitle line word for word and never list dialogue. Retell everything in your own words; the narration must read like one continuous story, never like subtitles being read out.\n"
     "- Fast pace. Every sentence moves the plot forward: someone does something, something goes wrong, someone decides, something changes. No scenery, no mood-setting, no reflection.\n"
     "- Short, simple, spoken sentences (about 8-16 words each). Plain words. No long clauses, no semicolons, no brackets, no emojis, no stage directions. Write for the ear, not for the eye.\n"
     "- Link events with cause and effect: \"because\", \"so\", \"after\", \"but\", \"until\", \"which means\". Jump in time or place with a short connector: \"Meanwhile,\", \"Later,\", \"That night,\", \"The next morning,\", \"Hours later,\", \"Back at the base,\".\n"
@@ -2762,6 +2886,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "\n"
     "%s"
     "%s"
+    "%s"
     "- The narration must be spoken-length for the time range, so the audio fills the clip without silence and without needing to be cut off.\n"
     "- Do not leave plot holes between clips. Together the clips must tell the complete story from beginning to ending, with no important event skipped.\n"
     "\n"
@@ -2777,7 +2902,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "\n"
     "1. Is every character named the same way in every clip, and spelled the same way?\n"
     "2. Does the first narration begin with \"The story begins...\" and the last end with the exact closing line?\n"
-    "3. Does every narration have enough words for its time range (seconds x 2.6, minimum 25)?\n"
+    "3. Does every narration have at least the minimum word count from STEP 4 for its own time range?\n"
     "4. Is any sentence describing the screen, the camera, or giving an opinion? Remove it.\n"
     "5. Is anything in the narration not supported by the subtitles or script? Remove it.\n"
     "6. Is the output valid JSON with nothing else around it?\n"
@@ -2809,6 +2934,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
                       closing_extra,
                       pace_line,           /* STEP 4                    */
                       words_extra,
+                      total_line,          /* STEP 4: the whole recap   */
                       num_clips,           /* STEP 5: how many clips    */
                       min_sec, max_sec);   /* STEP 5: range length      */
   if (plen < 0) die("snprintf failed building prompt");
@@ -2822,7 +2948,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
            title_utf8, lang_label, num_clips, min_sec, max_sec, language_rule,
            subs_trim, placeholder_note, scr_trim, title_utf8, plot_trim,
            title_utf8, closing_line, closing_extra, pace_line, words_extra,
-           num_clips, min_sec, max_sec);
+           total_line, num_clips, min_sec, max_sec);
   plen = strlen(prompt);
   if (demand_len) memcpy(prompt + plen, demand_note, demand_len + 1);
 
@@ -3027,6 +3153,7 @@ have_response:;
     logw("AI reply contained no usable clip plan - most likely the JSON was cut "
          "off (output limit) or the model refused.");
     logw("Reply started: %.300s", out_text);
+    if (out_retry_json_only) *out_retry_json_only = true;
   }
   warn_if_plan_was_cut_short(resp.data, plan.count);
 
@@ -4361,6 +4488,67 @@ static void srt_write_cue(FILE *f, int idx, int start_s, int end_s, const char *
           text);
 }
 
+/* The per-clip seconds range the prompt asks for.  Kept in one place so the
+ * pipeline can talk about the same numbers the model was given. */
+static void clip_seconds_range(int per_clip_sec, int *min_sec, int *max_sec) {
+  if (per_clip_sec >= 20) {
+    *min_sec = per_clip_sec * 8 / 10;
+    *max_sec = per_clip_sec * 12 / 10;
+  } else {
+    *min_sec = 8;
+    *max_sec = 16;
+  }
+  if (*min_sec < 6) *min_sec = 6;
+  if (*max_sec < *min_sec + 3) *max_sec = *min_sec + 3;
+}
+
+/* How much speech the narration of a plan adds up to.  The prompt tells the
+ * model to write 2.6 words per second of clip (see STEP 4); Chinese is counted
+ * in characters (about 4 per second), Arabic is spoken a little slower. */
+static double lang_speech_units_per_sec(const char *code) {
+  if (!strcmp(code, "zh")) return 4.0;
+  if (!strcmp(code, "ar")) return 2.1;
+  return 2.6;
+}
+
+/* Words for a space-separated language, CJK codepoints for Chinese. */
+static double count_speech_units(const char *text, const char *code) {
+  if (!text) return 0.0;
+  if (strcmp(code, "zh") != 0) {
+    double words = 0.0;
+    bool in_word = false;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+      bool space = (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r');
+      if (space) in_word = false;
+      else if (!in_word) { in_word = true; words += 1.0; }
+    }
+    return words;
+  }
+  double chars = 0.0;
+  for (const unsigned char *p = (const unsigned char *)text; *p; ) {
+    unsigned v = 0; size_t l = 1;
+    if (*p < 0x80) v = *p;
+    else if ((*p & 0xE0) == 0xC0 && p[1]) { v = ((unsigned)(*p & 0x1F) << 6) | (p[1] & 0x3F); l = 2; }
+    else if ((*p & 0xF0) == 0xE0 && p[1] && p[2]) {
+      v = ((unsigned)(*p & 0x0F) << 12) | ((unsigned)(p[1] & 0x3F) << 6) | (p[2] & 0x3F); l = 3;
+    } else if ((*p & 0xF8) == 0xF0 && p[1] && p[2] && p[3]) { v = 0x10000u; l = 4; }
+    /* CJK ideographs, kana and radicals count as one character each; CJK
+       punctuation and Latin letters do not count (Latin words are not what the
+       Chinese narration is measured in anyway). */
+    if (v >= 0x2E80 && v <= 0x9FFF && !(v >= 0x3000 && v <= 0x303F)) chars += 1.0;
+    p += l;
+  }
+  return chars;
+}
+
+/* Seconds of spoken narration in the whole plan. */
+static double plan_speech_seconds(const ClipPlan *items, size_t n, const char *code) {
+  double units = 0.0;
+  for (size_t i = 0; i < n; i++) units += count_speech_units(items[i].narration, code);
+  double per_sec = lang_speech_units_per_sec(code);
+  return per_sec > 0.0 ? units / per_sec : 0.0;
+}
+
 /* Find a user-provided SRT whose name approximately matches the movie title.
  * Names are normalized to lowercase alphanumerics, so "Toy Story 5 (2026)
  * [1080p].mp4" matches "Toy Story 5.srt". Files ending in _modified.srt or
@@ -4835,38 +5023,125 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
          "and the model's memory. Set \"use_wikipedia_plot\": false to silence this, "
          "or drop a summary at scripts/srt_files/%s_plot.txt.", movie_title);
 
-  bool retry_no_script = false;
+  bool retry_no_script = false, retry_json_only = false;
   ClipPlanList plan = openai_make_plan(cfg, movie_title, subs_seconds,
                                        imsdb_script ? imsdb_script : "",
                                        plot_summary ? plot_summary : "",
                                        subs_placeholder,
-                                       num_clips, per_clip_sec, &retry_no_script,
-                                       false);
+                                       num_clips, per_clip_sec,
+                                       &retry_no_script, &retry_json_only, NULL);
 
   if (plan.count == 0 && retry_no_script && imsdb_script && imsdb_script[0]) {
     logw("OpenAI request failed with IMSDb context; retrying without IMSDb script for %s", movie_title);
     plan = openai_make_plan(cfg, movie_title, subs_seconds, "", plot_summary ? plot_summary : "",
-                            subs_placeholder, num_clips, per_clip_sec, NULL, false);
+                            subs_placeholder, num_clips, per_clip_sec, NULL, NULL, NULL);
+  }
+
+  /* The request succeeded but the answer was not a usable clip plan (markdown
+     fences, prose around the JSON, a different shape).  Going straight to the
+     offline planner would emit the raw subtitle lines as the "recap", so ask
+     once more for bare JSON first. */
+  if (plan.count == 0 && retry_json_only) {
+    logw("Asking the model once more for the clip plan as bare JSON.");
+    plan = openai_make_plan(cfg, movie_title, subs_seconds,
+                            imsdb_script ? imsdb_script : "",
+                            plot_summary ? plot_summary : "", subs_placeholder,
+                            num_clips, per_clip_sec, NULL, NULL,
+                            "CRITICAL: the previous answer could not be used. Reply with ONE "
+                            "JSON object and nothing else - no markdown fences, no comments, "
+                            "no text before or after it, no trailing commas, and start/end as "
+                            "plain whole numbers of seconds: "
+                            "{\"clips\":[{\"start\":120,\"end\":150,\"narration\":\"...\"}]}");
   }
 
   if (plan.count > 0 && plan_language_mismatch(plan.items, plan.count, lang_code)) {
     logw("The AI plan came back in the wrong language - demanding %s and retrying once.",
          cfg->recap_language);
+    char lang_note[600];
+    snprintf(lang_note, sizeof(lang_note),
+             "CRITICAL: the previous answer was written in English and was rejected. "
+             "EVERY narration string MUST be written entirely in %s. Do not output "
+             "English.", cfg->recap_language);
     free_clip_plan_list(&plan);
     plan = openai_make_plan(cfg, movie_title, subs_seconds,
                             imsdb_script ? imsdb_script : "",
                             plot_summary ? plot_summary : "", subs_placeholder,
-                            num_clips, per_clip_sec, NULL, true);
+                            num_clips, per_clip_sec, NULL, NULL, lang_note);
     if (plan.count > 0 && plan_language_mismatch(plan.items, plan.count, lang_code))
       logw("The AI is still answering in English - the %s recap may come out in "
            "English. Try a stronger model for this language.", cfg->recap_language);
   }
 
+  /* Length audit.  With "recap_minutes" set, the narrations have to add up to
+     the requested speaking time: a model that writes one-liners per clip makes
+     the video come out far shorter than asked (the clip is sped up at most
+     max_video_speedup and then cut down to the narration). */
+  if (per_clip_sec > 0 && cfg->recap_minutes >= 1.0 && plan.count > 0) {
+    double target_sec = cfg->recap_minutes * 60.0;
+    double speech = plan_speech_seconds(plan.items, plan.count, lang_code);
+    logi("Plan speech: about %.1f min of narration for the %.0f min target (%zu clips).",
+         speech / 60.0, cfg->recap_minutes, plan.count);
+
+    if (speech < target_sec * 0.8) {
+      int mn = 0, mx = 0;
+      clip_seconds_range(per_clip_sec, &mn, &mx);
+      double per_sec = lang_speech_units_per_sec(lang_code);
+      bool in_chars = !strcmp(lang_code, "zh");
+      const char *unit = in_chars ? "Chinese characters" : "words";
+      char len_note[900];
+      snprintf(len_note, sizeof(len_note),
+               "CRITICAL LENGTH RULE: the narrations of the previous answer added up to "
+               "only about %d seconds of speech, but the target for this video is about "
+               "%d seconds (%.0f minutes). Every clip must carry a FULL narration of "
+               "roughly %d-%d %s (a %d to %d second clip needs that much speech) - not "
+               "one line, not a short summary. Rewrite the whole plan with full-length "
+               "narrations and keep the same JSON shape.",
+               (int)speech, (int)target_sec, cfg->recap_minutes,
+               (int)((double)mn * per_sec + 0.5), (int)((double)mx * per_sec + 0.5),
+               unit, mn, mx);
+      logw("The narrations are much shorter than the %.0f minute target (%.1f min of "
+           "speech) - asking the model once more for full-length narrations.",
+           cfg->recap_minutes, speech / 60.0);
+      ClipPlanList longer = openai_make_plan(cfg, movie_title, subs_seconds,
+                                             imsdb_script ? imsdb_script : "",
+                                             plot_summary ? plot_summary : "",
+                                             subs_placeholder, num_clips, per_clip_sec,
+                                             NULL, NULL, len_note);
+      double speech2 = longer.count ? plan_speech_seconds(longer.items, longer.count, lang_code) : 0.0;
+      if (longer.count > 0 && speech2 > speech) {
+        logok("Second attempt: about %.1f min of narration (was %.1f min).",
+              speech2 / 60.0, speech / 60.0);
+        free_clip_plan_list(&plan);
+        plan = longer;
+        speech = speech2;
+      } else {
+        free_clip_plan_list(&longer);
+        logw("The model still wrote short narrations - expect a recap near %.1f min "
+             "instead of %.0f min. A stronger model, fewer clips (min_clips/max_clips) "
+             "or a lower max_video_speedup change this.",
+             speech / 60.0, cfg->recap_minutes);
+      }
+    }
+  }
+
+  if (plan.count == 0 && !cfg->offline_planner) {
+    logw("No AI clip plan for %s - skipping this movie instead of turning the raw "
+         "subtitle lines into the narration.", movie_title);
+    logw("The messages above name the exact failure (API key, model id, base URL, "
+         "quota, output limit). Fix that and run again; set \"offline_planner\": true "
+         "in config.json only if you really want the raw-subtitle fallback video.");
+    free(subs_seconds);
+    if (imsdb_script) free(imsdb_script);
+    free(plot_summary);
+    free_clip_plan_list(&plan);
+    return false;
+  }
+
   if (plan.count == 0) {
     logi("No AI plan available - falling back to the offline planner.");
     logw("Offline planner = the narration will be RAW SUBTITLE LINES, not a retold "
-         "story. Check the warnings above for why the AI request failed (API key, "
-         "model id, base URL, quota).");
+         "story (offline_planner=true in config.json). Check the warnings above for "
+         "why the AI request failed (API key, model id, base URL, quota).");
     if (strcmp(lang_code, "en") != 0)
       logw("The offline fallback planner cannot translate - this pass will stay in "
            "the subtitle language, NOT %s!", cfg->recap_language);
@@ -4975,6 +5250,21 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     return false;
   }
   logok("Final duration: %.2f seconds", final_dur);
+
+  /* Say out loud how close the recap got to the requested length: a model that
+     under-writes the narrations cannot be fixed downstream, the video simply
+     has to be sped up (capped by max_video_speedup) and comes out short. */
+  if (cfg->recap_minutes >= 1.0) {
+    double want = cfg->recap_minutes * 60.0;
+    logi("Recap length: %.1f min of the %.0f min target (%.0f%%).",
+         final_dur / 60.0, cfg->recap_minutes, 100.0 * final_dur / want);
+    if (final_dur < want * 0.85)
+      logw("This recap is much shorter than the %.0f minutes asked for. Each clip "
+           "was sped up at most %.2fx and then cut down to its narration, so the "
+           "spoken lines were too short for their clip ranges. Try a stronger model, "
+           "fewer clips (min_clips/max_clips), or set \"recap_minutes\": 0.",
+           cfg->recap_minutes, cfg->max_video_speedup);
+  }
 
   /* Cancelled after the clips were joined: keep the recap we already have and
      skip the optional BGM / vertical steps instead of burning more time. */
@@ -5267,7 +5557,8 @@ int run_generation(void) {
     strip_ext(names[i], title, sizeof(title));
 
     if (output_already_exists(title)) {
-      logi("Skipping %s (already in output/)", title);
+      logi("Skipping %s: output/%s.mp4 already exists.", title, title);
+      logi("Delete that file (or move the movie back from movies_retired/) to render it again.");
       continue;
     }
 
