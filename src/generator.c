@@ -1306,11 +1306,27 @@ static MemBuf anthropic_post_messages(const Config *cfg, const char *sys_prompt,
   char endpoint[560];
   anthropic_endpoint(cfg->openai_base_url, endpoint, sizeof(endpoint));
 
+  char mdl_lc[128];
+  {
+    size_t i = 0;
+    for (; cfg->openai_model[i] && i + 1 < sizeof(mdl_lc); i++)
+      mdl_lc[i] = (char)tolower((unsigned char)cfg->openai_model[i]);
+    mdl_lc[i] = '\0';
+  }
+  bool is_deepseek = strstr(mdl_lc, "deepseek") != NULL;
+
   cJSON *req = cJSON_CreateObject();
   cJSON_AddStringToObject(req, "model", cfg->openai_model);
-  /* DeepSeek caps replies at 8192 tokens; Anthropic models accept far more. */
-  cJSON_AddNumberToObject(req, "max_tokens",
-                          strstr(cfg->openai_model, "deepseek") ? 8000 : 16000);
+  /* A full clip plan is thousands of tokens; a small budget silently
+     truncates the JSON and the run falls back to the offline planner. */
+  cJSON_AddNumberToObject(req, "max_tokens", 32000);
+  if (is_deepseek) {
+    /* DeepSeek models may default to thinking behind this gateway; the
+       reasoning would eat the output budget and truncate the plan. */
+    cJSON *th = cJSON_CreateObject();
+    cJSON_AddStringToObject(th, "type", "disabled");
+    cJSON_AddItemToObject(req, "thinking", th);
+  }
   cJSON_AddStringToObject(req, "system", sys_prompt);
   cJSON *msgs = cJSON_CreateArray();
   cJSON *u = cJSON_CreateObject();
@@ -2015,7 +2031,6 @@ static ClipPlanList openai_make_plan(const Config *cfg,
         return empty;
       }
     }
-    free(chat_body);
     goto have_response;
   }
 
@@ -2049,28 +2064,56 @@ static ClipPlanList openai_make_plan(const Config *cfg,
       return empty;
     }
   }
-  free(chat_body);
-
 have_response:;
   free(prompt);
 
   char *out_text = openai_extract_output_text(resp.data ? resp.data : "");
   if (!out_text) {
-    logw("OpenAI response parse failed.");
-    if (resp.data && resp.size) logw("OpenAI raw body: %.800s", resp.data);
-
+    logw("AI response parse failed (no text content in the reply).");
+    if (resp.data && resp.size) logw("Raw reply: %.800s", resp.data);
     if (has_script && resp.data && openai_resp_should_retry_without_script(resp.data)) {
       if (out_retry_without_script) *out_retry_without_script = true;
     }
-
-    if (resp.data) free(resp.data);
-    ClipPlanList empty = {0};
-    return empty;
   }
 
-  ClipPlanList plan = parse_clip_plan_json(out_text);
+  ClipPlanList plan = {0};
+  if (out_text) plan = parse_clip_plan_json(out_text);
+  if (plan.count == 0 && out_text) {
+    logw("AI reply contained no usable clip plan - most likely the JSON was cut "
+         "off (output limit) or the model refused.");
+    logw("Reply started: %.300s", out_text);
+  }
+
+  /* Anthropic-style gateways truncate or refuse more often than the plain
+     chat endpoint - give /chat/completions one chance with the SAME prompt
+     before the run drops to the offline subtitle planner. */
+  if (plan.count == 0 && anthropic_base && chat_body) {
+    char base2[512];
+    snprintf(base2, sizeof(base2), "%s", cfg->openai_base_url);
+    size_t bl = strlen(base2);
+    while (bl > 1 && base2[bl - 1] == '/') base2[--bl] = '\0';
+    if (bl >= 10 && strcmp(base2 + bl - 10, "/anthropic") == 0) base2[bl - 10] = '\0';
+    snprintf(endpoint, sizeof(endpoint), "%s/chat/completions", base2);
+    logi("Trying the OpenAI-style endpoint instead: %s", endpoint);
+    long code2 = 0;
+    MemBuf r2 = http_post_json_to_mem(endpoint, cfg->openai_key, chat_body, &code2, timeout_s);
+    if (code2 >= 200 && code2 < 300) {
+      char *t2 = openai_extract_output_text(r2.data ? r2.data : "");
+      if (t2) {
+        plan = parse_clip_plan_json(t2);
+        free(t2);
+        if (plan.count > 0) logok("Recovered the clip plan via %s", endpoint);
+      }
+    } else {
+      logw("Chat-completions HTTP %ld", code2);
+      if (r2.data && r2.size) logw("Chat raw body: %.800s", r2.data);
+    }
+    free(r2.data);
+  }
+
   free(out_text);
-  if (resp.data) free(resp.data);
+  free(chat_body);
+  free(resp.data);
   return plan;
 }
 
