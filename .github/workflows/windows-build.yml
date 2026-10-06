@@ -629,8 +629,13 @@ jobs:
           if (-not (Select-String -Path mockthink.log -Pattern "plan request carries no output-token limit" -Quiet)) {
             Write-Host "::error title=pthink::the plan request imposed an output-token limit"
             exit 1 }
-          if (Select-String -Path mockthink.log -Pattern "WARNING: plan request carried an output-token limit" -Quiet) {
-            Write-Host "::error title=pthink::a request carried an output-token limit"; exit 1 }
+          if (Select-String -Path mockthink.log -Pattern "WARNING: FIRST plan request carried an output-token limit" -Quiet) {
+            Write-Host "::error title=pthink::the first plan request imposed an output-token limit"
+            exit 1 }
+          # the retry is allowed (and expected) to name a budget
+          if (-not (Select-String -Path mockthink.log -Pattern "retry request names an explicit output budget \(128000 tokens\)" -Quiet)) {
+            Write-Host "::error title=pthink::the retry did not name an explicit 128000-token budget"
+            exit 1 }
           # 2. the thinking-model reply must be retried, with an explicit budget
           if (-not (Select-String -Path mockthink.log -Pattern "replying like a thinking model out of output room" -Quiet)) {
             Write-Host "::error title=pthink::the thinking-model reply was never served - the test did not run"

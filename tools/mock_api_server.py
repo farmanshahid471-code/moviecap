@@ -273,16 +273,24 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             if self.path.endswith("/responses"):
                 STATE["responses"] += 1
 
-        # The app must not impose an output-token limit (the provider's own
-        # maximum applies).  Say so in the log so CI can assert it.
+        # The app must not impose an output-token limit on the FIRST plan request
+        # (the provider's own maximum applies).  A later retry may name one - the
+        # app only does that once the provider said the answer never got written.
         if self.path.endswith("/responses") or self.path.endswith("/chat/completions"):
-            if ("max_output_tokens" not in body and "max_completion_tokens" not in body
-                    and "max_tokens" not in body):
+            limited = ("max_output_tokens" in body or "max_completion_tokens" in body
+                       or "max_tokens" in body)
+            first = STATE["responses"] <= 1
+            if not limited:
                 print("[mock-openai] plan request carries no output-token limit",
                       flush=True)
+            elif first:
+                print("[mock-openai] WARNING: FIRST plan request carried an "
+                      "output-token limit", flush=True)
             else:
-                print("[mock-openai] WARNING: plan request carried an output-token limit",
-                      flush=True)
+                limit = (body.get("max_output_tokens") or body.get("max_completion_tokens")
+                         or body.get("max_tokens"))
+                print(f"[mock-openai] retry request names an explicit output budget "
+                      f"({limit} tokens)", flush=True)
 
         # --- Anthropic Message Batches: create ---------------------------
         if self.path == "/anthropic/v1/messages/batches":
