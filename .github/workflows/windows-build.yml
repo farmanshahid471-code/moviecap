@@ -331,15 +331,17 @@ jobs:
           }
           Write-Host "Piper end to end OK"
 
-          # Full FREE generation, exactly the user scenario: Piper selected, no
-          # server running, no working OpenAI key. The app must auto-start the
-          # Piper server it just installed, and the fallback subtitles plus the
-          # local planner must carry the run all the way to a finished video.
+          # Full FREE generation: Piper selected, no server running, no working
+          # OpenAI key, and "offline_planner": true (the opt-in free path - by
+          # default a run with no AI plan is skipped, see the smoke test above).
+          # The app must auto-start the Piper server it just installed, and the
+          # fallback subtitles plus the local planner must carry the run all the
+          # way to a finished video of the requested length.
           $free = Join-Path (Get-Location) "pfree"
           New-Item -ItemType Directory -Force "$free\movies" | Out-Null
           Copy-Item build\Release\movie_summary_cli.exe $free\
           Copy-Item -Recurse resources $free\resources
-          '{"open_api_key":"sk-fake","tts_provider":"piper","min_clips":2,"max_clips":2,"recap_minutes":1}' | Set-Content "$free\config.json"
+          '{"open_api_key":"sk-fake","tts_provider":"piper","min_clips":2,"max_clips":2,"recap_minutes":1,"offline_planner":true}' | Set-Content "$free\config.json"
           # Dense synthetic SRT whose lines torture the caption escaping
           # (apostrophe, colon, comma, brackets, percent) so a regression in
           # drawtext escaping fails the build instead of the user's video.
