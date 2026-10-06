@@ -1,0 +1,39 @@
+# Build output
+build/
+build-*/
+out/
+cmake-build-*/
+*.exe
+*.obj
+__pycache__/
+*.pyc
+*.pdb
+*.ilk
+
+# IDEs / OS
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Runtime folders (created by the app)
+movies/
+movies_retired/
+output/
+tiktok_output/
+clips/
+output_audio/
+temp_movies/
+scripts/srt_files/
+
+# Secrets (config.json is committed with placeholders only - never commit real keys;
+# run:  git update-index --skip-worktree config.json  after adding your keys)
+client_secrets.json
+cookies.txt
+config.local.json
+
+# CI only: portable FFmpeg installed by the workflow tests
+/ci-tools/
+/runbat.log

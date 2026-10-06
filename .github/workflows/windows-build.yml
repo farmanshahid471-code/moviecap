@@ -1,0 +1,499 @@
+name: Windows build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to publish the zip to the public "windows-latest" release
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax-check the PowerShell installers
+        shell: pwsh
+        run: |
+          # setup.ps1 is never executed in CI (it would install the ~4 GB C++
+          # toolchain), so at least prove it parses.
+          $bad = $false
+          foreach ($f in @("setup.ps1", "install_tools.ps1", "install_piper.ps1")) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$errs)
+            if ($errs -and $errs.Count) {
+              $bad = $true
+              foreach ($e in $errs) {
+                Write-Host "::error title=$f::$($e.Message) (line $($e.Extent.StartLineNumber))"
+              }
+            } else {
+              Write-Host "$f parses OK"
+            }
+          }
+          if ($bad) { exit 1 }
+
+      - name: Build (MSVC, via build.bat)
+        shell: pwsh
+        run: |
+          cmd /c "build.bat > build.log 2>&1"
+          $code = $LASTEXITCODE
+          Get-Content build.log -Tail 150
+          if ($code -ne 0) {
+            # Surface the compiler errors as annotations + job summary, so they
+            # can be read without downloading the raw logs.
+            $errs = Select-String -Path build.log -Pattern 'error|LINK :|fatal' |
+                    Select-Object -First 12
+            foreach ($e in $errs) {
+              Write-Host ("::error title=MSVC build::{0}" -f $e.Line)
+            }
+            $fence = '```'
+            Add-Content $env:GITHUB_STEP_SUMMARY "### MSVC build failed (exit $code)"
+            Add-Content $env:GITHUB_STEP_SUMMARY $fence
+            Select-String -Path build.log -Pattern 'error|LINK|fatal' |
+              Select-Object -First 80 |
+              ForEach-Object { Add-Content $env:GITHUB_STEP_SUMMARY $_.Line }
+            Add-Content $env:GITHUB_STEP_SUMMARY $fence
+            exit $code
+          }
+
+      - name: Install FFmpeg for smoke test
+        shell: pwsh
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Smoke test (unicode + apostrophe file name, fake keys)
+        shell: pwsh
+        run: |
+          $env:Path = "C:\ProgramData\chocolatey\bin;" + $env:Path
+          New-Item -ItemType Directory -Force smoke\movies | Out-Null
+          Copy-Item build\Release\movie_summary_cli.exe smoke\
+          Copy-Item -Recurse resources smoke\resources
+          '{"open_api_key":"sk-fake","elevenlabs_api_key":"el-fake","auto_transcribe":false}' | Set-Content smoke\config.json
+          ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc=size=640x360:duration=60 -c:v libx264 "smoke\movies\Amélie's Test (2001).mp4"
+          Push-Location smoke
+          .\movie_summary_cli.exe 2>&1 | Tee-Object -FilePath ..\smoke.log
+          $rc = $LASTEXITCODE
+          Pop-Location
+          Write-Host "exit code: $rc"
+          if ($rc -ne 0) { throw "CLI returned $rc" }
+          if (-not (Select-String -Path smoke.log -Pattern "Processing: Amélie's Test \(2001\)" -Quiet)) { throw "unicode movie was not picked up" }
+          if (-not (Select-String -Path smoke.log -Pattern "All done" -Quiet)) { throw "run did not finish" }
+          if (-not (Select-String -Path smoke.log -Pattern "NO REAL SUBTITLES" -Quiet)) { throw "no-subtitle placeholder warning did not run" }
+          if (-not (Select-String -Path smoke.log -Pattern "offline planner" -Quiet)) { throw "free local planner did not run" }
+
+      - name: Test the portable FFmpeg lookup (nothing on PATH)
+        shell: pwsh
+        run: |
+          # This is what makes the F: install work: run.bat drops ffmpeg.exe next to
+          # the project instead of editing the system PATH, so the app has to find it.
+          $real = Get-ChildItem "C:\ProgramData\chocolatey\lib\ffmpeg" -Recurse -Filter ffmpeg.exe |
+                  Select-Object -First 1
+          if (-not $real) { throw "could not locate chocolatey's ffmpeg.exe to copy" }
+          $probe = Join-Path $real.DirectoryName "ffprobe.exe"
+          if (-not (Test-Path $probe)) { throw "ffprobe.exe is not next to ffmpeg.exe" }
+
+          New-Item -ItemType Directory -Force "smoke\tools\ffmpeg\bin" | Out-Null
+          Copy-Item $real.FullName "smoke\tools\ffmpeg\bin\"
+          Copy-Item $probe "smoke\tools\ffmpeg\bin\"
+
+          Push-Location smoke
+          $env:Path = "C:\Windows\System32;C:\Windows"
+          if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
+            throw "ffmpeg is still on PATH, so this test would prove nothing"
+          }
+          .\movie_summary_cli.exe 2>&1 | Tee-Object -FilePath ..\portable.log
+          Pop-Location
+
+          if (-not (Select-String -Path portable.log -Pattern "ffmpeg \+ ffprobe found" -Quiet)) {
+            throw "the app did not pick up the portable FFmpeg from tools\ffmpeg\bin"
+          }
+          Write-Host "portable FFmpeg lookup OK (found tools\ffmpeg\bin with an empty PATH)"
+
+      - name: Test the FFmpeg auto-installer (install_tools.ps1)
+        shell: pwsh
+        run: |
+          # Really downloads and unpacks FFmpeg, exactly like run.bat does for a user.
+          $dest = Join-Path (Get-Location) "ci-tools"
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\install_tools.ps1 -ToolsDir $dest
+          if ($LASTEXITCODE -ne 0) { throw "install_tools.ps1 returned $LASTEXITCODE" }
+
+          $ff = Join-Path $dest "ffmpeg\bin\ffmpeg.exe"
+          $fp = Join-Path $dest "ffmpeg\bin\ffprobe.exe"
+          if (-not (Test-Path $ff)) { throw "the installer did not produce ffmpeg.exe" }
+          if (-not (Test-Path $fp)) { throw "the installer did not produce ffprobe.exe" }
+          & $ff -version | Select-Object -First 1
+          if ($LASTEXITCODE -ne 0) { throw "the installed ffmpeg.exe does not run" }
+          if (Test-Path (Join-Path $dest "downloads\ffmpeg.zip")) { throw "the zip was not cleaned up" }
+
+          # a second run must be a no-op, not a second download
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\install_tools.ps1 -ToolsDir $dest
+          if ($LASTEXITCODE -ne 0) { throw "re-running install_tools.ps1 failed" }
+          Write-Host "install_tools.ps1 OK -> $dest"
+
+      - name: Test run.bat (finds the FFmpeg the installer put on disk)
+        shell: pwsh
+        run: |
+          # Proves run.bat and install_tools.ps1 agree on the folder layout:
+          # with no ffmpeg on PATH, run.bat must locate the portable copy.
+          $env:Path = "C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0"
+          $env:MOVIECAP_TOOLS = Join-Path (Get-Location) "ci-tools"
+          Write-Host "tools dir = $($env:MOVIECAP_TOOLS)"
+          Write-Host "ffmpeg on PATH? $([bool](Get-Command ffmpeg -ErrorAction SilentlyContinue))"
+
+          & cmd /c "run.bat setup" *> runbat.log
+          $rc = $LASTEXITCODE
+          Get-Content runbat.log | ForEach-Object { Write-Host "::notice title=runbat.log:: $_" }
+          Write-Host "run.bat setup exit code: $rc"
+          if ($rc -ne 0) { Write-Host "::error title=run.bat::run.bat setup exited with code $rc" }
+
+          $hit = Select-String -Path runbat.log -Pattern "Using the portable FFmpeg" -Quiet
+          if (-not $hit) { Write-Host "::error title=run.bat::run.bat did not report the portable FFmpeg" }
+          if ($rc -ne 0 -or -not $hit) { exit 1 }
+          Write-Host "run.bat OK"
+
+          # A placeholder voice file keeps the bare run from re-downloading Piper in CI.
+          New-Item -ItemType Directory -Force "ci-tools\piper\voices" | Out-Null
+          Set-Content "ci-tools\piper\voices\en_US-lessac-medium.onnx" "placeholder"
+
+          # Bare double-click: must confirm the tools and start no exe at all.
+          & cmd /c "run.bat" *> runbat-bare.log
+          $rcb = $LASTEXITCODE
+          Get-Content runbat-bare.log | ForEach-Object { Write-Host "::notice title=runbat-bare:: $_" }
+          Write-Host "bare run.bat exit code: $rcb"
+          $conf = Select-String -Path runbat-bare.log -Pattern "downloaded and installed" -Quiet
+          $launched = Select-String -Path runbat-bare.log -Pattern "Initializing raylib" -Quiet
+          if ($rcb -ne 0) { Write-Host "::error title=run.bat::bare run.bat exited with code $rcb" }
+          if (-not $conf) { Write-Host "::error title=run.bat::bare run.bat did not confirm the tools" }
+          if ($launched) { Write-Host "::error title=run.bat::bare run.bat started the app on its own" }
+          if ($rcb -ne 0 -or -not $conf -or $launched) { exit 1 }
+          Write-Host "bare run.bat OK - it confirms the tools and starts nothing"
+
+      - name: "Test run.bat with no F drive (tools fall back to the app folder)"
+        shell: pwsh
+        run: |
+          # The runner has no F:, which is exactly the fallback case: the tools
+          # must land in <app>\tools and run.bat must still find them.
+          $env:Path = "C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0"
+          $env:MOVIECAP_TOOLS = "Z:\definitely-not-here\tools"
+          if (Test-Path "tools\ffmpeg\bin") { Remove-Item -Recurse -Force "tools\ffmpeg" }
+
+          # First run: Z: does not exist, so the installer must fall back to <app>\tools.
+          & cmd /c "run.bat setup" *> runbat2.log
+          $rc1 = $LASTEXITCODE
+          Write-Host "::notice title=install-run::exit=$rc1 ffmpeg=$(Test-Path 'tools\ffmpeg\bin\ffmpeg.exe') ffprobe=$(Test-Path 'tools\ffmpeg\bin\ffprobe.exe')"
+          if ($rc1 -ne 0) { Write-Host "::error title=run.bat::the no-F: fallback exited with code $rc1" }
+          if (-not (Test-Path "tools\ffmpeg\bin\ffmpeg.exe")) {
+            Write-Host "::error title=run.bat::nothing was installed into the app folder"
+          }
+
+          # Second run: must find that copy on its own and must NOT download again.
+          & cmd /c "run.bat setup" *> runbat3.log
+          $rc2 = $LASTEXITCODE
+          Get-Content runbat3.log | ForEach-Object { Write-Host "::notice title=second-run:: $_" }
+          Write-Host "::notice title=second-run::exit=$rc2"
+
+          $bad = $false
+          if ($rc2 -ne 0) { Write-Host "::error title=run.bat::the second run exited with code $rc2"; $bad = $true }
+          if (-not (Select-String -Path runbat3.log -Pattern "Using the portable FFmpeg" -Quiet)) {
+            Write-Host "::error title=run.bat::the second run did not report the fallback copy"; $bad = $true
+          }
+          if (Select-String -Path runbat3.log -Pattern "Downloading" -Quiet) {
+            Write-Host "::error title=run.bat::the second run downloaded FFmpeg again"; $bad = $true
+          }
+          if ($rc1 -ne 0 -or -not (Test-Path "tools\ffmpeg\bin\ffmpeg.exe") -or $bad) { exit 1 }
+          Write-Host "no-F: fallback OK"
+
+      - name: "Test run.bat from a folder with spaces and brackets"
+        shell: pwsh
+        run: |
+          # The zip is usually extracted to something like "AI-Movie-Shorts-Windows (1)".
+          # A ")" in the path breaks any unquoted expansion inside a parenthesised IF
+          # block, and the installer must be told to use the folder run.bat will look in.
+          $src = Join-Path $env:RUNNER_TEMP "AI-Movie-Shorts-Windows (1)"
+          if (Test-Path $src) { Remove-Item -Recurse -Force $src }
+          New-Item -ItemType Directory -Force $src | Out-Null
+          Copy-Item run.bat, install_tools.ps1, install_piper.ps1 $src
+          Copy-Item -Recurse resources (Join-Path $src "resources")
+
+          $env:Path = "C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0"
+          Remove-Item Env:\MOVIECAP_TOOLS -ErrorAction SilentlyContinue
+          $log = Join-Path $env:RUNNER_TEMP "brackets.log"
+
+          # Phase 1: nothing is installed yet, so run.bat must install FFmpeg into the
+          # very folder it checks afterwards.
+          Push-Location $src
+          & cmd /c "run.bat setup" *> $log
+          $rc1 = $LASTEXITCODE
+          Pop-Location
+          $installed = Test-Path (Join-Path $src "tools\ffmpeg\bin\ffmpeg.exe")
+          Write-Host "::notice title=brackets::phase1 exit=$rc1 installed=$installed"
+          if ($rc1 -ne 0) { Write-Host "::error title=run.bat::run.bat setup failed inside a bracketed folder (exit $rc1)" }
+          if (-not $installed) { Write-Host "::error title=run.bat::FFmpeg was not installed into the bracketed app folder" }
+
+          # Phase 2: a second run must find it and must not download again.
+          Push-Location $src
+          & cmd /c "run.bat setup" *> "$log.2"
+          $rc2 = $LASTEXITCODE
+          Pop-Location
+          Get-Content "$log.2" | ForEach-Object { Write-Host "::notice title=brackets2:: $_" }
+          Write-Host "::notice title=brackets2::exit=$rc2"
+
+          $bad = $false
+          if ($rc1 -ne 0 -or -not $installed -or $rc2 -ne 0) { $bad = $true }
+          if (-not (Select-String -Path "$log.2" -Pattern "Using the portable FFmpeg" -Quiet)) {
+            Write-Host "::error title=run.bat::the second run did not find the portable FFmpeg"
+            $bad = $true
+          }
+          if (Select-String -Path "$log.2" -Pattern "downloading a portable copy" -Quiet) {
+            Write-Host "::error title=run.bat::the second run downloaded FFmpeg again"
+            $bad = $true
+          }
+          if ($bad) {
+            Get-Content $log | Select-Object -Last 15 | ForEach-Object { Write-Host "::notice title=brackets1:: $_" }
+            exit 1
+          }
+          Write-Host "bracketed folder OK"
+
+      - name: "Test the free Piper engine end to end (run.bat tts)"
+        shell: pwsh
+        run: |
+          # Installs a private Python + piper-tts + a voice model, starts the real
+          # server and asks it for audio. This is the whole free-narration path.
+          $env:Path = "C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0"
+          $tools = Join-Path (Get-Location) "ci-tools"
+          $env:MOVIECAP_TOOLS = $tools
+          Remove-Item -Recurse -Force (Join-Path $tools "piper") -ErrorAction SilentlyContinue
+
+          & cmd /c "run.bat tts install" *> piper-install.log
+          $rc = $LASTEXITCODE
+          Get-Content piper-install.log | Select-Object -Last 12 | ForEach-Object { Write-Host "::notice title=piper-install:: $_" }
+          Write-Host "::notice title=piper-install::exit=$rc"
+          if ($rc -ne 0) { Write-Host "::error title=piper::run.bat tts install exited with code $rc" }
+
+          $py   = Join-Path $tools "piper\python\python.exe"
+          $onnx = Join-Path $tools "piper\voices\en_US-lessac-medium.onnx"
+          if (-not (Test-Path $py))   { Write-Host "::error title=piper::no private python.exe was installed" }
+          if (-not (Test-Path $onnx)) { Write-Host "::error title=piper::the voice model was not downloaded" }
+          if ($rc -ne 0 -or -not (Test-Path $py) -or -not (Test-Path $onnx)) { exit 1 }
+
+          $srv = Start-Process -FilePath $py -PassThru -WindowStyle Hidden `
+                   -ArgumentList "-m","piper.http_server","--host","127.0.0.1","--port","5099","-m","en_US-lessac-medium","--data-dir","$tools\piper\voices" `
+                   -RedirectStandardError piper-err.log -RedirectStandardOutput piper-out.log
+          try {
+            $up = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Seconds 2
+              try { Invoke-WebRequest "http://127.0.0.1:5099/" -UseBasicParsing -TimeoutSec 5 | Out-Null; $up = $true; break } catch {}
+            }
+            if (-not $up) {
+              Get-Content piper-err.log -Tail 20 | ForEach-Object { Write-Host "::notice title=piper-server:: $_" }
+              Write-Host "::error title=piper::the server never answered on /"
+              exit 1
+            }
+
+            Invoke-WebRequest -Method Post -Uri "http://127.0.0.1:5099/synthesize" `
+              -ContentType "application/json" -Body '{"text":"Hello from the free narration engine."}' `
+              -OutFile piper.wav -UseBasicParsing -TimeoutSec 300
+            $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path piper.wav))
+            $hdr = [System.Text.Encoding]::ASCII.GetString($bytes[0..3])
+            Write-Host "::notice title=piper::/synthesize returned $($bytes.Length) bytes, header=$hdr"
+            if ($bytes.Length -lt 5000 -or $hdr -ne "RIFF") {
+              Write-Host "::error title=piper::/synthesize did not return WAV audio"
+              exit 1
+            }
+          } finally {
+            Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "Piper end to end OK"
+
+          # Full FREE generation, exactly the user scenario: Piper selected, no
+          # server running, no working OpenAI key. The app must auto-start the
+          # Piper server it just installed, and the fallback subtitles plus the
+          # local planner must carry the run all the way to a finished video.
+          $free = Join-Path (Get-Location) "pfree"
+          New-Item -ItemType Directory -Force "$free\movies" | Out-Null
+          Copy-Item build\Release\movie_summary_cli.exe $free\
+          Copy-Item -Recurse resources $free\resources
+          '{"open_api_key":"sk-fake","tts_provider":"piper","min_clips":2,"max_clips":2,"recap_minutes":1}' | Set-Content "$free\config.json"
+          # Dense synthetic SRT whose lines torture the caption escaping
+          # (apostrophe, colon, comma, brackets, percent) so a regression in
+          # drawtext escaping fails the build instead of the user's video.
+          New-Item -ItemType Directory -Force "$free\scripts\srt_files" | Out-Null
+          $lines = @()
+          $idx = 1
+          for ($t = 0; $t -lt 58; $t += 1) {
+            $lines += "$idx"
+            $lines += ("00:00:{0:D2},000 --> 00:00:{1:D2},000" -f $t, ($t + 1))
+            $lines += "Scene $t it's a test, and the story moves forward: yes [really] 100%."
+            $lines += ""
+            $idx++
+          }
+          ($lines -join "`r`n") | Set-Content "$free\scripts\srt_files\Free Run 2026 1080p.srt"
+          & "C:\ProgramData\chocolatey\bin\ffmpeg.exe" -hide_banner -loglevel error -f lavfi `            -i testsrc=size=640x360:duration=60 -c:v libx264 "$free\movies\Free Run (2026).mp4"
+          $env:Path = "C:\ProgramData\chocolatey\bin;C:\Windows\System32;C:\Windows"
+          Push-Location $free
+          .\movie_summary_cli.exe 2>&1 | Tee-Object -FilePath ..\pfree.log
+          $rc = $LASTEXITCODE
+          Pop-Location
+          $tail = (Get-Content pfree.log -Tail 14) -join " ||| "
+          Write-Host "::warning title=pfree-tail::$tail"
+          Write-Host "pfree exit code: $rc"
+          if ($rc -ne 0) {
+            Write-Host "::error title=pfree::cli exited $rc"; exit 1 }
+          if (-not (Select-String -Path pfree.log -Pattern "Piper server started automatically" -Quiet)) {
+            Write-Host "::error title=pfree::the app did not auto-start the Piper server"; exit 1 }
+          if (-not (Select-String -Path pfree.log -Pattern "Matched a subtitle file" -Quiet)) {
+            Write-Host "::error title=pfree::fuzzy SRT matching did not find the subtitle file"; exit 1 }
+          if (-not (Select-String -Path pfree.log -Pattern "Processed: 1" -Quiet)) {
+            Write-Host "::error title=pfree::the free keyless generation did not finish"; exit 1 }
+          if (-not (Select-String -Path pfree.log -Pattern "Target recap length" -Quiet)) {
+            Write-Host "::error title=pfree::recap_minutes target was not applied"; exit 1 }
+          $m = Select-String -Path pfree.log -Pattern "Final duration: ([0-9.]+) seconds"
+          if (-not $m) { Write-Host "::error title=pfree::no final duration in log"; exit 1 }
+          $dur = [double]$m.Matches[0].Groups[1].Value
+          Write-Host "pfree final duration: $dur s (target ~60 s)"
+          if ($dur -lt 40) {
+            Write-Host "::error title=pfree::recap collapsed to $dur s - the length target is broken"; exit 1 }
+          Write-Host "free keyless generation OK (auto-started Piper, fallback SRT, local plan)"
+
+      - name: "Test run.bat web brings the control panel up"
+        shell: pwsh
+        run: |
+          # Exercises the run.bat launch path end to end: tools resolution, the
+          # exe lookup and the PATH injection the app relies on.
+          Copy-Item run.bat smoke\
+          Copy-Item build\Release\movie_summary_web.exe smoke\
+          $env:Path = "C:\ProgramData\chocolatey\bin;C:\Windows\System32;C:\Windows"
+          $p = Start-Process -FilePath "cmd.exe" -ArgumentList '/c','run.bat web --port 8124' `
+                 -WorkingDirectory smoke -PassThru -WindowStyle Hidden
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Milliseconds 500
+              try {
+                $r = Invoke-WebRequest "http://127.0.0.1:8124/api/status" -UseBasicParsing -TimeoutSec 5
+                if ($r.StatusCode -eq 200) { $ok = $true; break }
+              } catch {}
+            }
+            if (-not $ok) {
+              Write-Host "::error title=run.bat::run.bat web did not bring the panel up on port 8124"
+              exit 1
+            }
+            Write-Host "run.bat web OK - the panel answered on 8124"
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Get-Process movie_summary_web -ErrorAction SilentlyContinue |
+              Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Test the AI extras (edge-tts + faster-whisper)
+        shell: pwsh
+        run: |
+          $env:Path = "C:\ProgramData\chocolatey\bin;" + $env:Path
+          $py = "ci-tools\piper\python\python.exe"
+          if (-not (Test-Path $py)) { Write-Host "::error title=extras::bundled python missing at $py"; exit 1 }
+          $o = (& $py -m pip install --no-warn-script-location --disable-pip-version-check edge-tts faster-whisper==1.1.1 requests "av>=15" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) { $f = ($o -replace "\r?\n", " ||| "); Write-Host "::error title=extras::pip install failed (exit $LASTEXITCODE): $($f.Substring([Math]::Max(0,$f.Length-600)))"; exit 1 }
+          $o = (& $py -c "import edge_tts, faster_whisper, ctranslate2; print('imports OK', ctranslate2.__version__)" 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) { $f = ($o -replace "\r?\n", " ||| "); Write-Host "::error title=extras::import failed: $($f.Substring([Math]::Max(0,$f.Length-700)))"; exit 1 }
+          $o = (& $py -c "from huggingface_hub import snapshot_download; p=snapshot_download('Systran/faster-whisper-tiny', cache_dir='ci-tools/hf-cache'); print('snapshot OK', p)" 2>&1 | Out-String)
+          Write-Host $o
+          if ($LASTEXITCODE -ne 0) { $f = ($o -replace "\r?\n", " ||| "); Write-Host "::error title=extras::model download failed: $($f.Substring([Math]::Max(0,$f.Length-700)))"; exit 1 }
+          $o = (& $py -c "import glob, ctranslate2; d=glob.glob('ci-tools/hf-cache/models--Systran--faster-whisper-tiny/snapshots/*')[0]; m=ctranslate2.models.Whisper(d); print('ct2 load OK')" 2>&1 | Out-String)
+          Write-Host $o
+          if ($LASTEXITCODE -ne 0) { $f = ($o -replace "\r?\n", " ||| "); Write-Host "::error title=extras::ctranslate2 load failed: $($f.Substring([Math]::Max(0,$f.Length-700)))"; exit 1 }
+          ffmpeg -y -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=6" -ar 16000 -ac 1 extras_audio.wav
+          if (-not (Test-Path extras_audio.wav)) { Write-Host "::error title=extras::ffmpeg did not produce the test audio"; exit 1 }
+          & $py whisper_transcribe.py --model tiny --audio extras_audio.wav --out extras.srt --cache-dir ci-tools\hf-cache *> whisper_run.txt
+          $wexit = $LASTEXITCODE
+          $wout = (Get-Content whisper_run.txt -Raw)
+          Write-Host $wout
+          if ($wexit -ne 0) { $f = ($wout -replace "\r?\n", " ||| "); Write-Host "::error title=extras::whisper_transcribe failed (exit $wexit): $($f.Substring([Math]::Max(0,$f.Length-800)))"; exit 1 }
+          if (-not (Test-Path extras.srt)) { Write-Host "::error title=extras::no SRT was produced"; exit 1 }
+          Write-Host "AI extras OK (edge-tts importable, faster-whisper produced an SRT)"
+
+      - name: Smoke test the web control panel
+        shell: pwsh
+        run: |
+          Copy-Item build\Release\movie_summary_web.exe smoke\
+          $p = Start-Process -FilePath "smoke\movie_summary_web.exe" `
+                 -ArgumentList "--host","127.0.0.1","--port","8123" `
+                 -WorkingDirectory smoke -PassThru -WindowStyle Hidden
+          try {
+            $s = $null
+            for ($i = 0; $i -lt 40; $i++) {
+              Start-Sleep -Milliseconds 500
+              try { $s = Invoke-RestMethod "http://127.0.0.1:8123/api/status"; break } catch {}
+            }
+            if (-not $s) { throw "web UI never answered on /api/status" }
+            if (-not $s.ffmpeg) { throw "web UI reports ffmpeg as missing" }
+
+            $page = Invoke-WebRequest "http://127.0.0.1:8123/" -UseBasicParsing
+            if ($page.StatusCode -ne 200 -or $page.Content -notmatch "START GENERATION") {
+              throw "control panel page is missing or incomplete"
+            }
+
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8123/api/config" `
+              -ContentType "application/json" `
+              -Body '{"open_api_key":"sk-fake","elevenlabs_api_key":"el-fake","min_clips":3}' | Out-Null
+            $cfg = Invoke-RestMethod "http://127.0.0.1:8123/api/config"
+            if ($cfg.min_clips -ne 3) { throw "config write did not stick" }
+            if (-not $cfg.openai_key_set) { throw "API key was not saved" }
+
+            # free / local narration engines must survive a round trip through config.json
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8123/api/config" `
+              -ContentType "application/json" `
+              -Body '{"tts_provider":"xtts","tts_base_url":"http://127.0.0.1:8020","tts_voice":"me.wav","tts_language":"en"}' | Out-Null
+            $cfg = Invoke-RestMethod "http://127.0.0.1:8123/api/config"
+            if ($cfg.tts_provider -ne "xtts") { throw "tts_provider write did not stick" }
+            if ($cfg.tts_voice -ne "me.wav") { throw "tts_voice write did not stick" }
+            if ($page.Content -notmatch "tts_provider") { throw "engine picker missing from the page" }
+            if ($page.Content -notmatch "recap_languages") { throw "recap languages hint missing from the page" }
+            if ($page.Content -notmatch "lang_zh") { throw "language checkboxes missing from the page" }
+            if ($page.Content -notmatch "caption_font_zh") { throw "per-language caption font fields missing from the page" }
+            Write-Host "TTS provider switch OK ($($cfg.tts_provider) / $($cfg.tts_base_url))"
+
+            Set-Content -Path smoke\hello.srt -Value "1`n00:00:01,000 --> 00:00:02,000`nhi"
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8123/api/upload?dir=srt&name=hello.srt" `
+              -InFile smoke\hello.srt -ContentType "text/plain" | Out-Null
+            $list = Invoke-RestMethod "http://127.0.0.1:8123/api/list?dir=srt"
+            if (-not ($list.files | Where-Object { $_.name -eq "hello.srt" })) { throw "upload failed" }
+
+            $logs = Invoke-RestMethod "http://127.0.0.1:8123/api/logs?since=0"
+            Write-Host "web UI smoke test OK ($($logs.lines.Count) log lines buffered)"
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $pkg = "AI-Movie-Shorts-Windows"
+          New-Item -ItemType Directory -Force $pkg | Out-Null
+          Copy-Item build\Release\movie_summary_bot.exe, build\Release\movie_summary_cli.exe, build\Release\movie_summary_web.exe $pkg\
+          Copy-Item -Recurse resources, backgroundmusic $pkg\
+          Copy-Item config.json, README.md, run.bat, setup.ps1, install_tools.ps1, install_piper.ps1 $pkg\
+          Copy-Item edge_tts_synth.py, whisper_transcribe.py $pkg\
+          Compress-Archive -Path $pkg\* -DestinationPath "$pkg.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AI-Movie-Shorts-Windows
+          path: AI-Movie-Shorts-Windows.zip
+
+      - name: Publish to public release (direct download link)
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "windows-latest"
+          $notes = "Ready-to-run Windows build (x64) from commit ${{ github.sha }}.`n`nDouble-click run.bat: it downloads every required tool (portable, kept off C:), confirms the install and stops.`nThen open movie_summary_web.exe yourself (browser panel, needs no graphics card) or movie_summary_bot.exe (desktop window, needs OpenGL 3.3).`nAPI keys go in config.json or into the panel."
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag AI-Movie-Shorts-Windows.zip --title "AI-Movie-Shorts for Windows (latest build)" --notes $notes --target ${{ github.sha }} --latest
+          } else {
+            gh release upload $tag AI-Movie-Shorts-Windows.zip --clobber
+            gh release edit $tag --notes $notes
+          }
