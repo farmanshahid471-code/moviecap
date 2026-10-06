@@ -1308,7 +1308,9 @@ static MemBuf anthropic_post_messages(const Config *cfg, const char *sys_prompt,
 
   cJSON *req = cJSON_CreateObject();
   cJSON_AddStringToObject(req, "model", cfg->openai_model);
-  cJSON_AddNumberToObject(req, "max_tokens", 16000);
+  /* DeepSeek caps replies at 8192 tokens; Anthropic models accept far more. */
+  cJSON_AddNumberToObject(req, "max_tokens",
+                          strstr(cfg->openai_model, "deepseek") ? 8000 : 16000);
   cJSON_AddStringToObject(req, "system", sys_prompt);
   cJSON *msgs = cJSON_CreateArray();
   cJSON *u = cJSON_CreateObject();
@@ -1982,18 +1984,38 @@ static ClipPlanList openai_make_plan(const Config *cfg,
 
   if (anthropic_base) {
     free(body);
-    free(chat_body);
     resp = anthropic_post_messages(cfg, sys_prompt, prompt, &http_code, timeout_s);
     if (http_code < 200 || http_code >= 300) {
       logw("Anthropic-compatible HTTP %ld", http_code);
       if (resp.data && resp.size) logw("Anthropic raw body: %.800s", resp.data);
-      if (has_script && resp.data && openai_resp_should_retry_without_script(resp.data)) {
-        if (out_retry_without_script) *out_retry_without_script = true;
+      if (resp.data) free(resp.data);
+      resp.data = NULL;
+      resp.size = 0;
+      /* Rescue: gateways like DeepSeek's also serve /chat/completions on the
+         plain base URL - derive it and retry with the SAME prompt. */
+      char base2[512];
+      snprintf(base2, sizeof(base2), "%s", cfg->openai_base_url);
+      size_t bl = strlen(base2);
+      while (bl > 1 && base2[bl - 1] == '/') base2[--bl] = '\0';
+      if (bl >= 10 && strcmp(base2 + bl - 10, "/anthropic") == 0) base2[bl - 10] = '\0';
+      snprintf(endpoint, sizeof(endpoint), "%s/chat/completions", base2);
+      logi("Anthropic endpoint failed - trying the OpenAI-style endpoint instead: %s", endpoint);
+      resp = http_post_json_to_mem(endpoint, cfg->openai_key,
+                                   chat_body ? chat_body : "{}", &http_code, timeout_s);
+      if (http_code < 200 || http_code >= 300) {
+        logw("Chat-completions HTTP %ld", http_code);
+        if (resp.data && resp.size) logw("Chat raw body: %.800s", resp.data);
+        if (has_script && resp.data && openai_resp_should_retry_without_script(resp.data)) {
+          if (out_retry_without_script) *out_retry_without_script = true;
+        }
+        if (resp.data) free(resp.data);
+        free(chat_body);
+        free(prompt);
+        ClipPlanList empty = {0};
+        return empty;
       }
-      free(resp.data);
-      ClipPlanList empty = {0};
-      return empty;
     }
+    free(chat_body);
     goto have_response;
   }
 
@@ -3405,7 +3427,10 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   }
 
   if (plan.count == 0) {
-    logi("No OpenAI plan available - building a free local clip plan from the subtitles.");
+    logi("No AI plan available - falling back to the offline planner.");
+    logw("Offline planner = the narration will be RAW SUBTITLE LINES, not a retold "
+         "story. Check the warnings above for why the AI request failed (API key, "
+         "model id, base URL, quota).");
     if (strcmp(lang_code, "en") != 0)
       logw("The offline fallback planner cannot translate - this pass will stay in "
            "the subtitle language, NOT %s!", cfg->recap_language);
