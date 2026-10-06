@@ -34,8 +34,11 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+_TRUNCATE_FIRST_BATCH = False      # set from --truncate-first-batch
+
 STATE = {"plans": 0, "tts": 0, "wiki_searches": 0, "wiki_extracts": 0,
-         "batches": {}, "batch_seq": 0, "lock": threading.Lock()}
+         "batches": {}, "batch_seq": 0, "truncate_first_batch": False,
+         "lock": threading.Lock()}
 
 
 def make_tone_mp3(seconds, path, freq=440.0):
@@ -230,6 +233,14 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                 if msg.get("role") == "user":
                     prompt = msg.get("content", "")
             plan = plan_from_prompt(prompt, batch["clips"], honour_length=True)
+            text = json.dumps(plan)
+            stop_reason = "end_turn"
+            if STATE["truncate_first_batch"] and batch["seq"] == 1:
+                # a reply that ran out of output budget: the JSON just stops
+                text = text[: len(text) // 2]
+                stop_reason = "max_tokens"
+                print(f"[mock-openai] batch {batch_id}: replying CUT OFF "
+                      f"(stop_reason=max_tokens)", flush=True)
             lines.append(json.dumps({
                 "custom_id": req.get("custom_id"),
                 "result": {"type": "succeeded", "message": {
@@ -237,8 +248,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "type": "message",
                     "role": "assistant",
                     "model": params.get("model", "mock"),
-                    "stop_reason": "end_turn",
-                    "content": [{"type": "text", "text": json.dumps(plan)}],
+                    "stop_reason": stop_reason,
+                    "content": [{"type": "text", "text": text}],
                     "usage": {"input_tokens": 100, "output_tokens": 500},
                 }},
             }))
@@ -253,6 +264,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         except Exception:
             body = {}
 
+        if self.path == "/anthropic/v1/messages/batches":
+            STATE["truncate_first_batch"] = _TRUNCATE_FIRST_BATCH
+
         with STATE["lock"]:
             STATE["plans"] += 1
 
@@ -262,7 +276,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             with STATE["lock"]:
                 STATE["batch_seq"] += 1
                 batch_id = f"msgbatch_mock{STATE['batch_seq']:03d}"
-                STATE["batches"][batch_id] = {"requests": reqs, "clips": 8}
+                STATE["batches"][batch_id] = {"requests": reqs, "clips": 8,
+                                              "seq": STATE["batch_seq"]}
             for req in reqs:
                 if "stream" in req.get("params", {}):
                     return self._send(400, {"type": "error", "error": {
@@ -515,7 +530,15 @@ def main():
     ap.add_argument("--eleven-port", type=int, default=9101)
     ap.add_argument("--tts-port", type=int, default=8020)
     ap.add_argument("--wiki-port", type=int, default=9102)
+    ap.add_argument("--truncate-first-batch", action="store_true",
+                    help="answer the FIRST batch with a reply that stops at the "
+                         "output limit (stop_reason=max_tokens), the way an "
+                         "under-budgeted plan comes back. Later batches answer "
+                         "completely. Used to test the escalation path.")
     args = ap.parse_args()
+
+    global _TRUNCATE_FIRST_BATCH
+    _TRUNCATE_FIRST_BATCH = bool(args.truncate_first_batch)
 
     a = ThreadingHTTPServer(("127.0.0.1", args.openai_port), OpenAIHandler)
     b = ThreadingHTTPServer(("127.0.0.1", args.eleven_port), ElevenHandler)

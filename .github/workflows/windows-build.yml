@@ -499,7 +499,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "ffmpeg could not build the test movie" }
 
           $srv = Start-Process -FilePath "python" `
-            -ArgumentList "tools/mock_api_server.py","--openai-port","9100","--eleven-port","9101","--tts-port","8020" `
+            -ArgumentList "tools/mock_api_server.py","--openai-port","9100","--eleven-port","9101","--tts-port","8020","--truncate-first-batch" `
             -PassThru -RedirectStandardOutput "mockbatch.log" -RedirectStandardError "mockbatch.err"
           Start-Sleep -Seconds 4
           try {
@@ -527,6 +527,19 @@ jobs:
             Write-Host "::error title=pbatch::the batch never finished"; exit 1 }
           if (-not (Select-String -Path pbatch.log -Pattern "Using the batched plan for" -Quiet)) {
             Write-Host "::error title=pbatch::the rendering pass did not use the batched plan"; exit 1 }
+
+          # The mock cut the first batch's reply off at the output limit (that is
+          # what an under-budgeted plan looks like).  The app must submit those
+          # plans as ONE MORE batch with a bigger budget - NOT re-ask them live,
+          # which is what would pay for the same plan twice.
+          if (-not (Select-String -Path pbatch.log -Pattern "cut off at max_tokens=" -Quiet)) {
+            Write-Host "::error title=pbatch::the first batch was not cut off - the escalation was not exercised"
+            exit 1 }
+          if (-not (Select-String -Path pbatch.log -Pattern "one more batch with max_tokens=128000" -Quiet)) {
+            Write-Host "::error title=pbatch::a cut-off plan was not re-submitted as a batch - it would have been paid for twice"
+            exit 1 }
+          if (-not (Select-String -Path pbatch.log -Pattern "msgbatch_mock002 submitted" -Quiet)) {
+            Write-Host "::error title=pbatch::no second batch was submitted"; exit 1 }
           if (-not (Select-String -Path pbatch.log -Pattern "All done. Processed: 1" -Quiet)) {
             Write-Host "::error title=pbatch::the run did not finish"; exit 1 }
           # The batched plan must satisfy the length target on its own: the audit

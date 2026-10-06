@@ -665,8 +665,8 @@ static void test_batch_collect_then_render(void) {
   const char *params = g_batch_n ? g_batch_items[0].params : "";
   ck(body_has(params, "\"model\":\"claude-sonnet-4-5\""),
      "the batched request carries the same model");
-  ck(body_has(params, "\"max_tokens\":32000"),
-     "the batched request carries the same output budget");
+  ck(body_has(params, "\"max_tokens\":64000"),
+     "the batched request asks for a generous output budget");
   ck(body_has(params, "\"system\":") && body_has(params, "\"messages\":[{"),
      "the batched request carries the same system prompt and text");
   ck(!body_has(params, "\"stream\""),
@@ -799,46 +799,145 @@ static void test_batch_failure_falls_back_live(void) {
   batch_items_free();
 }
 
-static void test_batch_cut_short_goes_live(void) {
-  /* A batched reply that stopped at the output limit is not good enough: the
-     app re-asks live (streamed, bigger budget) so the recap stays complete. */
+static void test_batch_cut_short_is_rebatched(void) {
+  /* A batched reply that stopped at the output limit used to be re-asked live
+     at full price - paying for the same plan twice.  It now goes back into ONE
+     more batch with twice the budget, and only what is still cut off after that
+     is asked live. */
   stub_reset();
   batch_items_free();
   ensure_dir(BATCH_DIR);
 
   Config c = batch_cfg();
-  char id[96], path[PATH_MAX];
+  c.batch_max_wait_minutes = 1;
+  g_batch_poll_seconds = 0;
+
+  char id[96], path[PATH_MAX], r1[160], r1_path[PATH_MAX];
   batch_custom_id("Cut Short Movie", "en", id, sizeof(id));
+  snprintf(r1, sizeof(r1), "%s_r1", id);
   batch_result_path(id, ".result.json", path, sizeof(path));
+  batch_result_path(r1, ".result.json", r1_path, sizeof(r1_path));
   plat_unlink(path);
+  plat_unlink(r1_path);
   batch_result_path(id, ".failed", path, sizeof(path));
   plat_unlink(path);
 
   g_batch_collect = true;
+  g_batch_render = false;
   ClipPlanList q = openai_make_plan(&c, "Cut Short Movie", "1\n5 --> 9\nStory.\n\n",
+                                    "", "", false, 2, 12, NULL, NULL, NULL);
+  free_clip_plan_list(&q);
+  ck(g_batch_n == 1, "the request was collected");
+
+  /* first batch: the reply stops at the output limit */
+  stub_reset();
+  queue_batch_create();
+  queue_batch_status("ended", 0, 1, 0);
+  queue_batch_results_line(id, "succeeded", PLAN_TEXT, 1);   /* stop_reason=max_tokens */
+  /* the second batch (the escalation) answers properly */
+  queue_batch_create();
+  queue_batch_status("ended", 0, 1, 0);
+  queue_batch_results_line(r1, "succeeded", PLAN_TEXT, 0);   /* complete this time */
+
+  bool cancelled = false, in_flight = false;
+  bool got = batch_run_all(&c, &cancelled, &in_flight, NULL, 0);
+  ck(got, "the run reports that plans were fetched");
+
+  /* the second create must carry the doubled budget and the _r1 custom id */
+  int creates = 0, second = -1;
+  for (int i = 0; i < stub_request_count(); i++) {
+    if (stub_request_body(i) && strstr(stub_request_body(i), "\"requests\":") &&
+        strstr(stub_request_body(i), "\"params\":")) {
+      creates++;
+      if (creates == 2) second = i;
+    }
+  }
+  ck(creates == 2, "the cut-off plan was re-submitted as one more batch");
+  ck(second >= 0 && body_has(stub_request_body(second), "\"max_tokens\":128000"),
+     "the second batch asks for twice the output budget");
+  ck(second >= 0 && body_has(stub_request_body(second), "_r1"),
+     "the second batch uses an id of its own (the first plan stays on disk)");
+  ck(!file_exists(path), "the truncated plan is not left behind for the render pass");
+
+  /* the rendering pass must use the second batch's plan, with NO live call */
+  stub_reset();
+  char found[PATH_MAX];
+  ck(batch_plan_file("Cut Short Movie", "en", found, sizeof(found)),
+     "the second batch's plan is found for the rendering pass");
+  ck(strstr(found, "_r1") != NULL, "and it is the plan from the second batch");
+
+  g_batch_collect = false;
+  g_batch_render = true;
+  ClipPlanList plan = openai_make_plan(&c, "Cut Short Movie", "1\n5 --> 9\nStory.\n\n",
+                                       "", "", false, 2, 12, NULL, NULL, NULL);
+  ck(plan.count == 1, "the rendering pass renders the re-batched plan");
+  ck(stub_request_count() == 0,
+     "and makes no live request - the second batch is where the saving is");
+  free_clip_plan_list(&plan);
+
+  /* the plan that was written is the complete one from the second batch */
+  char *t = read_entire_file(r1_path);
+  char stop[64] = "";
+  if (t) anthropic_stop_reason(t, stop, sizeof(stop));
+  ck(t != NULL && strcmp(stop, "end_turn") == 0,
+     "the re-batched plan is complete (not a cut-off reply)");
+  free(t);
+
+  g_batch_collect = false;
+  g_batch_render = false;
+  batch_items_free();
+  plat_unlink(r1_path);
+}
+
+static void test_batch_still_cut_off_after_two_rounds_goes_live(void) {
+  /* Both batches cut the plan off: the app must still produce the recap, so it
+     asks live with the live ladder (streamed, bigger budget). */
+  stub_reset();
+  batch_items_free();
+  ensure_dir(BATCH_DIR);
+
+  Config c = batch_cfg();
+  g_batch_poll_seconds = 0;
+  char id[96], path[PATH_MAX], r1[160], r1_path[PATH_MAX];
+  batch_custom_id("Twice Cut Movie", "en", id, sizeof(id));
+  snprintf(r1, sizeof(r1), "%s_r1", id);
+  batch_result_path(id, ".result.json", path, sizeof(path));
+  batch_result_path(r1, ".result.json", r1_path, sizeof(r1_path));
+  plat_unlink(path);
+  plat_unlink(r1_path);
+
+  g_batch_collect = true;
+  g_batch_render = false;
+  ClipPlanList q = openai_make_plan(&c, "Twice Cut Movie", "1\n5 --> 9\nStory.\n\n",
                                     "", "", false, 2, 12, NULL, NULL, NULL);
   free_clip_plan_list(&q);
 
   stub_reset();
   queue_batch_create();
   queue_batch_status("ended", 0, 1, 0);
-  queue_batch_results_line(id, "succeeded", PLAN_TEXT, 1);   /* stop_reason=max_tokens */
+  queue_batch_results_line(id, "succeeded", PLAN_TEXT, 1);
+  queue_batch_create();
+  queue_batch_status("ended", 0, 1, 0);
+  queue_batch_results_line(r1, "succeeded", PLAN_TEXT, 1);   /* still cut off */
   bool cancelled = false, in_flight = false;
   batch_run_all(&c, &cancelled, &in_flight, NULL, 0);
 
+  /* now the render pass: it must go live rather than render a half plan */
   stub_reset();
   queue_ok(PLAN_JSON);
   g_batch_collect = false;
   g_batch_render = true;
-  ClipPlanList plan = openai_make_plan(&c, "Cut Short Movie", "1\n5 --> 9\nStory.\n\n",
+  ClipPlanList plan = openai_make_plan(&c, "Twice Cut Movie", "1\n5 --> 9\nStory.\n\n",
                                        "", "", false, 2, 12, NULL, NULL, NULL);
-  ck(plan.count == 1, "a plan cut short in the batch is replaced by a live plan");
-  ck(stub_request_count() >= 1, "the live request was actually sent");
+  ck(plan.count == 1, "a plan cut short twice still produces a recap (asked live)");
+  ck(stub_request_count() >= 1, "the live request went out");
   free_clip_plan_list(&plan);
 
   g_batch_collect = false;
   g_batch_render = false;
   batch_items_free();
+  plat_unlink(path);
+  plat_unlink(r1_path);
 }
 
 static void test_batch_chunking(void) {
@@ -967,7 +1066,8 @@ int main(void) {
   test_batch_custom_id_shape();
   test_batch_collect_then_render();
   test_batch_failure_falls_back_live();
-  test_batch_cut_short_goes_live();
+  test_batch_cut_short_is_rebatched();
+  test_batch_still_cut_off_after_two_rounds_goes_live();
   test_batch_chunking();
   test_batch_manifest_resume();
 

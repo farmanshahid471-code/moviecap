@@ -2208,6 +2208,18 @@ static MemBuf anthropic_post_messages(const Config *cfg, const char *sys_prompt,
 #define BATCH_MANIFEST            "scripts/plans/batch_state.json"
 #define BATCH_MAX_ITEMS_PER_BATCH 100          /* the API allows 100k         */
 #define BATCH_MAX_BYTES_PER_BATCH (32u * 1024u * 1024u)  /* API: 256 MB     */
+
+/* The output budget asked for in a batched request.  A batch has no streaming
+ * requirement and Anthropic bills the tokens actually produced, never the cap -
+ * so this is deliberately generous: a plan that comes back cut off means a
+ * second, full-price live request.  A 20-minute recap (100+ clips) needs a few
+ * thousand tokens of narration, but a thinking model spends far more than that
+ * before it writes the JSON, and 32000 was not enough for exactly that case. */
+#define BATCH_MAX_TOKENS          64000
+
+/* A reply that is still cut off at that budget gets ONE more batch with twice
+ * the room (still 50% off) before the render pass falls back to a live call. */
+#define BATCH_ESCALATE_ROUNDS     1
 static int  g_batch_poll_seconds = 30;   /* shortened by the unit tests */
 
 typedef struct {
@@ -2217,8 +2229,10 @@ typedef struct {
   char  lang_code[8];
   int   num_clips;
   int   per_clip_sec;
-  int   budget;
-  char *params;                 /* the Messages params, as JSON           */
+  int   budget;                 /* output budget currently submitted       */
+  char  base_id[96];            /* the id of the first submission - the plan
+                                   the rendering pass reads lives under this */
+  char *params;                 /* the Messages params, as JSON            */
 } BatchItem;
 
 static BatchItem *g_batch_items = NULL;
@@ -2233,7 +2247,10 @@ static bool       g_batch_render  = false;/* pass 2: use the batch results   */
 static bool       g_batch_bypass_lookup = false;
 
 static void batch_items_free(void) {
-  for (size_t i = 0; i < g_batch_n; i++) free(g_batch_items[i].params);
+  for (size_t i = 0; i < g_batch_n; i++) {
+    free(g_batch_items[i].params);
+    g_batch_items[i].params = NULL;
+  }
   free(g_batch_items);
   g_batch_items = NULL;
   g_batch_n = g_batch_cap = 0;
@@ -2275,6 +2292,7 @@ static void batch_item_add(const char *title, const char *lang, int num_clips,
   BatchItem *it = &g_batch_items[g_batch_n++];
   memset(it, 0, sizeof(*it));
   batch_custom_id(title, lang, it->custom_id, sizeof(it->custom_id));
+  snprintf(it->base_id, sizeof(it->base_id), "%s", it->custom_id);
   batch_title_hash(title, it->title_hash, sizeof(it->title_hash));
   snprintf(it->movie_title, sizeof(it->movie_title), "%s", title ? title : "");
   snprintf(it->lang_code, sizeof(it->lang_code), "%s", (lang && lang[0]) ? lang : "en");
@@ -2302,9 +2320,22 @@ static bool batch_plan_file(const char *title, const char *lang, char *out, size
   char id[96];
   batch_custom_id(title, lang, id, sizeof(id));
   char path[PATH_MAX];
+  /* the escalated round writes its plan under whatever id it was submitted
+     with - accept either, the newest first */
+  {
+    char alt[PATH_MAX];
+    snprintf(alt, sizeof(alt), "%s/%s_r1.result.json", BATCH_DIR, id);
+    if (file_exists(alt)) { snprintf(out, outsz, "%s", alt); return true; }
+  }
   batch_result_path(id, ".result.json", path, sizeof(path));
   if (file_exists(path)) { snprintf(out, outsz, "%s", path); return true; }
   return false;
+}
+
+/* cfg->recap_language is empty for the original English track, and an empty
+ * "Toy Story 5 []" in the log tells the user nothing. */
+static const char *batch_lang_label(const Config *cfg) {
+  return (cfg && cfg->recap_language[0]) ? cfg->recap_language : "English";
 }
 
 static bool batch_failed_file(const char *title, const char *lang, char *out, size_t outsz) {
@@ -2403,25 +2434,40 @@ static bool anthropic_get_to_file(const Config *cfg, const char *url, const char
 
 /* ---------------------------------------------------------------- submit */
 
-static bool batch_create(const Config *cfg, size_t from, size_t to,
-                         char *out_id, size_t outsz) {
+/* Defined with the live retry ladder below; the batch create needs the same
+ * "the provider named its output ceiling" handling. */
+static bool anthropic_error_mentions(const char *resp_json, const char *needle);
+static long anthropic_limit_from_error(const char *resp_json, long current);
+static void anthropic_stop_reason(const char *resp_json, char *out, size_t outsz);
+
+/* The create body over an explicit list of collected requests, with "stream"
+ * removed (the API rejects it there) and the output budget forced to "budget" -
+ * the collected params keep their own budget for the "is this request what a
+ * live run would send?" check. */
+static char *batch_create_body(const size_t *idx, size_t n, int budget) {
   cJSON *root = cJSON_CreateObject();
   cJSON *reqs = cJSON_AddArrayToObject(root, "requests");
-  size_t bytes = 0;
-  for (size_t i = from; i < to; i++) {
+  for (size_t k = 0; k < n; k++) {
+    const BatchItem *it = &g_batch_items[idx[k]];
     cJSON *entry = cJSON_CreateObject();
-    cJSON_AddStringToObject(entry, "custom_id", g_batch_items[i].custom_id);
-    cJSON *params = cJSON_Parse(g_batch_items[i].params);
-    if (!params) { cJSON_Delete(entry); cJSON_Delete(root); return false; }
-    /* A batched request must not stream - the results come back as one file. */
+    cJSON_AddStringToObject(entry, "custom_id", it->custom_id);
+    cJSON *params = cJSON_Parse(it->params);
+    if (!params) { cJSON_Delete(entry); cJSON_Delete(root); return NULL; }
     cJSON_DeleteItemFromObjectCaseSensitive(params, "stream");
+    cJSON_DeleteItemFromObjectCaseSensitive(params, "max_tokens");
+    cJSON_AddNumberToObject(params, "max_tokens", budget);
     cJSON_AddItemToObject(entry, "params", params);
     cJSON_AddItemToArray(reqs, entry);
-    bytes += strlen(g_batch_items[i].params);
   }
-
   char *body = cJSON_PrintUnformatted(root);
   cJSON_Delete(root);
+  return body;
+}
+
+static bool batch_submit(const Config *cfg, const size_t *idx, size_t n,
+                         int *in_out_budget, char *out_id, size_t outsz) {
+  int budget = (in_out_budget && *in_out_budget > 0) ? *in_out_budget : BATCH_MAX_TOKENS;
+  char *body = batch_create_body(idx, n, budget);
   if (!body) return false;
 
   /* The Message Batches API lives at /v1/messages/batches (the same base as
@@ -2430,8 +2476,8 @@ static bool batch_create(const Config *cfg, size_t from, size_t to,
   anthropic_endpoint(cfg->openai_base_url, endpoint, sizeof(endpoint));
   snprintf(endpoint + strlen(endpoint), sizeof(endpoint) - strlen(endpoint), "/batches");
 
-  logi("Submitting %zu plan request%s as one batch (50%% cheaper): %s", to - from,
-       (to - from) == 1 ? "" : "s", endpoint);
+  logi("Submitting %zu plan request%s as one batch (50%% cheaper, max_tokens=%d): %s",
+       n, n == 1 ? "" : "s", budget, endpoint);
 
   /* The create call carries the same credentials as a live Messages call. */
   char keyhdr[1024], bearhdr[1024];
@@ -2451,6 +2497,30 @@ static bool batch_create(const Config *cfg, size_t from, size_t to,
   long code = 0;
   MemBuf resp = http_post_json_headers(endpoint, hdrs, body, &code, 900);
   free(body);
+
+  /* A model with a smaller output ceiling (an older Claude caps at 8192) would
+   * lose the whole batch over one rejected cap - and every plan in it would
+   * then be asked live at full price.  Name the ceiling, resubmit once. */
+  if ((code < 200 || code >= 300) && resp.data &&
+      (anthropic_error_mentions(resp.data, "max_tokens") ||
+       anthropic_error_mentions(resp.data, "output tokens"))) {
+    long limit = anthropic_limit_from_error(resp.data, budget);
+    int next = (limit > 0) ? (int)limit : budget / 2;
+    if (next < 1024) next = 1024;
+    if (next != budget) {
+      logw("The endpoint rejected max_tokens=%d for the batch (HTTP %ld) - submitting "
+           "the same %zu request%s again with %d.", budget, code, n,
+           n == 1 ? "" : "s", next);
+      budget = next;
+      if (in_out_budget) *in_out_budget = budget;
+      char *body2 = batch_create_body(idx, n, budget);
+      if (body2) {
+        free(resp.data);
+        resp = http_post_json_headers(endpoint, hdrs, body2, &code, 900);
+        free(body2);
+      }
+    }
+  }
 
   bool ok = false;
   if (code >= 200 && code < 300 && resp.data) {
@@ -2581,6 +2651,21 @@ static int batch_write_results(const char *jsonl_path) {
   return written;
 }
 
+/* -------------------------------------------------- the second batch round */
+
+/* Did the model stop at the output limit for this request?  (Those are the
+ * plans that would otherwise be re-asked live, at the normal price.) */
+static bool batch_item_cut_off(const BatchItem *it) {
+  char path[PATH_MAX];
+  batch_result_path(it->custom_id, ".result.json", path, sizeof(path));
+  char *txt = read_entire_file(path);
+  if (!txt) return false;
+  char stop[64];
+  anthropic_stop_reason(txt, stop, sizeof(stop));
+  free(txt);
+  return strcmp(stop, "max_tokens") == 0;
+}
+
 /* ------------------------------------------------------------- manifest */
 
 /* Which batch is still in flight, so a run that is interrupted (or a second
@@ -2688,6 +2773,53 @@ static bool batch_wait_and_fetch(const Config *cfg, const char *batch_id,
   return written > 0;
 }
 
+/* Plans the model cut off: submit them once more as a batch with twice the
+ * budget (still 50% off) instead of paying full price for a live retry.  Only
+ * what is still cut off after this round is asked live. */
+static bool batch_escalate_cut_off(const Config *cfg, int *budget, bool *cancelled) {
+  if (g_batch_n == 0) return true;
+
+  size_t *idx = (size_t *)malloc(g_batch_n * sizeof(size_t));
+  if (!idx) return true;
+  size_t n = 0;
+  for (size_t i = 0; i < g_batch_n; i++)
+    if (batch_item_cut_off(&g_batch_items[i])) idx[n++] = i;
+  if (n == 0) { free(idx); return true; }
+
+  *budget *= 2;
+  logw("The batch replied with %zu plan%s cut off at max_tokens=%d - the plan(s) "
+       "would have to be bought again live at full price, so they are submitted as "
+       "one more batch with max_tokens=%d instead (still 50%% off).", n,
+       n == 1 ? " was" : "s were", *budget / 2, *budget);
+
+  for (size_t k = 0; k < n; k++) {
+    BatchItem *it = &g_batch_items[idx[k]];
+    /* the truncated plan must not be picked up by the rendering pass */
+    char path[PATH_MAX];
+    batch_result_path(it->custom_id, ".result.json", path, sizeof(path));
+    plat_unlink(path);
+    snprintf(it->custom_id, sizeof(it->custom_id), "%s_r1", it->base_id);
+  }
+
+  char batch_id[128];
+  if (!batch_submit(cfg, idx, n, budget, batch_id, sizeof(batch_id))) {
+    free(idx);
+    logw("The second batch could not be submitted - those plans will be asked live.");
+    return false;
+  }
+
+  logok("Batch %s submitted (%zu request%s) with the bigger budget.",
+        batch_id, n, n == 1 ? "" : "s");
+  batch_save_manifest(batch_id, "submitted", n);
+
+  bool cancel = false;
+  bool got = batch_wait_and_fetch(cfg, batch_id, n, &cancel);
+  if (got) batch_save_manifest(batch_id, "fetched", n);
+  if (cancel && cancelled) *cancelled = true;
+  free(idx);
+  return got;
+}
+
 /* Submit everything that was collected, wait, fetch.
  * Returns true when at least one batch was fetched.  *out_in_flight is set when
  * a batch was submitted and paid for but its results did not arrive (too slow,
@@ -2698,6 +2830,8 @@ static bool batch_run_all(const Config *cfg, bool *cancelled, bool *out_in_fligh
   if (cancelled) *cancelled = false;
   if (out_in_flight) *out_in_flight = false;
   if (g_batch_n == 0) return false;
+
+  int budget = BATCH_MAX_TOKENS;
 
   /* Chunk: the API allows 100k requests or 256 MB, whichever comes first. */
   size_t from = 0, done = 0;
@@ -2715,8 +2849,13 @@ static bool batch_run_all(const Config *cfg, bool *cancelled, bool *out_in_fligh
       to++;
     }
 
+    size_t *idx = (size_t *)malloc((to - from) * sizeof(size_t));
+    if (!idx) return done > 0;
+    for (size_t i = from; i < to; i++) idx[i - from] = i;
+
     char batch_id[128];
-    if (!batch_create(cfg, from, to, batch_id, sizeof(batch_id))) {
+    if (!batch_submit(cfg, idx, to - from, &budget, batch_id, sizeof(batch_id))) {
+      free(idx);
       logw("Falling back to live requests for the %zu plan(s) in this chunk - the "
            "narration is unchanged, only the discount is lost.", to - from);
       /* mark them failed so the render pass makes a live request */
@@ -2729,6 +2868,7 @@ static bool batch_run_all(const Config *cfg, bool *cancelled, bool *out_in_fligh
       from = to;
       continue;
     }
+    free(idx);
 
     logok("Batch %s submitted (%zu request%s). Most batches finish within an hour; "
           "this run waits for it.", batch_id, to - from, (to - from) == 1 ? "" : "s");
@@ -2747,7 +2887,15 @@ static bool batch_run_all(const Config *cfg, bool *cancelled, bool *out_in_fligh
   }
   /* A chunk that is still in flight makes the whole run stop: rendering the
      other plans now would end with live requests for these, at full price. */
-  return done > 0 && !(out_in_flight && *out_in_flight);
+  if (out_in_flight && *out_in_flight) return false;
+
+  /* Plans the model cut off get one more (cheaper) batch before the render pass
+     falls back to a full-price live request. */
+  for (int round = 0; round < BATCH_ESCALATE_ROUNDS; round++) {
+    if (generator_cancel_requested()) break;
+    if (!batch_escalate_cut_off(cfg, &budget, cancelled)) break;
+  }
+  return done > 0;
 }
 
 /* A batch that is still in flight from an earlier run: fetch it instead of
@@ -4195,22 +4343,23 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     if (batch_plan_file(movie_title, recap_lang_code(cfg->recap_language), known, sizeof(known)) ||
         batch_failed_file(movie_title, recap_lang_code(cfg->recap_language), known, sizeof(known))) {
       logi("Already have a batched plan for %s [%s] - not submitting it again.",
-           movie_title, cfg->recap_language[0] ? cfg->recap_language : "English");
+           movie_title, batch_lang_label(cfg));
       free(prompt);
       free(chat_body);
       free(chat_body_limited);
       ClipPlanList empty = {0};
       return empty;
     }
-    char *params = anthropic_build_params(cfg, sys_prompt, prompt, 32000, false, false);
+    char *params = anthropic_build_params(cfg, sys_prompt, prompt, BATCH_MAX_TOKENS,
+                                          false, false);
     if (params) {
       char cid[96];
       batch_custom_id(movie_title, recap_lang_code(cfg->recap_language), cid, sizeof(cid));
       batch_item_add(movie_title, recap_lang_code(cfg->recap_language),
-                     num_clips, per_clip_sec, 32000, params);
+                     num_clips, per_clip_sec, BATCH_MAX_TOKENS, params);
       g_plan_queued = true;
       logi("Queued for the batch: %s [%s] (%d clips) as %s", movie_title,
-           cfg->recap_language[0] ? cfg->recap_language : "English", num_clips, cid);
+           batch_lang_label(cfg), num_clips, cid);
     } else {
       logw("Could not build the plan request for %s - it will be requested live.",
            movie_title);
@@ -4241,7 +4390,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
           if (strcmp(stop, "max_tokens") == 0) {
             logw("The batched plan for %s [%s] stopped at the output limit - asking "
                  "for it live with a bigger budget instead.", movie_title,
-                 cfg->recap_language);
+                 batch_lang_label(cfg));
           } else {
             /* exactly what the live path does with a response body */
             char *out_text = openai_extract_output_text(txt);
@@ -4250,8 +4399,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
               free(out_text);
               if (plan.count > 0) {
                 logok("Using the batched plan for %s [%s] (%zu clips) - no live API "
-                      "call, 50%% cheaper.", movie_title,
-                      cfg->recap_language[0] ? cfg->recap_language : "English",
+                      "call, 50%% cheaper.", movie_title, batch_lang_label(cfg),
                       plan.count);
                 free(txt);
                 free(prompt);
@@ -4261,7 +4409,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
               }
             }
             logw("The batched reply for %s [%s] had no usable clip plan - asking "
-                 "live instead.", movie_title, cfg->recap_language);
+                 "live instead.", movie_title, batch_lang_label(cfg));
           }
           free(txt);
         }
@@ -4269,7 +4417,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
                                    failed, sizeof(failed))) {
         char *why = read_entire_file(failed);
         logw("The batch request for %s [%s] failed (%s) - asking live at the normal "
-             "price.", movie_title, cfg->recap_language, why ? why : "unknown reason");
+             "price.", movie_title, batch_lang_label(cfg), why ? why : "unknown reason");
         free(why);
       }
       /* otherwise: no batch result for this one - fall through to the live call */
@@ -6374,14 +6522,27 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   report_progress(GEN_STAGE_SCRIPT, movie_index, movie_total, 0, 0, movie_title);
 
   char imsdb_url[1600] = {0};
+  char imsdb_miss[PATH_MAX];
+  snprintf(imsdb_miss, sizeof(imsdb_miss), "scripts/srt_files/%s_imsdb_missing.txt",
+           movie_title);
   if (file_exists(script_txt)) {
     logok("Found cached IMSDb script: %s (%ld bytes)", script_txt, file_size_bytes(script_txt));
+  } else if (file_exists(imsdb_miss)) {
+    /* IMSDb has nothing for this title (a new or rare release).  Remember it,
+       or every recap of every language walks all seven URL variants again. */
+    logi("No IMSDb script for %s (checked earlier); using subtitles only.", movie_title);
   } else {
     logi("Attempting IMSDb script scrape for %s (optional context)...", movie_title);
     if (download_imsdb_script_ex(movie_title, script_txt, imsdb_url, sizeof(imsdb_url))) {
       logok("IMSDb script saved: %s (source: %s)", script_txt, imsdb_url[0] ? imsdb_url : "unknown");
     } else {
       logw("IMSDb scrape failed for %s (this is OK; continuing with subtitles-only).", movie_title);
+      FILE *mf = plat_fopen(imsdb_miss, "wb");
+      if (mf) {
+        fputs("IMSDb has no usable script for this title. Delete this file to try "
+              "the scrape again after a later release adds one.\n", mf);
+        fclose(mf);
+      }
     }
   }
 

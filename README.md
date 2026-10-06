@@ -707,17 +707,20 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
     requests and submits them as **one Anthropic Message Batch**. Then it waits for the batch and
     renders every video from those results.
   - each batched request is the *same* request a live run would send: same model, same system
-    prompt, same subtitle text and plot summary, same `max_tokens`. Only `stream` is left out,
-    because the Batches API rejects it (the 10-minute streaming rule does not apply to an
-    asynchronous batch).
+    prompt, same subtitle text and plot summary. Only `stream` is left out, because the Batches API
+    rejects it (the 10-minute streaming rule does not apply to an asynchronous batch). The output
+    budget is deliberately generous (`max_tokens: 64000`, not the 32000 of a live request): a batch
+    has no streaming limit and you are billed for the tokens actually produced, never for the cap -
+    while a reply that comes back cut off would mean buying that plan a second time.
   - **nothing is ever paid for twice.** A batch that was submitted but not fetched yet is remembered
     in `scripts/plans/batch_state.json`; the next run fetches *that* batch instead of submitting a
     new one (results stay available for 29 days). A plan that is already on disk is never queued
     again, and a movie whose video already exists is not planned at all.
-  - **quality is never traded away:** a request that errored/expired, came back without a usable
-    plan, or stopped at the output limit (`stop_reason: max_tokens`) is re-asked **live** at the
-    normal price (streamed, and retried with more room if it is cut off again), so the recap is the
-    same one you would have got without batching. The language check and the length audit run on
+  - **quality is never traded away:** a plan that stopped at the output limit
+    (`stop_reason: max_tokens`) is **submitted once more, as one more batch with twice the budget**
+    (still 50% off) - only what is still cut off after that is re-asked **live** at the normal price
+    (streamed, with the live retry ladder). An errored or expired request goes straight to the live
+    retry, because there is no reply to re-ask about. The language check and the length audit run on
     batched plans exactly as on live ones, and a "write longer narrations" / "answer in <language>"
     correction always goes live. A plan that failed in the batch is remembered as failed, so it is
     not submitted a second time either.
