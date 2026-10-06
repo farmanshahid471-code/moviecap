@@ -79,7 +79,7 @@ jobs:
           Write-Host $cfg
           if ($LASTEXITCODE -ne 0) { Show-Tail $cfg "cmake configure"; exit 1 }
 
-          $bld = & cmake --build build --config Release --target caption_language_test srt_structure_test 2>&1 | Out-String
+          $bld = & cmake --build build --config Release --target caption_language_test srt_structure_test anthropic_endpoint_test 2>&1 | Out-String
           Write-Host $bld
           if ($LASTEXITCODE -ne 0) { Show-Tail $bld "building the unit tests"; exit 1 }
 

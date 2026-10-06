@@ -222,7 +222,7 @@ endif()
 if(BUILD_UNIT_TESTS)
   enable_testing()
 
-  foreach(_t caption_language_test srt_structure_test)
+  foreach(_t caption_language_test srt_structure_test anthropic_endpoint_test)
     # cJSON is compiled straight into the target, exactly like movie_core does.
     add_executable(${_t}
       tests/${_t}.c
@@ -231,6 +231,8 @@ if(BUILD_UNIT_TESTS)
       "${cjson_SOURCE_DIR}/cJSON.c"
     )
     target_include_directories(${_t} PRIVATE "${cjson_SOURCE_DIR}")
+    # the retry backoff must not put the tests to sleep
+    target_compile_definitions(${_t} PRIVATE MOVIECAP_UNIT_TEST)
     target_link_libraries(${_t} PRIVATE CURL::libcurl miniz Threads::Threads)
     if(WIN32)
       target_compile_definitions(${_t} PRIVATE
@@ -253,5 +255,6 @@ if(BUILD_UNIT_TESTS)
   # every test gets a scratch directory to write its subtitle fixtures in
   file(MAKE_DIRECTORY
     "${CMAKE_CURRENT_BINARY_DIR}/caption_language_test_run"
-    "${CMAKE_CURRENT_BINARY_DIR}/srt_structure_test_run")
+    "${CMAKE_CURRENT_BINARY_DIR}/srt_structure_test_run"
+    "${CMAKE_CURRENT_BINARY_DIR}/anthropic_endpoint_test_run")
 endif()

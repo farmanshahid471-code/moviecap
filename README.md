@@ -664,16 +664,35 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
 - **Claude / Anthropic-compatible endpoints** (any `openai_base_url` containing `anthropic`):
   - native Claude: `"openai_base_url": "https://api.anthropic.com/v1"` with an Anthropic key
     (`sk-ant-api...`) and a `claude-...` model. The key goes in the `x-api-key` header only —
-    sent as a Bearer token instead, the API rejects it.
+    sent as a Bearer token instead, the API rejects it. All of these are accepted as the base URL:
+    `https://api.anthropic.com/v1`, `https://api.anthropic.com`, a pasted
+    `.../v1/messages` endpoint, with or without a trailing slash.
+  - **the reply is streamed** (`"stream": true`). Anthropic refuses a *non-streaming* request
+    whose `max_tokens` implies more than ~21,333 tokens of output ("Streaming is required for
+    operations that may take longer than 10 minutes"), and a full clip plan needs more room than
+    that — that is what made the Anthropic end look broken. The server-sent event stream is folded
+    back into one reply object, so everything downstream (JSON repair, clip parsing, the
+    "cut off at the output limit" retry) works exactly as before. A gateway that cannot stream
+    answers HTTP 400, and that one request is retried non-streaming with a budget that fits
+    (`max_tokens` 16000), so gateways keep working too.
   - gateways (DeepSeek `https://api.deepseek.com/anthropic`, Azure AI Foundry, ...) get the key in
     **both** headers and the model name is what the gateway expects.
   - the request adapts itself instead of silently dropping to the fallback planner: an output-token
     limit that is too high is retried with the limit named in the error (e.g. 32000 → 8192), a
     rejected `thinking` field is dropped and retried, and a reply that was cut off mid-JSON still
     yields the clip ranges that were complete. A reply that stopped at the provider's output limit
-    (`stop_reason: max_tokens`) is retried with a doubled budget (32000 → 64000) while the provider
-    allows it. `api.anthropic.com` is not retried on the
-    OpenAI-style `/chat/completions` path (it does not exist there) — the log tells you instead.
+    (`stop_reason: max_tokens`, or `status: incomplete` / `finish_reason: length` on the OpenAI-style
+    paths) is retried with a doubled budget (32000 → 64000) while the provider allows it, and the log
+    says so instead of quietly shipping a half-length recap. `429` and `529`/`5xx` (rate limited /
+    overloaded) are retried with a short backoff, which is what Anthropic asks clients to do.
+    A model refusal (`stop_reason: refusal`) is reported as a refusal rather than as a broken plan.
+  - the log prints what actually went out, so a failure can be read off it:
+    `Anthropic-compatible endpoint: .../v1/messages (model=claude-..., max_tokens=32000, streamed)`.
+    A key that is not `sk-ant-...` while the base URL is `api.anthropic.com`, or a model that is not
+    a `claude-...` model on that host, is warned about *before* the request is spent.
+  - `api.anthropic.com` is not retried on the OpenAI-style `/chat/completions` path (it does not
+    exist there) — the log tells you instead. For gateways that path is derived from the Anthropic
+    base URL with the pasted tail, `/v1` and `/anthropic` peeled off.
   - the OpenAI-style paths ask for a full plan too: `max_output_tokens` on the Responses API and
     `max_completion_tokens` on `/chat/completions` (dropped automatically for providers that only
     know `max_tokens`). If a reply still stops early, the log warns that only part of the clip plan

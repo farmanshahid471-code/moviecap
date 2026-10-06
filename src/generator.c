@@ -2047,9 +2047,34 @@ static MemBuf http_post_json_headers(const char *url, const char *const *headers
  *   https://api.anthropic.com/v1  ->  https://api.anthropic.com/v1/messages
  *   https://api.deepseek.com/anthropic -> https://api.deepseek.com/anthropic/v1/messages */
 static void anthropic_endpoint(const char *base, char *out, size_t outsz) {
-  size_t bl = strlen(base);
-  bool has_v1 = bl >= 3 && strcmp(base + bl - 3, "/v1") == 0;
-  snprintf(out, outsz, "%s%s/messages", base, has_v1 ? "" : "/v1");
+  char tmp[512];
+  snprintf(tmp, sizeof(tmp), "%s", base ? base : "");
+  size_t bl = strlen(tmp);
+  while (bl > 1 && tmp[bl - 1] == '/') tmp[--bl] = '\0';
+  /* somebody pasted the full endpoint instead of the base URL */
+  if (bl >= 9 && strcmp(tmp + bl - 9, "/messages") == 0) tmp[bl -= 9] = '\0';
+  bl = strlen(tmp);
+  bool has_v1 = bl >= 3 && strcmp(tmp + bl - 3, "/v1") == 0;
+  snprintf(out, outsz, "%s%s/messages", tmp, has_v1 ? "" : "/v1");
+}
+
+/* The OpenAI-style base URL behind an Anthropic-style one.  A pasted endpoint
+ * tail (/messages), a /v1 suffix and the gateway's /anthropic suffix are all
+ * peeled off, so the /chat/completions retry lands on the right host:
+ *   https://api.deepseek.com/anthropic           -> https://api.deepseek.com
+ *   https://gw.example.com/anthropic/v1/messages -> https://gw.example.com
+ */
+static void anthropic_openai_base(const char *base, char *out, size_t outsz) {
+  char tmp[512];
+  snprintf(tmp, sizeof(tmp), "%s", base ? base : "");
+  size_t bl = strlen(tmp);
+  while (bl > 1 && tmp[bl - 1] == '/') tmp[--bl] = '\0';
+  if (bl >= 9 && strcmp(tmp + bl - 9, "/messages") == 0) tmp[bl -= 9] = '\0';
+  bl = strlen(tmp);
+  if (bl >= 3 && strcmp(tmp + bl - 3, "/v1") == 0) tmp[bl -= 3] = '\0';
+  bl = strlen(tmp);
+  if (bl >= 10 && strcmp(tmp + bl - 10, "/anthropic") == 0) tmp[bl -= 10] = '\0';
+  snprintf(out, outsz, "%s", tmp);
 }
 
 /* api.anthropic.com itself authenticates with x-api-key only and rejects an
@@ -2063,8 +2088,8 @@ static bool anthropic_host_is_native(const char *base) {
 
 static MemBuf anthropic_post_messages(const Config *cfg, const char *sys_prompt,
                                       const char *prompt, int max_tokens,
-                                      bool disable_thinking, long *http_code,
-                                      long timeout_s) {
+                                      bool disable_thinking, bool stream,
+                                      long *http_code, long timeout_s) {
   char endpoint[560];
   anthropic_endpoint(cfg->openai_base_url, endpoint, sizeof(endpoint));
 
@@ -2079,6 +2104,13 @@ static MemBuf anthropic_post_messages(const Config *cfg, const char *sys_prompt,
     cJSON *th = cJSON_CreateObject();
     cJSON_AddStringToObject(th, "type", "disabled");
     cJSON_AddItemToObject(req, "thinking", th);
+  }
+  if (stream) {
+    /* Anthropic answers a non-streaming request only while max_tokens stays
+       under ~21,333 (a reply that may take longer than 10 minutes has to be
+       streamed - see ANTHROPIC_STREAM_OVER); the reply then arrives as SSE and
+       is folded back into one Messages object by anthropic_sse_fold. */
+    cJSON_AddBoolToObject(req, "stream", 1);
   }
   cJSON_AddStringToObject(req, "system", sys_prompt);
   cJSON *msgs = cJSON_CreateArray();
@@ -2107,11 +2139,103 @@ static MemBuf anthropic_post_messages(const Config *cfg, const char *sys_prompt,
   }
   hdrs[nh] = NULL;
 
-  logi("Anthropic-compatible endpoint: %s (max_tokens=%d%s)", endpoint, max_tokens,
-       disable_thinking ? ", thinking disabled" : "");
+  logi("Anthropic-compatible endpoint: %s (model=%s, max_tokens=%d%s%s)", endpoint,
+       cfg->openai_model, max_tokens, disable_thinking ? ", thinking disabled" : "",
+       stream ? ", streamed" : "");
   MemBuf r = http_post_json_headers(endpoint, hdrs, body, http_code, timeout_s);
   free(body);
   return r;
+}
+
+/* A streamed Messages reply is a server-sent event stream.  Fold it back into
+ * one object shaped like a non-streaming reply:
+ *   {"content":[{"type":"text","text":"..."}], "stop_reason":"end_turn"}
+ * so every reader of the response keeps working unchanged.  Returns NULL when
+ * the body is not an event stream (a plain JSON reply, an HTML error page). */
+static char *anthropic_sse_fold(const char *body) {
+  if (!body) return NULL;
+  if (strncmp(body, "event:", 6) != 0 && strstr(body, "\nevent:") == NULL)
+    return NULL;
+
+  char *text = NULL;
+  size_t tlen = 0, tcap = 0;
+  char stop[64];
+  stop[0] = '\0';
+  char *err_json = NULL;
+
+  const char *p = body;
+  while (p && *p) {
+    const char *nl = strchr(p, '\n');
+    const char *line = p;
+    size_t ll = nl ? (size_t)(nl - p) : strlen(p);
+
+    if (ll > 5 && strncmp(line, "data:", 5) == 0) {
+      const char *j = line + 5;
+      while (*j == ' ' || *j == '\t') j++;
+      size_t jlen = ll - (size_t)(j - line);
+      if (strncmp(j, "[DONE]", 6) != 0) {
+        cJSON *ev = cJSON_ParseWithLength(j, jlen);
+        if (ev) {
+          const cJSON *type = cJSON_GetObjectItemCaseSensitive(ev, "type");
+          const char *t = cJSON_IsString(type) ? type->valuestring : "";
+          if (strcmp(t, "content_block_delta") == 0) {
+            const cJSON *d = cJSON_GetObjectItemCaseSensitive(ev, "delta");
+            const cJSON *dt = d ? cJSON_GetObjectItemCaseSensitive(d, "text") : NULL;
+            if (cJSON_IsString(dt) && dt->valuestring) {
+              size_t add = strlen(dt->valuestring);
+              if (tlen + add + 1 > tcap) {
+                tcap = (tlen + add + 1) * 2;
+                text = (char *)realloc(text, tcap);
+                if (!text) die("OOM");
+              }
+              memcpy(text + tlen, dt->valuestring, add);
+              tlen += add;
+              text[tlen] = '\0';
+            }
+          } else if (strcmp(t, "message_delta") == 0) {
+            const cJSON *d = cJSON_GetObjectItemCaseSensitive(ev, "delta");
+            const cJSON *sr = d ? cJSON_GetObjectItemCaseSensitive(d, "stop_reason") : NULL;
+            if (cJSON_IsString(sr) && sr->valuestring)
+              snprintf(stop, sizeof(stop), "%s", sr->valuestring);
+          } else if (strcmp(t, "error") == 0 || strcmp(t, "message_stop") == 0) {
+            if (strcmp(t, "error") == 0) {
+              free(err_json);
+              err_json = cJSON_PrintUnformatted(ev);
+            }
+          }
+          cJSON_Delete(ev);
+        }
+      }
+    }
+    p = nl ? nl + 1 : NULL;
+  }
+
+  if (err_json) {
+    free(text);
+    return err_json;
+  }
+  cJSON *out = cJSON_CreateObject();
+  cJSON *content = cJSON_AddArrayToObject(out, "content");
+  cJSON *item = cJSON_CreateObject();
+  cJSON_AddStringToObject(item, "type", "text");
+  cJSON_AddStringToObject(item, "text", text ? text : "");
+  cJSON_AddItemToArray(content, item);
+  if (stop[0]) cJSON_AddStringToObject(out, "stop_reason", stop);
+  char *folded = cJSON_PrintUnformatted(out);
+  cJSON_Delete(out);
+  free(text);
+  return folded;
+}
+
+static void anthropic_stop_reason(const char *body, char *out, size_t outsz) {
+  out[0] = '\0';
+  if (!body) return;
+  cJSON *root = cJSON_Parse(body);
+  if (!root) return;
+  const cJSON *sr = cJSON_GetObjectItemCaseSensitive(root, "stop_reason");
+  if (cJSON_IsString(sr) && sr->valuestring)
+    snprintf(out, outsz, "%s", sr->valuestring);
+  cJSON_Delete(root);
 }
 
 /* The provider tells us the real output limit in the error message, e.g.
@@ -2149,23 +2273,16 @@ static bool anthropic_error_mentions(const char *resp_json, const char *needle) 
 /* An HTTP 200 can still be a cut-off answer: the provider stopped at its output
  * limit in the middle of the clips array.  Anthropic-compatible replies say so
  * in stop_reason, OpenAI-style replies in finish_reason / status. */
-static bool anthropic_body_hit_output_limit(const char *body) {
-  if (!body) return false;
-  cJSON *root = cJSON_Parse(body);
-  if (!root) return false;
-  const cJSON *sr = cJSON_GetObjectItemCaseSensitive(root, "stop_reason");
-  bool hit = cJSON_IsString(sr) && sr->valuestring &&
-             strcmp(sr->valuestring, "max_tokens") == 0;
-  cJSON_Delete(root);
-  return hit;
-}
-
 static bool openai_body_hit_output_limit(const char *body) {
   if (!body) return false;
   cJSON *root = cJSON_Parse(body);
   if (!root) return false;
 
   bool hit = false;
+  const cJSON *stop = cJSON_GetObjectItemCaseSensitive(root, "stop_reason");
+  if (cJSON_IsString(stop) && stop->valuestring &&
+      strcmp(stop->valuestring, "max_tokens") == 0)
+    hit = true;                                   /* Anthropic Messages API */
   const cJSON *status = cJSON_GetObjectItemCaseSensitive(root, "status");
   if (cJSON_IsString(status) && status->valuestring &&
       strcmp(status->valuestring, "incomplete") == 0)
@@ -2198,6 +2315,9 @@ static void warn_if_plan_was_cut_short(const char *resp_body, size_t clips) {
  * The Messages API has no JSON mode, and questions of taste differ between
  * Claude, DeepSeek's gateway and Azure, so this keeps the run alive instead of
  * silently dropping to the raw-subtitle fallback planner. */
+#define ANTHROPIC_STREAM_OVER   21333  /* non-streaming max_tokens ceiling  */
+#define ANTHROPIC_NONSTREAM_MAX 16000  /* what we ask for when not streaming */
+
 static MemBuf anthropic_plan_request(const Config *cfg, const char *sys_prompt,
                                      const char *prompt, long *http_code,
                                      long timeout_s) {
@@ -2216,22 +2336,64 @@ static MemBuf anthropic_plan_request(const Config *cfg, const char *sys_prompt,
   int  budget = 32000;
   int  raised = 0;              /* times we asked for more room */
   bool lowered = false;         /* provider told us its ceiling */
+  /* A full clip plan in one non-streaming reply is exactly what Anthropic
+     refuses above ~21,333 max_tokens, so a big budget goes out streamed (the
+     SSE reply is folded back into one JSON object). */
+  bool stream = budget > ANTHROPIC_STREAM_OVER;
+  bool tried_stream = stream, tried_nonstream = !stream;
+  int  waited = 0;              /* transient-error retries used */
+
+  /* Say the obvious things before spending a request: with a key that is not
+     an Anthropic key, or a model that is not a Claude model, the native
+     endpoint can only ever answer 401/404. */
+  if (anthropic_host_is_native(cfg->openai_base_url)) {
+    if (strncmp(mdl_lc, "claude", 6) != 0)
+      logw("The model \"%s\" does not look like a Claude model, but the base URL "
+           "points at api.anthropic.com - that host serves claude-... models only.",
+           cfg->openai_model);
+    if (strncmp(cfg->openai_key, "sk-ant-", 7) != 0)
+      logw("The API key does not look like an Anthropic key (it should start with "
+           "sk-ant-api... or sk-ant-oat... for an OAuth token), but the base URL "
+           "points at api.anthropic.com.");
+  }
 
   MemBuf resp = {0};
-  for (int attempt = 0; attempt < 5; attempt++) {
+  for (int attempt = 0; attempt < 6; attempt++) {
     resp = anthropic_post_messages(cfg, sys_prompt, prompt, budget, disable_thinking,
-                                   http_code, timeout_s);
+                                   stream, http_code, timeout_s);
     long code = http_code ? *http_code : 0;
+
+    if (resp.data && code >= 200 && code < 300) {
+      char *folded = anthropic_sse_fold(resp.data);
+      if (folded) {
+        free(resp.data);
+        resp.data = folded;
+        resp.size = strlen(folded);
+        if (strstr(folded, "\"error\"") && !strstr(folded, "\"content\"")) {
+          code = 400;                 /* an error event inside the stream */
+          if (http_code) *http_code = 400;
+          logw("The streamed reply carried an error: %.300s", folded);
+        }
+      }
+    }
+
     if (code >= 200 && code < 300) {
+      char stop[64];
+      anthropic_stop_reason(resp.data, stop, sizeof(stop));
+      if (strcmp(stop, "refusal") == 0)
+        logw("The model refused to write this plan (stop_reason=refusal) - a different "
+             "model may handle this movie.");
       /* Cut off mid-array?  Ask for more room, unless the provider already
          named its ceiling (then the plan is simply as long as it can be). */
-      if (anthropic_body_hit_output_limit(resp.data) && !lowered && raised < 2 &&
+      if (strcmp(stop, "max_tokens") == 0 && !lowered && raised < 2 &&
           budget < 160000) {
         int next = budget * 2;
         if (next > 160000) next = 160000;
         logw("The reply was cut off in the middle of the plan (stop_reason=max_tokens) - "
              "retrying with max_tokens=%d so all clips arrive.", next);
         budget = next;
+        stream = true;                /* a budget this size has to stream */
+        tried_stream = true;
         raised++;
         if (resp.data) free(resp.data);
         resp.data = NULL;
@@ -2247,6 +2409,7 @@ static MemBuf anthropic_plan_request(const Config *cfg, const char *sys_prompt,
       long limit = anthropic_limit_from_error(resp.data, budget);
       int next = (limit > 0 && limit < budget) ? (int)limit : budget / 4;
       if (next < 512) next = 512;
+      if (!stream && next > ANTHROPIC_NONSTREAM_MAX) next = ANTHROPIC_NONSTREAM_MAX;
       if (next != budget) {
         logw("Anthropic endpoint rejected max_tokens=%d (HTTP %ld) - retrying with %d.",
              budget, code, next);
@@ -2259,6 +2422,47 @@ static MemBuf anthropic_plan_request(const Config *cfg, const char *sys_prompt,
                 anthropic_error_mentions(resp.data, "output_config"))) {
       logw("Anthropic endpoint rejects the thinking field (HTTP %ld) - retrying without it.", code);
       disable_thinking = false;
+      retried = true;
+    }
+
+    /* Transient: rate limit, overloaded (529), gateway hiccup.  Anthropic asks
+       clients to retry these instead of failing the run. */
+    if (!retried &&
+        (code == 429 || code == 500 || code == 502 || code == 503 || code == 504 ||
+         code == 529 || (code == 400 && anthropic_error_mentions(resp.data, "overloaded")))) {
+      if (waited < 2) {
+        int delay_ms = waited == 0 ? 2000 : 5000;
+        waited++;
+        logw("The Anthropic endpoint is overloaded or rate limited (HTTP %ld) - retrying "
+             "in %d s.", code, delay_ms / 1000);
+#ifndef MOVIECAP_UNIT_TEST
+        plat_sleep_ms(delay_ms);
+#endif
+        retried = true;
+      }
+    }
+
+    /* "Streaming is required for operations that may take longer than 10
+       minutes": the reply has to be streamed at this budget. */
+    if (!retried && !stream && !tried_stream &&
+        (anthropic_error_mentions(resp.data, "streaming") ||
+         anthropic_error_mentions(resp.data, "stream is required"))) {
+      logw("The endpoint requires a streamed reply for this output budget - retrying "
+           "with streaming.");
+      stream = true;
+      tried_stream = true;
+      retried = true;
+    }
+
+    /* A gateway that cannot stream answers a streamed request with 400/422:
+       go back to a plain request with a budget that fits one. */
+    if (!retried && stream && !tried_nonstream && (code == 400 || code == 422)) {
+      logw("The endpoint rejected the streamed request (HTTP %ld) - retrying without "
+           "streaming (max_tokens=%d).", code,
+           budget > ANTHROPIC_NONSTREAM_MAX ? ANTHROPIC_NONSTREAM_MAX : budget);
+      stream = false;
+      tried_nonstream = true;
+      if (budget > ANTHROPIC_NONSTREAM_MAX) budget = ANTHROPIC_NONSTREAM_MAX;
       retried = true;
     }
 
@@ -3353,7 +3557,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   bool has_script = (optional_script_text && optional_script_text[0] != 0);
   long timeout_s = has_script ? 14400L : 3600L;
 
-  bool anthropic_base = strstr(cfg->openai_base_url, "anthropic") != NULL;
+  bool anthropic_base = strcasestr_local(cfg->openai_base_url, "anthropic") != NULL;
   char endpoint[560];
   MemBuf resp;
 
@@ -3392,10 +3596,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
       /* Rescue: gateways like DeepSeek's also serve /chat/completions on the
          plain base URL - derive it and retry with the SAME prompt. */
       char base2[512];
-      snprintf(base2, sizeof(base2), "%s", cfg->openai_base_url);
-      size_t bl = strlen(base2);
-      while (bl > 1 && base2[bl - 1] == '/') base2[--bl] = '\0';
-      if (bl >= 10 && strcmp(base2 + bl - 10, "/anthropic") == 0) base2[bl - 10] = '\0';
+      anthropic_openai_base(cfg->openai_base_url, base2, sizeof(base2));
       snprintf(endpoint, sizeof(endpoint), "%s/chat/completions", base2);
       logi("Anthropic endpoint failed - trying the OpenAI-style endpoint instead: %s", endpoint);
       resp = openai_post_chat_tokens(endpoint, cfg->openai_key,
@@ -3479,10 +3680,7 @@ have_response:;
   if (plan.count == 0 && anthropic_base && chat_body &&
       !anthropic_host_is_native(cfg->openai_base_url)) {
     char base2[512];
-    snprintf(base2, sizeof(base2), "%s", cfg->openai_base_url);
-    size_t bl = strlen(base2);
-    while (bl > 1 && base2[bl - 1] == '/') base2[--bl] = '\0';
-    if (bl >= 10 && strcmp(base2 + bl - 10, "/anthropic") == 0) base2[bl - 10] = '\0';
+    anthropic_openai_base(cfg->openai_base_url, base2, sizeof(base2));
     snprintf(endpoint, sizeof(endpoint), "%s/chat/completions", base2);
     logi("Trying the OpenAI-style endpoint instead: %s", endpoint);
     long code2 = 0;

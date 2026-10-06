@@ -994,7 +994,7 @@ static const char *PAGE_HTML[] = {
   "        <div><label class='f'>Music vol</label><input type='number' id='bgm_volume' step='0.05' min='0' max='10'></div>",
   "      </div>",
   "      <label class='f'>OpenAI base URL</label><input type='text' id='openai_base_url'>",
-  "      <div class='hint'>Any OpenAI-compatible API works (OpenAI, DeepSeek: https://api.deepseek.com/v1). Claude is supported too: use https://api.anthropic.com/v1 with a claude-... model, or DeepSeek via Anthropic style: https://api.deepseek.com/anthropic - any base URL containing 'anthropic' switches to the Anthropic Messages API automatically.</div>",
+  "      <div class='hint'>Any OpenAI-compatible API works (OpenAI, DeepSeek: https://api.deepseek.com/v1). Claude is supported too: use https://api.anthropic.com/v1 with a claude-... model and your sk-ant-... key, or DeepSeek via Anthropic style: https://api.deepseek.com/anthropic - any base URL containing 'anthropic' switches to the Anthropic Messages API automatically (large plans are streamed, which is what that API requires).</div>",
   "      <label class='f'>ElevenLabs base URL</label><input type='text' id='elevenlabs_base_url'>",
   "      <label class='f'>TTS server URL <span class='hint'>xtts / piper / openai-compatible</span></label>",
   "      <input type='text' id='tts_base_url' placeholder='http://127.0.0.1:8020'>",
