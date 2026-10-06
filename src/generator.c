@@ -469,6 +469,7 @@ typedef struct {
   char recap_languages[4][96];/* languages to render, one recap each, in order */
   int  n_recap_languages;
   int  tts_voice_auto;        /* 1 = tts_voice was auto-picked, free to change */
+  int  tts_rate;              /* narration speed in %, 100 = normal voice     */
   char caption_font[256];     /* font used for burnt-in captions              */
   char caption_font_zh[256];  /* per-language caption fonts ("" = use above)  */
   char caption_font_ar[256];
@@ -611,6 +612,7 @@ static Config load_config_json(const char *path) {
   cfg_set_str(c.caption_font_zh, sizeof(c.caption_font_zh), cJSON_GetObjectItemCaseSensitive(root, "caption_font_zh"));
   cfg_set_str(c.caption_font_ar, sizeof(c.caption_font_ar), cJSON_GetObjectItemCaseSensitive(root, "caption_font_ar"));
   cfg_set_str(c.caption_font_es, sizeof(c.caption_font_es), cJSON_GetObjectItemCaseSensitive(root, "caption_font_es"));
+  c.tts_rate = (int)cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "tts_rate"), 110, 50, 200);
   if (c.tts_provider == TTS_XTTS && c.tts_voice[0] == 0)
     die("config.json: tts_voice must name an XTTS speaker (a .wav in the server's speakers folder)");
   c.tts_voice_auto = 0;
@@ -1368,9 +1370,33 @@ static void free_clip_plan_list(ClipPlanList *lst) {
   lst->count = 0;
 }
 
+/* Models often wrap the JSON in ```json fences or a chatty preamble - pull
+ * out the outermost {...} block before parsing so extra text never throws a
+ * whole plan away (that silently dropped runs onto the offline planner). */
+static char *json_extract_object(const char *in) {
+  const char *a = strchr(in, '{');
+  if (!a) return NULL;
+  const char *b = strrchr(in, '}');
+  if (!b || b <= a) return NULL;
+  size_t n = (size_t)(b - a) + 1;
+  char *out = (char *)malloc(n + 1);
+  if (!out) return NULL;
+  memcpy(out, a, n);
+  out[n] = '\0';
+  return out;
+}
+
 static ClipPlanList parse_clip_plan_json(const char *json_text) {
   ClipPlanList out = {0};
   cJSON *root = cJSON_Parse(json_text);
+  if (!root) {
+    char *bare = json_extract_object(json_text);
+    if (bare) {
+      root = cJSON_Parse(bare);
+      free(bare);
+      if (root) logw("Model wrapped the JSON in extra text - recovered the clip plan anyway.");
+    }
+  }
   if (!root) return out;
 
   cJSON *clips = cJSON_GetObjectItemCaseSensitive(root, "clips");
@@ -1508,6 +1534,34 @@ static char *trim_copy_utf8_safe(const char *s, size_t max_bytes) {
   return out;
 }
 
+/* True when the recap must be Chinese/Arabic but the plan's narrations are
+ * mostly other scripts - i.e. the model ignored the language rule. */
+static bool plan_language_mismatch(const ClipPlan *items, size_t n, const char *code) {
+  bool want_cjk = !strcmp(code, "zh");
+  bool want_ar  = !strcmp(code, "ar");
+  if (!want_cjk && !want_ar) return false;
+  size_t total = 0, hit = 0;
+  for (size_t i = 0; i < n; i++) {
+    const unsigned char *p = (const unsigned char *)items[i].narration;
+    if (!p) continue;
+    while (*p) {
+      unsigned v; size_t l;
+      if (*p < 0x80)                 { v = *p; l = 1; if (v != ' ') total++; }
+      else if ((*p & 0xE0) == 0xC0)  { v = ((unsigned)(*p & 0x1F) << 6) | (p[1] & 0x3F); l = 2; total++; }
+      else if ((*p & 0xF0) == 0xE0)  { v = ((unsigned)(*p & 0x0F) << 12) | ((unsigned)(p[1] & 0x3F) << 6) | (p[2] & 0x3F); l = 3; total++; }
+      else if ((*p & 0xF8) == 0xF0)  { v = 0x10000u; l = 4; total++; }
+      else                            { l = 1; continue; }
+      if (l > 1) {
+        if (want_cjk && ((v >= 0x4E00 && v <= 0x9FFF) || (v >= 0x3400 && v <= 0x4DBF))) hit++;
+        if (want_ar  && v >= 0x0600 && v <= 0x06FF) hit++;
+      }
+      p += l;
+    }
+  }
+  if (total < 40) return false;
+  return (double)hit / (double)total < 0.30;
+}
+
 static ClipPlanList openai_make_plan(const Config *cfg,
                                      const char *movie_title,
                                      const char *subs_seconds_text,
@@ -1515,7 +1569,8 @@ static ClipPlanList openai_make_plan(const Config *cfg,
                                      bool subs_placeholder,
                                      int num_clips,
                                      int per_clip_sec,
-                                     bool *out_retry_without_script) {
+                                     bool *out_retry_without_script,
+                                     bool demand_language) {
   if (out_retry_without_script) *out_retry_without_script = false;
 
   const size_t MAX_SUB_CHARS    = 320000;
@@ -1553,42 +1608,118 @@ static ClipPlanList openai_make_plan(const Config *cfg,
              "- Never use generic filler or trailer cliches like \"the stakes get "
              "raised\".\n");
 
-  char language_rule[384];
+  bool non_en_lang = cfg->recap_language[0] && str_icmp(cfg->recap_language, "english") != 0;
+
+  char language_rule[512];
   language_rule[0] = '\0';
-  if (cfg->recap_language[0] && str_icmp(cfg->recap_language, "english") != 0)
+  if (non_en_lang)
     snprintf(language_rule, sizeof(language_rule),
-             "\nLANGUAGE: Write ALL narrations in %s - natural, fluent and "
-             "native-sounding, like a native recap narrator. The subtitles may "
-             "be in English or another language; tell the story in %s either "
-             "way. Keep character names recognizable (common localized names "
-             "or clean transliterations).\n",
+             "\nLANGUAGE - THE MOST IMPORTANT RULE: Write ALL narrations in %s - "
+             "natural, fluent and native-sounding, like a native recap narrator. "
+             "The subtitles may be in English; tell the story in %s anyway. Not "
+             "one narration may be in English. Keep character names recognizable "
+             "(common localized names or clean transliterations).\n",
              cfg->recap_language, cfg->recap_language);
+
+  char demand_note[320];
+  demand_note[0] = '\0';
+  if (demand_language && non_en_lang)
+    snprintf(demand_note, sizeof(demand_note),
+             "\nCRITICAL: the previous answer was written in English and was "
+             "rejected. EVERY narration string MUST be written entirely in %s. "
+             "Do not output English.\n", cfg->recap_language);
+
+  char sys_lang_extra[160];
+  sys_lang_extra[0] = '\0';
+  if (non_en_lang)
+    snprintf(sys_lang_extra, sizeof(sys_lang_extra),
+             " Every narration you write must be entirely in %s, never English.",
+             cfg->recap_language);
+
+  /* The exact outro, in the recap language - demanding an English outro for a
+     Chinese recap pushed models into writing the whole plan in English. */
+  char outro_rule[760];
+  {
+    const char *ocode = recap_lang_code(cfg->recap_language);
+    if (!strcmp(ocode, "zh"))
+      snprintf(outro_rule, sizeof(outro_rule),
+               "- The LAST narration must end EXACTLY with these Chinese "
+               "characters: \u6545\u4e8b\u5c31\u8bb2\u5230\u8fd9\u91cc\u3002"
+               "\u5728\u8bc4\u8bba\u533a\u544a\u8bc9\u6211\u4eec\u4f60\u7684"
+               "\u770b\u6cd5\uff0c\u522b\u5fd8\u4e86\u70b9\u8d5e\u89c6\u9891"
+               "\u5e76\u8ba2\u9605\u9891\u9053\u3002\n");
+    else if (!strcmp(ocode, "ar"))
+      snprintf(outro_rule, sizeof(outro_rule),
+               "- The LAST narration must end EXACTLY with this Arabic text: "
+               "\u0648\u0628\u0647\u0630\u0627 \u062a\u0646\u062a\u0647\u064a "
+               "\u0627\u0644\u0642\u0635\u0629 \u0647\u0646\u0627. "
+               "\u0623\u062e\u0628\u0631\u0648\u0646\u0627 \u0641\u064a "
+               "\u0627\u0644\u062a\u0639\u0644\u064a\u0642\u0627\u062a "
+               "\u0628\u0631\u0623\u064a\u0643\u0645 \u0641\u064a \u0647\u0630\u0627 "
+               "\u0627\u0644\u0634\u0631\u062d\u060c \u0648\u0644\u0627 "
+               "\u062a\u0646\u0633\u0648\u0627 \u0627\u0644\u0625\u0639\u062c\u0627\u0628 "
+               "\u0628\u0627\u0644\u0641\u064a\u062f\u064a\u0648 \u0648\u0627\u0644\u0627\u0634\u062a\u0631\u0627\u0643 "
+               "\u0641\u064a \u0627\u0644\u0642\u0646\u0627\u0629.\n");
+    else if (!strcmp(ocode, "es"))
+      snprintf(outro_rule, sizeof(outro_rule),
+               "- The LAST narration must end EXACTLY with: \"Y con esto la "
+               "historia termina justo aqu\u00ed. Cu\u00e9ntanos en los comentarios "
+               "qu\u00e9 te pareci\u00f3 esta explicaci\u00f3n y no olvides darle like al "
+               "video y suscribirte al canal.\"\n");
+    else if (non_en_lang)
+      snprintf(outro_rule, sizeof(outro_rule),
+               "- The LAST narration must end with a natural %s version of: "
+               "\"With that the story ends right here. Let us know in the comments "
+               "how you liked this explanation and don't forget to like the video "
+               "and subscribe to the channel.\"\n", cfg->recap_language);
+    else
+      snprintf(outro_rule, sizeof(outro_rule),
+               "- The LAST narration must end EXACTLY with: \"With that the story "
+               "ends right here. Let us know in the comments how you liked this "
+               "explanation and don't forget to like the video and subscribe to "
+               "the channel.\"\n");
+  }
   char *scr_trim  = trim_copy_utf8_safe(scr_utf8,  MAX_SCRIPT_CHARS);
 
   free(subs_utf8);
   free(scr_utf8);
 
-  char range_line[220], words_line[220];
-  if (per_clip_sec >= 20) {
-    int lo  = per_clip_sec * 8 / 10;
-    int hi  = per_clip_sec * 12 / 10;
-    int wlo = per_clip_sec * 2;
-    int whi = per_clip_sec * 5 / 2;
-    int slo = per_clip_sec / 12;
-    int shi = per_clip_sec / 8;
-    if (slo < 3) slo = 3;
-    if (shi < slo + 2) shi = slo + 2;
-    snprintf(range_line, sizeof(range_line),
-             "Each time range should usually be %d-%d seconds long (end-start). "
-             "Do not go below %d seconds.", lo, hi, lo > 8 ? lo - 4 : 8);
-    snprintf(words_line, sizeof(words_line),
-             "Keep each narration about %d-%d words, in %d-%d sentences, so the "
-             "spoken audio fills the whole range.", wlo, whi, slo, shi);
-  } else {
-    snprintf(range_line, sizeof(range_line),
-             "Each time range should usually be 8-16 seconds long (end-start). Avoid >20 seconds.");
-    snprintf(words_line, sizeof(words_line),
-             "Keep narrations punchy but not tiny: about 20-35 words total, in 3-5 short sentences.");
+  char range_line[220], words_line[300];
+  {
+    const char *wcode = recap_lang_code(cfg->recap_language);
+    if (per_clip_sec >= 20) {
+      int lo  = per_clip_sec * 8 / 10;
+      int hi  = per_clip_sec * 12 / 10;
+      int slo = per_clip_sec / 12;
+      int shi = slo + 2;
+      if (slo < 3) slo = 3;
+      snprintf(range_line, sizeof(range_line),
+               "Each time range should usually be %d-%d seconds long (end-start). "
+               "Do not go below %d seconds.", lo, hi, lo > 8 ? lo - 4 : 8);
+      if (!strcmp(wcode, "zh")) {
+        /* Chinese speech ~4 characters/second - count characters, not words. */
+        int clo = per_clip_sec * 4, chi = per_clip_sec * 5;
+        snprintf(words_line, sizeof(words_line),
+                 "IMPORTANT: each narration MUST contain at least %d Chinese "
+                 "characters (%d-%d is ideal), in %d-%d short sentences, so the "
+                 "spoken audio fills the whole time range.", clo, clo, chi, slo, shi);
+      } else {
+        /* ~2.4 words/second for English & Spanish, ~2.1 for Arabic. */
+        int mult = !strcmp(wcode, "ar") ? 21 : 24;
+        int wlo = per_clip_sec * mult / 10;
+        int whi = per_clip_sec * 3;
+        snprintf(words_line, sizeof(words_line),
+                 "IMPORTANT: each narration MUST contain at least %d words "
+                 "(%d-%d is ideal), in %d-%d short sentences, so the spoken "
+                 "audio fills the whole time range.", wlo, wlo, whi, slo, shi);
+      }
+    } else {
+      snprintf(range_line, sizeof(range_line),
+               "Each time range should usually be 8-16 seconds long (end-start). Avoid >20 seconds.");
+      snprintf(words_line, sizeof(words_line),
+               "IMPORTANT: keep narrations punchy but never tiny - at least 25 "
+               "words, in 3-5 short sentences.");
+    }
   }
 
   const char *prompt_fmt =
@@ -1636,6 +1767,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "%s\n"
     "%s"
     "%s"
+    "%s"
     "\n"
     "INPUT B (Optional script text WITHOUT timestamps; may be empty):\n"
     "%s\n"
@@ -1654,17 +1786,17 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "- NO intro talk: the first narration must start instantly with \"The story\n"
     "begins\" or \"The movie starts\" - never \"welcome\", \"today we\" or any\n"
     "channel greeting.\n"
-    "- The LAST narration must end EXACTLY with: \"With that the story ends\n"
-    "right here. Let us know in the comments how you liked this explanation\n"
-    "and don't forget to like the video and subscribe to the channel.\"\n";
+    "%s";
 
   int plen = snprintf(NULL, 0, prompt_fmt, title_utf8, subs_trim, placeholder_note,
-                      language_rule, scr_trim, num_clips, range_line, words_line);
+                      language_rule, demand_note, scr_trim, num_clips, range_line,
+                      words_line, outro_rule);
   if (plen < 0) die("snprintf failed building prompt");
   char *prompt = (char *)malloc((size_t)plen + 1);
   if (!prompt) die("OOM");
   snprintf(prompt, (size_t)plen + 1, prompt_fmt, title_utf8, subs_trim, placeholder_note,
-           language_rule, scr_trim, num_clips, range_line, words_line);
+           language_rule, demand_note, scr_trim, num_clips, range_line, words_line,
+           outro_rule);
 
   free(title_utf8);
   free(subs_trim);
@@ -1678,10 +1810,13 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   cJSON_AddItemToObject(req, "reasoning", reasoning);
 
   cJSON *input = cJSON_CreateArray();
-  static const char *sys_prompt =
-      "You are a professional movie recap scriptwriter for a popular recap "
-      "channel. You retell movie plots as gripping present-tense stories that "
-      "follow the characters. You always answer with strict JSON only.";
+  char sys_buf[640];
+  snprintf(sys_buf, sizeof(sys_buf),
+           "You are a professional movie recap scriptwriter for a popular recap "
+           "channel. You retell movie plots as gripping present-tense stories that "
+           "follow the characters. You always answer with strict JSON only.%s",
+           sys_lang_extra);
+  const char *sys_prompt = sys_buf;
   cJSON *sys = cJSON_CreateObject();
   cJSON_AddStringToObject(sys, "role", "system");
   cJSON_AddStringToObject(sys, "content", sys_prompt);
@@ -1797,6 +1932,12 @@ static bool elevenlabs_tts_to_mp3(const Config *cfg, const char *text, const cha
   cJSON *root = cJSON_CreateObject();
   cJSON_AddStringToObject(root, "text", text);
   cJSON_AddStringToObject(root, "model_id", cfg->eleven_model_id);
+  if (cfg->tts_rate > 0 && cfg->tts_rate != 100) {
+    double sp = cfg->tts_rate / 100.0;
+    if (sp < 0.7) sp = 0.7;
+    if (sp > 1.2) sp = 1.2;
+    cJSON_AddNumberToObject(root, "speed", sp);
+  }
   char *body = cJSON_PrintUnformatted(root);
   cJSON_Delete(root);
 
@@ -1919,6 +2060,12 @@ static bool tts_xtts(const Config *cfg, const char *text, const char *out_mp3_pa
   cJSON_AddStringToObject(root, "text", text);
   cJSON_AddStringToObject(root, "speaker_wav", cfg->tts_voice);
   cJSON_AddStringToObject(root, "language", cfg->tts_language);
+  if (cfg->tts_rate > 0 && cfg->tts_rate != 100) {
+    double sp = cfg->tts_rate / 100.0;
+    if (sp < 0.5) sp = 0.5;
+    if (sp > 2.0) sp = 2.0;
+    cJSON_AddNumberToObject(root, "speed", sp);
+  }
   char *body = cJSON_PrintUnformatted(root);
   cJSON_Delete(root);
 
@@ -1935,6 +2082,12 @@ static bool tts_piper(const Config *cfg, const char *text, const char *out_mp3_p
   cJSON *root = cJSON_CreateObject();
   cJSON_AddStringToObject(root, "text", text);
   if (cfg->tts_voice[0]) cJSON_AddStringToObject(root, "voice", cfg->tts_voice);
+  if (cfg->tts_rate > 0 && cfg->tts_rate != 100) {
+    double ls = 100.0 / (double)cfg->tts_rate;   /* smaller length_scale = faster */
+    if (ls < 0.5) ls = 0.5;
+    if (ls > 2.0) ls = 2.0;
+    cJSON_AddNumberToObject(root, "length_scale", ls);
+  }
   char *body = cJSON_PrintUnformatted(root);
   cJSON_Delete(root);
 
@@ -1953,6 +2106,12 @@ static bool tts_openai_compat(const Config *cfg, const char *text, const char *o
   cJSON_AddStringToObject(root, "input", text);
   cJSON_AddStringToObject(root, "voice", cfg->tts_voice[0] ? cfg->tts_voice : "alloy");
   cJSON_AddStringToObject(root, "response_format", "mp3");
+  if (cfg->tts_rate > 0 && cfg->tts_rate != 100) {
+    double sp = cfg->tts_rate / 100.0;
+    if (sp < 0.25) sp = 0.25;
+    if (sp > 4.0) sp = 4.0;
+    cJSON_AddNumberToObject(root, "speed", sp);
+  }
   char *body = cJSON_PrintUnformatted(root);
   cJSON_Delete(root);
 
@@ -2076,8 +2235,13 @@ static bool tts_edge(const Config *cfg, const char *text, const char *out_mp3_pa
   fputs(text, f);
   fclose(f);
   const char *voice = cfg->tts_voice[0] ? cfg->tts_voice : "en-US-ChristopherNeural";
-  int rc = run_cmd("\"%s\" edge_tts_synth.py --voice %s --text-file \"%s\" --out \"%s\"",
-                   py, voice, txt, out_mp3_path);
+  char rate_arg[48] = "";
+  if (cfg->tts_rate > 0 && cfg->tts_rate != 100) {
+    int d = cfg->tts_rate - 100;
+    snprintf(rate_arg, sizeof(rate_arg), " --rate \"%s%d%%\"", d > 0 ? "+" : "", d);
+  }
+  int rc = run_cmd("\"%s\" edge_tts_synth.py --voice %s --text-file \"%s\" --out \"%s\"%s",
+                   py, voice, txt, out_mp3_path, rate_arg);
   remove(txt);
   if (rc != 0 || !file_exists(out_mp3_path)) {
     logw("Edge TTS failed (rc=%d) - check the internet connection or switch to Piper.", rc);
@@ -2113,14 +2277,39 @@ static bool whisper_transcribe_to_srt(const char *movie_path, const char *out_sr
   return sz > 200;
 }
 
-static bool tts_synthesize(const Config *cfg, const char *text, const char *out_mp3_path) {
-  switch (cfg->tts_provider) {
-    case TTS_XTTS:  return tts_xtts(cfg, text, out_mp3_path);
-    case TTS_PIPER: return tts_piper(cfg, text, out_mp3_path);
-    case TTS_OPENAI: return tts_openai_compat(cfg, text, out_mp3_path);
-    case TTS_EDGE:  return tts_edge(cfg, text, out_mp3_path);
-    default:        return elevenlabs_tts_to_mp3(cfg, text, out_mp3_path);
+/* Every TTS engine leaves silence at the start/end of a clip; those dead
+ * gaps at every cut are most of the "slow pacing" feel. Trim them. */
+static void tts_trim_silence(const char *mp3) {
+  char tmp[PATH_MAX];
+  snprintf(tmp, sizeof(tmp), "%s.trim", mp3);
+  char *in_esc  = sh_escape(mp3);
+  char *tmp_esc = sh_escape(tmp);
+  int rc = run_cmd(
+    "ffmpeg -y -hide_banner -loglevel error -i %s -af "
+    "\"silenceremove=start_periods=1:start_threshold=-45dB,areverse,"
+    "silenceremove=start_periods=1:start_threshold=-45dB,areverse\" "
+    "-c:a libmp3lame -b:a 192k %s", in_esc, tmp_esc);
+  free(in_esc);
+  free(tmp_esc);
+  if (rc == 0 && file_size_bytes(tmp) > 2048) {
+    plat_unlink(mp3);
+    if (plat_rename(tmp, mp3) != 0) logw("Could not swap in the silence-trimmed narration.");
+  } else {
+    plat_unlink(tmp);
   }
+}
+
+static bool tts_synthesize(const Config *cfg, const char *text, const char *out_mp3_path) {
+  bool ok = false;
+  switch (cfg->tts_provider) {
+    case TTS_XTTS:   ok = tts_xtts(cfg, text, out_mp3_path); break;
+    case TTS_PIPER:  ok = tts_piper(cfg, text, out_mp3_path); break;
+    case TTS_OPENAI: ok = tts_openai_compat(cfg, text, out_mp3_path); break;
+    case TTS_EDGE:   ok = tts_edge(cfg, text, out_mp3_path); break;
+    default:         ok = elevenlabs_tts_to_mp3(cfg, text, out_mp3_path); break;
+  }
+  if (ok) tts_trim_silence(out_mp3_path);
+  return ok;
 }
 
 /* ---------------------------------------------------------------------------
@@ -2138,9 +2327,13 @@ static bool caption_font_available(const char *font) {
  * splitter chokes on " and \ too), and every ':' is written \: so it
  * survives level 2 as a literal colon.  Wrapped lines become separate
  * drawtext filters - no newline characters anywhere. */
-static char *caption_filter_chain(const char *text, const char *font) {
-  if (!text || !text[0]) return NULL;
+#define CAP_MAX_SEG  48
+#define CAP_MAX_LINE 96
 
+static char *caption_filter_chain(const char *text, const char *font, double dur) {
+  if (!text || !text[0] || dur <= 0.1) return NULL;
+
+  /* Clean: curly apostrophe for ', space for " \\ and newlines. */
   size_t cap = strlen(text) * 3 + 8;
   char *clean = (char *)malloc(cap);
   if (!clean) die("OOM");
@@ -2153,49 +2346,86 @@ static char *caption_filter_chain(const char *text, const char *font) {
   }
   clean[o] = '\0';
 
-  char lines[3][64];
-  int nl = 0;
-  char *p = clean;
-  while (*p == ' ') p++;
-  while (*p && nl < 3) {
-    size_t l = strlen(p);
-    while (l && p[l - 1] == ' ') p[--l] = '\0';
-    if (l == 0) break;
-    if (l <= 45) {
-      memcpy(lines[nl], p, l + 1);
+  /* Decode to code points with byte offsets. */
+  size_t maxr = strlen(clean) + 1;
+  unsigned *cp = (unsigned *)malloc(maxr * sizeof(unsigned));
+  unsigned char *cl = (unsigned char *)malloc(maxr);
+  size_t *boff = (size_t *)malloc((maxr + 1) * sizeof(size_t));
+  if (!cp || !cl || !boff) die("OOM");
+  size_t nr = 0;
+  boff[0] = 0;
+  for (size_t k = 0; clean[k]; ) {
+    unsigned char c = (unsigned char)clean[k];
+    unsigned v = c; size_t l = 1;
+    if (c >= 0xF0 && clean[k+1] && clean[k+2] && clean[k+3]) {
+      v = (((unsigned)(c & 0x07) << 18) | (((unsigned char)clean[k+1] & 0x3F) << 12) |
+           (((unsigned char)clean[k+2] & 0x3F) << 6) | ((unsigned char)clean[k+3] & 0x3F));
+      l = 4;
+    } else if (c >= 0xE0 && clean[k+1] && clean[k+2]) {
+      v = (((unsigned)(c & 0x0F) << 12) | (((unsigned char)clean[k+1] & 0x3F) << 6) |
+           ((unsigned char)clean[k+2] & 0x3F));
+      l = 3;
+    } else if (c >= 0xC0 && clean[k+1]) {
+      v = (((unsigned)(c & 0x1F) << 6) | ((unsigned char)clean[k+1] & 0x3F));
+      l = 2;
+    }
+    cp[nr] = v; cl[nr] = (unsigned char)l; nr++;
+    k += l; boff[nr] = k;
+  }
+  if (nr == 0) { free(clean); free(cp); free(cl); free(boff); return NULL; }
+
+  /* Split into sentence chunks (Latin, CJK and Arabic terminators), <= 78
+     runes each, so every sentence of the narration gets its own window. */
+  size_t seg_s[CAP_MAX_SEG], seg_e[CAP_MAX_SEG];
+  int nseg = 0;
+  size_t cur = 0;
+  while (cur < nr && nseg < CAP_MAX_SEG) {
+    while (cur < nr && cp[cur] == ' ') cur++;
+    if (cur >= nr) break;
+    size_t j = cur, soft = 0;
+    while (j < nr && j - cur < 78) {
+      unsigned v = cp[j];
+      bool term = (v == '.' || v == '!' || v == '?' || v == 0x3002u ||
+                   v == 0xFF01u || v == 0xFF1Fu || v == 0x061Fu || v == 0x061Bu);
+      bool softp = (v == ',' || v == ';' || v == ':' || v == ' ' ||
+                    v == 0xFF0Cu || v == 0x3001u || v == 0x060Cu);
+      if (softp) soft = j + 1;
+      j++;
+      if (term && j - cur >= 16) break;
+    }
+    if (j >= nr) j = nr;
+    else if (j - cur >= 78 && soft > cur + 8) j = soft;
+    seg_s[nseg] = cur; seg_e[nseg] = j; nseg++;
+    cur = j;
+  }
+  if (nseg == 0) { free(clean); free(cp); free(cl); free(boff); return NULL; }
+
+  /* Wrap each chunk into <= 2 lines of <= 42 runes (space break if any). */
+  size_t ls[CAP_MAX_LINE], le[CAP_MAX_LINE], lseg[CAP_MAX_LINE];
+  int nline = 0;
+  for (int g = 0; g < nseg && nline + 2 <= CAP_MAX_LINE; g++) {
+    size_t w0 = seg_s[g], we = seg_e[g];
+    int nl = 0;
+    while (we > w0 && nl < 2) {
+      size_t take = we - w0;
+      if (take > 42) {
+        take = 42;
+        size_t t2 = take;
+        while (t2 > 20 && cp[w0 + t2] != ' ') t2--;
+        if (t2 > 20) take = t2;
+      }
+      ls[nline] = w0; le[nline] = w0 + take; lseg[nline] = (size_t)g; nline++;
+      w0 += take;
+      while (w0 < we && cp[w0] == ' ') w0++;
       nl++;
-      break;
     }
-    size_t cut = 45;
-    while (cut > 20 && p[cut] != ' ') cut--;
-    if (cut <= 20) cut = 45;
-    memcpy(lines[nl], p, cut);
-    lines[nl][cut] = '\0';
-    nl++;
-    p += cut;
-    while (*p == ' ') p++;
-  }
-  free(clean);
-  if (nl == 0) return NULL;
-
-  if (*p) {
-    size_t l = strlen(lines[nl - 1]);
-    if (l > 41) { l = 41; lines[nl - 1][l] = '\0'; }
-    memcpy(lines[nl - 1] + l, "...", 4);
   }
 
-  /* Escape the level-2 specials for the filter-args parser. */
-  char esc[3][128];
-  for (int i = 0; i < nl; i++) {
-    size_t eo = 0;
-    for (const char *q = lines[i]; *q && eo + 2 < sizeof(esc[0]); q++) {
-      if (*q == ':') esc[i][eo++] = '\\';
-      esc[i][eo++] = *q;
-    }
-    esc[i][eo] = '\0';
-  }
+  /* Show each chunk while it is being spoken: window proportional to length. */
+  double total_w = 0;
+  for (int g = 0; g < nseg; g++) total_w += (double)(seg_e[g] - seg_s[g]);
+  if (total_w <= 0) total_w = 1;
 
-  /* Escape the font path for the quoted filtergraph section. */
   char font_esc[300];
   size_t fo = 0;
   for (const char *q = font; *q && fo + 2 < sizeof(font_esc); q++) {
@@ -2206,20 +2436,40 @@ static char *caption_filter_chain(const char *text, const char *font) {
   }
   font_esc[fo] = '\0';
 
-  char *chain = (char *)malloc(2048);
+  size_t chain_cap = (size_t)nline * 320 + 1024;
+  char *chain = (char *)malloc(chain_cap);
   if (!chain) die("OOM");
   chain[0] = '\0';
   size_t off = 0;
-  for (int i = 0; i < nl; i++) {
-    int k = (nl - 1) - i;
-    int w = snprintf(chain + off, 2048 - off,
-                     ",drawtext=fontfile='%s':expansion=none:"
-                     "text='%s':fontcolor=white:borderw=2:bordercolor=black:"
-                     "fontsize=h*0.035:x=(w-text_w)/2:y=h-h*0.07-th-%d*h*0.045",
-                     font_esc, esc[i], k);
-    if (w < 0 || (size_t)w >= 2048 - off) break;
-    off += (size_t)w;
+  double t_acc = 0;
+  for (int g = 0; g < nseg; g++) {
+    double t0 = dur * t_acc / total_w;
+    t_acc += (double)(seg_e[g] - seg_s[g]);
+    double t1 = (g == nseg - 1) ? dur + 1.0 : dur * t_acc / total_w;
+    for (int li = 0; li < nline; li++) {
+      if (lseg[li] != (size_t)g) continue;
+      int stack = 0;
+      for (int pj = 0; pj < li; pj++) if (lseg[pj] == lseg[li]) stack++;
+      char line_txt[300];
+      size_t b0 = boff[ls[li]], b1 = boff[le[li]];
+      size_t eo = 0;
+      for (size_t q = b0; q < b1 && eo + 2 < sizeof(line_txt); q++) {
+        if (clean[q] == ':') line_txt[eo++] = '\\';
+        line_txt[eo++] = clean[q];
+      }
+      line_txt[eo] = '\0';
+      int w = snprintf(chain + off, chain_cap - off,
+                       ",drawtext=fontfile='%s':expansion=none:"
+                       "text='%s':fontcolor=white:borderw=2:bordercolor=black:"
+                       "fontsize=h*0.035:x=(w-text_w)/2:y=h-h*0.07-th-%d*h*0.045:"
+                       "enable='between(t,%.2f,%.2f)'",
+                       font_esc, line_txt, stack, t0, t1);
+      if (w < 0 || (size_t)w >= chain_cap - off) goto cap_done;
+      off += (size_t)w;
+    }
   }
+cap_done:
+  free(clean); free(cp); free(cl); free(boff);
   return chain;
 }
 
@@ -2279,7 +2529,7 @@ static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
 
   char *cap_esc = NULL;
   if (cfg->captions && caption && caption[0] && caption_font_available(cfg->caption_font))
-    cap_esc = caption_filter_chain(caption, cfg->caption_font);
+    cap_esc = caption_filter_chain(caption, cfg->caption_font, narration_dur);
 
   int rc;
   if (cap_esc) {
@@ -2869,7 +3119,10 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     snprintf(srt_in, sizeof(srt_in), "scripts/srt_files/%s.%s.srt", movie_title, lang_code);
   else
     snprintf(srt_in, sizeof(srt_in), "scripts/srt_files/%s.srt", movie_title);
-  snprintf(srt_mod, sizeof(srt_mod), "scripts/srt_files/%s_modified.srt", movie_title);
+  if (strcmp(lang_code, "en") != 0)
+    snprintf(srt_mod, sizeof(srt_mod), "scripts/srt_files/%s_%s_modified.srt", movie_title, lang_code);
+  else
+    snprintf(srt_mod, sizeof(srt_mod), "scripts/srt_files/%s_modified.srt", movie_title);
   snprintf(script_txt, sizeof(script_txt), "scripts/srt_files/%s_summary.txt", movie_title);
 
   report_progress(GEN_STAGE_SUBTITLES, movie_index, movie_total, 0, 0, movie_title);
@@ -3001,16 +3254,32 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   ClipPlanList plan = openai_make_plan(cfg, movie_title, subs_seconds,
                                        imsdb_script ? imsdb_script : "",
                                        subs_placeholder,
-                                       num_clips, per_clip_sec, &retry_no_script);
+                                       num_clips, per_clip_sec, &retry_no_script,
+                                       false);
 
   if (plan.count == 0 && retry_no_script && imsdb_script && imsdb_script[0]) {
     logw("OpenAI request failed with IMSDb context; retrying without IMSDb script for %s", movie_title);
     plan = openai_make_plan(cfg, movie_title, subs_seconds, "", subs_placeholder,
-                            num_clips, per_clip_sec, NULL);
+                            num_clips, per_clip_sec, NULL, false);
+  }
+
+  if (plan.count > 0 && plan_language_mismatch(plan.items, plan.count, lang_code)) {
+    logw("The AI plan came back in the wrong language - demanding %s and retrying once.",
+         cfg->recap_language);
+    free_clip_plan_list(&plan);
+    plan = openai_make_plan(cfg, movie_title, subs_seconds,
+                            imsdb_script ? imsdb_script : "", subs_placeholder,
+                            num_clips, per_clip_sec, NULL, true);
+    if (plan.count > 0 && plan_language_mismatch(plan.items, plan.count, lang_code))
+      logw("The AI is still answering in English - the %s recap may come out in "
+           "English. Try a stronger model for this language.", cfg->recap_language);
   }
 
   if (plan.count == 0) {
     logi("No OpenAI plan available - building a free local clip plan from the subtitles.");
+    if (strcmp(lang_code, "en") != 0)
+      logw("The offline fallback planner cannot translate - this pass will stay in "
+           "the subtitle language, NOT %s!", cfg->recap_language);
     plan = local_make_plan(subs_seconds, num_clips, per_clip_sec);
   }
 

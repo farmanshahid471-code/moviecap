@@ -20,6 +20,7 @@
   "max_clips": 30,
   "max_video_speedup": 1.75,
   "recap_minutes": 0,
+  "tts_rate": 110,
   "captions": true,
   "auto_transcribe": true,
   "whisper_model": "small",

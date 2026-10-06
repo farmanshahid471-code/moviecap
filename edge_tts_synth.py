@@ -17,6 +17,8 @@ def main() -> int:
     ap.add_argument("--voice", default="en-US-GuyNeural")
     ap.add_argument("--text-file", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--rate", default="+0%",
+                    help="speaking rate offset, e.g. +10%% or -10%%")
     args = ap.parse_args()
 
     try:
@@ -37,7 +39,7 @@ def main() -> int:
         return 3
 
     async def run() -> None:
-        tts = edge_tts.Communicate(text, args.voice)
+        tts = edge_tts.Communicate(text, args.voice, rate=args.rate)
         await tts.save(args.out)
 
     try:

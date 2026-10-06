@@ -685,6 +685,7 @@ static cJSON *config_read_json(void) {
   ADD_NUM("narration_volume",  "narration_volume",  2.5);
   ADD_NUM("bgm_volume",        "bgm_volume",        0.1);
   ADD_NUM("recap_minutes",     "recap_minutes",     0);
+  ADD_NUM("tts_rate",          "tts_rate",          110);
 
   ADD_BOOL("bgm_enabled",   "bgm_enabled",   true);
   ADD_BOOL("make_vertical", "make_vertical", true);
@@ -742,7 +743,7 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
 
   const char *num_keys[] = {
     "min_clips", "max_clips", "max_video_speedup", "narration_volume", "bgm_volume",
-    "recap_minutes", NULL
+    "recap_minutes", "tts_rate", NULL
   };
   for (int i = 0; num_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, num_keys[i]);
@@ -991,6 +992,7 @@ static const char *PAGE_HTML[] = {
   "        <div><label class='f'>TTS language</label><input type='text' id='tts_language'></div>",
   "      </div>",
   "      <label class='f'>TTS model</label><input type='text' id='tts_model'>",
+  "      <label class='f'>Narration speed % <span class='hint'>100 = normal voice, 110-120 = recap-channel pace</span></label><input type='number' id='tts_rate' min='50' max='200'>",
   "      <label class='f'>TTS API key <span id='k3state' class='hint'></span></label>",
   "      <input type='password' id='tts_api_key' placeholder='optional - leave empty to keep current'>",
   "      <label class='chk'><input type='checkbox' id='bgm_enabled'> Background music</label>",
@@ -1121,7 +1123,7 @@ static const char *PAGE_HTML[] = {
   "  var texts = ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
   "               'tts_base_url','tts_voice','tts_language','tts_model','whisper_model','caption_font',",
   "               'caption_font_zh','caption_font_ar','caption_font_es'];",
-  "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes'];",
+  "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','tts_rate'];",
   "  var bools = ['bgm_enabled','make_vertical','retire_movies','captions'];",
   "  texts.forEach(function(k){ el(k).value = c[k] || ''; });",
   "  nums.forEach(function(k){ el(k).value = c[k]; });",
@@ -1250,7 +1252,7 @@ static const char *PAGE_HTML[] = {
   "  if (el('lang_es').checked) rl.push('Spanish (neutral Latin American)');",
   "  if (!rl.length) rl.push('');",
   "  body.recap_languages = rl;",
-  "  ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes'].forEach(function(k){ body[k] = Number(el(k).value); });",
+  "  ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','tts_rate'].forEach(function(k){ body[k] = Number(el(k).value); });",
   "  ['bgm_enabled','make_vertical','retire_movies','captions'].forEach(function(k){ body[k] = el(k).checked; });",
   "  if (el('open_api_key').value) body.open_api_key = el('open_api_key').value;",
   "  if (el('elevenlabs_api_key').value) body.elevenlabs_api_key = el('elevenlabs_api_key').value;",
