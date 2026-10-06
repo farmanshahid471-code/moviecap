@@ -140,7 +140,11 @@ def plan_from_prompt(prompt, clips_wanted, honour_length=False):
     if honour_length:
         m = re.search(r"Target clip length:\s*(\d+)-(\d+) seconds each", prompt)
         if m:
-            target_sec = int(m.group(2))
+            target_sec = (int(m.group(1)) + int(m.group(2))) // 2   # the middle of
+                                                                   # the asked range
+        m = re.search(r"Number of clips:\s*(\d+)", prompt)
+        if m:
+            clips_wanted = max(1, min(50, int(m.group(1))))        # the asked count
     subs = ""
     if "INPUT A" in prompt:
         subs = prompt.split("INPUT A", 1)[1].split("INPUT B", 1)[0]

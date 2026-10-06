@@ -538,13 +538,16 @@ jobs:
           if (Select-String -Path pbatch.log -Pattern "came back in the wrong language" -Quiet) {
             Write-Host "::error title=pbatch::the batched plan came back in the wrong language"; exit 1 }
 
-          # The plan really came from the batch: no live plan call was made
-          # (the mock prints "returning N clips" for a live /responses request).
-          if (Select-String -Path mockbatch.err -Pattern "returning \d+ clips" -Quiet) {
+          # The plan really came from the batch: no live plan call was made.
+          # (the mock prints state lines on stdout, i.e. mockbatch.log)
+          Get-Content mockbatch.log -Tail 10 | ForEach-Object { Write-Host "::notice title=mockbatch:: $_" }
+          if (Select-String -Path mockbatch.log -Pattern "returning \d+ clips" -Quiet) {
             Write-Host "::error title=pbatch::a LIVE plan request was made - the batch was bypassed"
             exit 1 }
-          if (-not (Select-String -Path mockbatch.err -Pattern "created with 1 request" -Quiet)) {
+          if (-not (Select-String -Path mockbatch.log -Pattern "created with 1 request" -Quiet)) {
             Write-Host "::error title=pbatch::the mock never received a batch create call"; exit 1 }
+          if (-not (Select-String -Path mockbatch.log -Pattern "batch msgbatch_mock\d+: 1 result" -Quiet)) {
+            Write-Host "::error title=pbatch::the mock never served the batch results"; exit 1 }
 
           # The result file and the manifest are on disk, with the real script.
           $manifest = Get-Content "$pb\scripts\plans\batch_state.json" | ConvertFrom-Json
