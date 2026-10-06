@@ -23,6 +23,7 @@ option(BUILD_RAYLIB_UI     "Build Raylib UI (src/main.c)"                      O
 option(BUILD_WEB_UI        "Build the browser control panel (src/web_ui.c)"    ON)
 option(BUILD_SIMPLE_UI     "Build the old simple Raylib UI (src/ui_main.c)"    OFF)
 option(BUILD_WINDOWS_GUI   "Windows: build the UI without a console window"    OFF)
+option(BUILD_UNIT_TESTS    "Build the unit tests (tests/)"                  OFF)
 
 if(WIN32)
   set(_default_system_curl OFF)
@@ -212,4 +213,32 @@ endif()
 if(BUILD_SIMPLE_UI)
   add_executable(movie_summary_simple_ui src/ui_main.c ${APP_RC})
   movie_shorts_ui_target(movie_summary_simple_ui)
+endif()
+
+# ---------------- unit tests ----------------
+# These compile the real pipeline sources (generator.c is included by the test
+# so nothing has to be stubbed).  Run them from a scratch directory: they write
+# scripts/srt_files/*.srt next to the current working directory.
+if(BUILD_UNIT_TESTS)
+  enable_testing()
+
+  foreach(_t caption_language_test srt_structure_test)
+    add_executable(${_t} tests/${_t}.c src/platform.c src/platform_open.c)
+    target_include_directories(${_t} PRIVATE "${cjson_SOURCE_DIR}")
+    target_link_libraries(${_t} PRIVATE CURL::libcurl miniz Threads::Threads)
+    if(WIN32)
+      target_compile_definitions(${_t} PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX CJSON_HIDE_SYMBOLS)
+      target_link_libraries(${_t} PRIVATE shell32)
+    endif()
+    add_test(NAME ${_t} COMMAND ${_t}
+             WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${_t}_run")
+    set_tests_properties(${_t} PROPERTIES
+      WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${_t}_run")
+  endforeach()
+
+  # every test gets a scratch directory to write its subtitle fixtures in
+  file(MAKE_DIRECTORY
+    "${CMAKE_CURRENT_BINARY_DIR}/caption_language_test_run"
+    "${CMAKE_CURRENT_BINARY_DIR}/srt_structure_test_run")
 endif()

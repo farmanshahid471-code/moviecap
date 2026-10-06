@@ -58,6 +58,29 @@ jobs:
             exit $code
           }
 
+      - name: Unit tests (subtitles, captions, languages)
+        shell: pwsh
+        run: |
+          # Same build folder as build.bat, so the dependencies are already there.
+          cmake -S . -B build -DBUILD_UNIT_TESTS=ON
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+          cmake --build build --config Release --target caption_language_test srt_structure_test
+          if ($LASTEXITCODE -ne 0) { throw "building the unit tests failed" }
+          ctest --test-dir build -C Release --output-on-failure
+          $code = $LASTEXITCODE
+          $log = "build/Testing/Temporary/LastTest.log"
+          if (Test-Path $log) {
+            Select-String -Path $log -Pattern 'checks, \d+ failures' |
+              ForEach-Object { Write-Host $_.Line }
+          }
+          if ($code -ne 0) {
+            if (Test-Path $log) {
+              Select-String -Path $log -Pattern '\[FAIL\]' | Select-Object -First 15 |
+                ForEach-Object { Write-Host ("::error title=Unit test::{0}" -f $_.Line) }
+            }
+            throw "unit tests failed"
+          }
+
       - name: Install FFmpeg for smoke test
         shell: pwsh
         run: choco install ffmpeg -y --no-progress

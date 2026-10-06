@@ -791,11 +791,14 @@ static int timestamp_to_seconds(const char *ts) {
   for (; ts[i] && i + 1 < sizeof(buf); i++) buf[i] = (ts[i] == '.') ? ',' : ts[i];
   buf[i] = '\0';
 
-  int hh = 0, mm = 0, ss = 0, ms = 0;
-  if (sscanf(buf, "%d:%d:%d,%d", &hh, &mm, &ss, &ms) == 4)
-    return hh * 3600 + mm * 60 + ss;
-  if (sscanf(buf, "%d:%d,%d", &mm, &ss, &ms) == 3)
-    return mm * 60 + ss;
+  int a = 0, b = 0, c = 0, d = 0;
+  /* With milliseconds - the usual "00:10:06,500" and "00:10:06.500" forms. */
+  if (sscanf(buf, "%d:%d:%d,%d", &a, &b, &c, &d) == 4) return a * 3600 + b * 60 + c;
+  /* Without them: some tracks (and hand-made ones) write "00:10:06". */
+  if (sscanf(buf, "%d:%d:%d", &a, &b, &c) == 3) return a * 3600 + b * 60 + c;
+  /* mm:ss[,ms] */
+  if (sscanf(buf, "%d:%d,%d", &a, &b, &c) == 3) return a * 60 + b;
+  if (sscanf(buf, "%d:%d", &a, &b) == 2) return a * 60 + b;
   return -1;
 }
 
@@ -834,7 +837,14 @@ static void srt_cue_push(SrtCue **arr, size_t *n, size_t *cap, int st, int en, c
   (*n)++;
 }
 
-/* Parse a subtitle file into cues (in file order). */
+/* Parse a subtitle file into cues (in file order).
+ *
+ * A line that holds nothing but digits is either the next cue's index or real
+ * dialogue ("1944", "42", "3").  The index is sequential and is followed by a
+ * timestamp, so a digits-only line is held back for one line and only dropped
+ * when it continues the numbering AND a timestamp comes next.  Everything else
+ * is text - the old code dropped those lines, which is how a year could
+ * disappear from the narration. */
 static bool srt_parse_cues(const char *data, SrtCue **out, size_t *out_n) {
   *out = NULL;
   *out_n = 0;
@@ -844,6 +854,9 @@ static bool srt_parse_cues(const char *data, SrtCue **out, size_t *out_n) {
   bool open = false;
   int  st = 0, en = 0;
   char *text = NULL;
+
+  int  expect_index = 1;
+  char *pending_num = NULL;      /* digits-only line, not classified yet */
 
   char *work = str_dup(data ? data : "");
   if (!work) return false;
@@ -874,6 +887,9 @@ static bool srt_parse_cues(const char *data, SrtCue **out, size_t *out_n) {
       int s1 = timestamp_to_seconds(a);
       int s2 = timestamp_to_seconds(b);
       if (s1 >= 0 && s2 >= 0) {
+        /* the held digits line sits directly before this timestamp: it was the
+           cue index, not text */
+        if (pending_num) { free(pending_num); pending_num = NULL; expect_index++; }
         if (open && text) srt_cue_push(&cues, &n, &cap, st, en, text);
         else if (text) free(text);
         open = true; st = s1; en = s2; text = NULL;
@@ -882,6 +898,7 @@ static bool srt_parse_cues(const char *data, SrtCue **out, size_t *out_n) {
     }
 
     if (*line == '\0') {
+      if (pending_num) { srt_cue_append(&text, pending_num); free(pending_num); pending_num = NULL; }
       if (open && text) srt_cue_push(&cues, &n, &cap, st, en, text);
       else if (text) free(text);
       open = false; text = NULL;
@@ -890,11 +907,21 @@ static bool srt_parse_cues(const char *data, SrtCue **out, size_t *out_n) {
 
     if (open) {
       bool digits_only = true;
-      for (const char *d = line; *d; d++)
+      int  value = 0;
+      for (const char *d = line; *d; d++) {
         if (*d < '0' || *d > '9') { digits_only = false; break; }
-      if (!digits_only) srt_cue_append(&text, line);
+        if (value < 100000) value = value * 10 + (*d - '0');
+      }
+      if (digits_only && value == expect_index) {
+        free(pending_num);
+        pending_num = str_dup(line);       /* maybe the next cue's index */
+        continue;
+      }
+      if (pending_num) { srt_cue_append(&text, pending_num); free(pending_num); pending_num = NULL; }
+      srt_cue_append(&text, line);
     }
   }
+  if (pending_num) { srt_cue_append(&text, pending_num); free(pending_num); }
   if (open && text) srt_cue_push(&cues, &n, &cap, st, en, text);
   else if (text) free(text);
   free(work);
@@ -904,28 +931,151 @@ static bool srt_parse_cues(const char *data, SrtCue **out, size_t *out_n) {
   return true;
 }
 
-/* True when the already-converted "seconds" subtitle file runs forwards.
- * Older versions of the app wrote those files in the original (sometimes
- * scrambled) order, so a cached file gets re-converted instead of reusing it. */
-static bool srt_seconds_file_is_ordered(const char *path) {
+/* ---------------------------------------------------------------------------
+ * Turning a fragment stream into sentences.
+ *
+ * A subtitle track is written for somebody who also sees the picture, so it is
+ * cut into whatever fits the screen: "Star." / "Command.", "I" / "can't" /
+ * "see the stars above us too much, Fog."  Handed to the model like that, that
+ * is what comes back - fragments instead of a story - and the converted file
+ * the user opens shows the same clump of pieces.  So the converted file is
+ * assembled into sentence-sized cues: consecutive cues are joined while the
+ * earlier one has no sentence ending yet, while the pause between them is
+ * short, and while the result stays a sane length.  The window grows with the
+ * merge, so a joined cue still covers the moment its words are spoken.
+ * ------------------------------------------------------------------------ */
+#define SRT_MERGE_GAP_SEC   1.50   /* a longer pause is a new beat            */
+#define SRT_MERGE_MAX_CHARS 400    /* never a paragraph on one line           */
+#define SRT_MERGE_MAX_SEC   30.0   /* never one cue over half a minute        */
+
+/* Does this text finish a sentence?  Trailing quotes and brackets are ignored. */
+static bool srt_text_ends_sentence(const char *t) {
+  if (!t) return false;
+  size_t n = strlen(t);
+  for (;;) {
+    while (n > 0 && (t[n - 1] == ' ' || t[n - 1] == '\t' ||
+                     t[n - 1] == '\n' || t[n - 1] == '\r')) n--;
+    if (n == 0) return true;
+    unsigned char c = (unsigned char)t[n - 1];
+    if (c == '"' || c == '\'' || c == ')' || c == ']' || c == '}') { n--; continue; }
+    /* the closing half of a CJK quote (\u300d / \u300f) */
+    if (n >= 3 && (unsigned char)t[n - 1] == 0x8D && (unsigned char)t[n - 2] == 0x80 &&
+        (unsigned char)t[n - 3] == 0xE3) { n -= 3; continue; }
+    if (n >= 3 && (unsigned char)t[n - 1] == 0x8F && (unsigned char)t[n - 2] == 0x80 &&
+        (unsigned char)t[n - 3] == 0xE3) { n -= 3; continue; }
+    break;
+  }
+  unsigned char c = (unsigned char)t[n - 1];
+  if (c == '.' || c == '!' || c == '?') return true;
+  if (n >= 3) {
+    if (c == 0x82 && (unsigned char)t[n - 2] == 0x80 && (unsigned char)t[n - 3] == 0xE3) return true;  /* 。 */
+    if (c == 0x81 && (unsigned char)t[n - 2] == 0xBC && (unsigned char)t[n - 3] == 0xEF) return true;  /* ！ */
+    if (c == 0x9F && (unsigned char)t[n - 2] == 0xBC && (unsigned char)t[n - 3] == 0xEF) return true;  /* ？ */
+  }
+  if (n >= 2 && c == 0x9F && (unsigned char)t[n - 2] == 0xD8) return true;                            /* ؟ */
+  return false;
+}
+
+/* "- " / "– " at the start of a cue marks a different speaker: never join it
+ * onto the line before it. */
+static bool srt_text_is_speaker_change(const char *t) {
+  if (!t) return false;
+  while (*t == ' ' || *t == '\t') t++;
+  if (*t == '-') return true;
+  if ((unsigned char)t[0] == 0xE2 && (unsigned char)t[1] == 0x80 &&
+      ((unsigned char)t[2] == 0x93 || (unsigned char)t[2] == 0x94)) return true;
+  return false;
+}
+
+static void srt_merge_fragments(SrtCue *cues, size_t *n) {
+  size_t w = 0;
+  for (size_t i = 0; i < *n; i++) {
+    if (w > 0) {
+      SrtCue *prev = &cues[w - 1];
+      SrtCue *curc = &cues[i];
+      size_t plen = prev->text ? strlen(prev->text) : 0;
+      size_t clen = curc->text ? strlen(curc->text) : 0;
+      bool join =
+        prev->text && prev->text[0] && curc->text && curc->text[0] &&
+        !srt_text_ends_sentence(prev->text) &&
+        !srt_text_is_speaker_change(curc->text) &&
+        (double)(curc->start - prev->end) <= SRT_MERGE_GAP_SEC &&
+        (double)(curc->start - prev->end) >= -1.0 &&
+        (double)(prev->end - prev->start) + (double)(curc->end - curc->start) <= SRT_MERGE_MAX_SEC &&
+        plen + clen + 2 <= SRT_MERGE_MAX_CHARS;
+      if (join) {
+        char *m = (char *)realloc(prev->text, plen + clen + 2);
+        if (!m) die("OOM");
+        m[plen] = ' ';
+        memcpy(m + plen + 1, curc->text, clen + 1);
+        prev->text = m;
+        if (curc->end > prev->end) prev->end = curc->end;
+        free(curc->text);
+        continue;
+      }
+    }
+    cues[w++] = cues[i];
+  }
+  *n = w;
+}
+
+/* Count one line of cue text: how many words, and whether it is only a
+ * fragment of a sentence (a couple of words, or a second of speech). */
+static void count_cue_text(const char *line, int *cues, int *fragments) {
+  int words = 0, nchars = 0;
+  bool in_word = false;
+  for (const char *q = line; *q; q++) {
+    bool space = (*q == ' ' || *q == '\t');
+    if (space) in_word = false;
+    else { if (!in_word) { in_word = true; words++; } nchars++; }
+  }
+  if (nchars <= 0) return;
+  (*cues)++;
+  if (words <= 3) (*fragments)++;
+}
+
+/* True when a cached "seconds" subtitle file can be reused: it runs forwards
+ * in time (older versions wrote them in the file's original, sometimes
+ * scrambled order) and it has been structured into sentences rather than left
+ * as a stream of two-word fragments (older versions did not merge at all, so
+ * those files get re-converted instead of reused). */
+static bool srt_seconds_file_is_usable(const char *path) {
   char *data = read_entire_file(path);
   if (!data) return false;
 
   bool ok = true;
   int prev = -1;
+  int cues = 0, fragments = 0;
+  const char *pending_digits = NULL;   /* may be a cue index, may be text */
   char *cur = data;
   while (cur) {
     char *nl = strchr(cur, '\n');
     if (nl) *nl = '\0';
     int s1 = 0, s2 = 0;
     if (sscanf(cur, "%d --> %d", &s1, &s2) == 2) {
+      /* the digits line just before a window was this cue's index */
+      pending_digits = NULL;
       if (s1 < prev) { ok = false; break; }
       prev = s1;
+    } else {
+      if (pending_digits) { count_cue_text(pending_digits, &cues, &fragments); pending_digits = NULL; }
+      if (*cur) {
+        bool digits_only = true;
+        for (const char *q = cur; *q; q++)
+          if (*q < '0' || *q > '9') { digits_only = false; break; }
+        if (digits_only) pending_digits = cur;
+        else count_cue_text(cur, &cues, &fragments);
+      }
     }
     cur = nl ? nl + 1 : NULL;
   }
   free(data);
-  return ok;
+  if (!ok) return false;
+  /* Most cues only a few words long means the file is still the old stream of
+     subtitle fragments: re-convert it.  A sentence cue is well over three
+     words, so a structured file stays far below this ratio. */
+  if (cues >= 3 && fragments * 100 > cues * 60) return false;
+  return true;
 }
 
 /* A subtitle track that only covers part of the movie (a per-CD file, a
@@ -1011,6 +1161,14 @@ static bool convert_srt_timestamps_to_seconds(const char *input_srt, const char 
     logw("The subtitle file was not in chronological order - sorted %zu cues "
          "back into timeline order.", n);
   }
+
+  /* Structure: word-by-word and half-sentence cues become sentences, so the
+     planner gets a story and not a pile of pieces. */
+  size_t before = n;
+  srt_merge_fragments(cues, &n);
+  if (before > n)
+    logi("Structured the subtitles: %zu cues -> %zu sentence cues (%zu fragments joined).",
+         before, n, before - n);
 
   FILE *out = plat_fopen(output_srt, "wb");
   if (!out) {
@@ -5270,8 +5428,9 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   if (generator_cancel_requested()) return false;
 
   bool need_convert = !file_exists(srt_mod);
-  if (!need_convert && !srt_seconds_file_is_ordered(srt_mod)) {
-    logw("The cached converted subtitles are not in timeline order - rebuilding: %s", srt_mod);
+  if (!need_convert && !srt_seconds_file_is_usable(srt_mod)) {
+    logw("The cached converted subtitles are out of date (not in timeline order, or "
+         "still a stream of subtitle fragments) - rebuilding: %s", srt_mod);
     plat_unlink(srt_mod);
     need_convert = true;
   }

@@ -555,6 +555,14 @@ If no music files exist, output will be narration-only.
   tracks, per-CD files glued together) is sorted first and the log says so, because scrambled timestamps
   make the whole recap (clip ranges, narration and captions) come out in the wrong order. An already
   cached `_modified.srt` from an older run is re-converted automatically when its cues are not in order.
+- The converted file is also **structured into sentences, not left as a stream of fragments**. Subtitle
+  tracks are cut into whatever fits the screen ("Star." / "Command.", "I" / "can't" / "see the stars"),
+  and handing that to the model is what makes a recap read like a rewritten subtitle list instead of a
+  story. So consecutive cues are joined while the earlier one has no sentence ending yet, while the pause
+  between them is short (under 1.5 s) and while the result stays a sane length — a merged cue keeps the
+  window of everything it swallowed. A cue line that is only digits ("1944", "42") is kept as dialogue, a
+  cue without milliseconds (`00:10:06 --> 00:10:08`) is kept, and a cached `_modified.srt` that is still
+  a pile of 2-3 word fragments is rebuilt automatically.
 - The plan is checked for the requested language: Chinese and Arabic by script, Spanish against the
   English function words. A plan that comes back in the wrong language is rejected once and
   re-requested with an explicit "every narration must be in <language>" demand.
