@@ -677,31 +677,90 @@ static Config load_config_json(const char *path) {
   return c;
 }
 
+/* "00:01:23,456" -> 83.  Also accepts a '.' decimal separator and the short
+ * "MM:SS,mmm" form some subtitle files use. */
 static int timestamp_to_seconds(const char *ts) {
+  char buf[64];
+  size_t i = 0;
+  for (; ts[i] && i + 1 < sizeof(buf); i++) buf[i] = (ts[i] == '.') ? ',' : ts[i];
+  buf[i] = '\0';
+
   int hh = 0, mm = 0, ss = 0, ms = 0;
-  if (sscanf(ts, "%d:%d:%d,%d", &hh, &mm, &ss, &ms) != 4) return -1;
-  (void)ms;
-  return hh * 3600 + mm * 60 + ss;
+  if (sscanf(buf, "%d:%d:%d,%d", &hh, &mm, &ss, &ms) == 4)
+    return hh * 3600 + mm * 60 + ss;
+  if (sscanf(buf, "%d:%d,%d", &mm, &ss, &ms) == 3)
+    return mm * 60 + ss;
+  return -1;
 }
 
-static bool convert_srt_timestamps_to_seconds(const char *input_srt, const char *output_srt) {
-  FILE *in = plat_fopen(input_srt, "rb");
-  if (!in) return false;
-  FILE *out = plat_fopen(output_srt, "wb");
-  if (!out) {
-    fclose(in);
-    return false;
-  }
+/* SRT -> "seconds" subtitles.  Besides converting the timestamps this drops
+ * <i> markup, and (important) it writes the cues back in chronological order:
+ * some subtitle files - merged tracks, per-CD files glued together, editors'
+ * leftovers - are not sorted by time, and an out-of-order subtitle file makes
+ * the whole recap (clip ranges, narration and burnt-in captions) come out in
+ * the wrong order. */
+typedef struct {
+  int   start;
+  int   end;
+  char *text;      /* may contain newlines */
+} SrtCue;
 
-  char line[4096];
-  while (fgets(line, sizeof(line), in)) {
-    while (strstr(line, "<i>")) {
-      char *p = strstr(line, "<i>");
-      memmove(p, p + 3, strlen(p + 3) + 1);
-    }
-    while (strstr(line, "</i>")) {
-      char *p = strstr(line, "</i>");
-      memmove(p, p + 4, strlen(p + 4) + 1);
+/* Append a line to a cue's text (lines joined with newlines). */
+static void srt_cue_append(char **text, const char *txt) {
+  size_t a = *text ? strlen(*text) : 0;
+  size_t b = strlen(txt);
+  char *m = (char *)realloc(*text, a + b + 2);
+  if (!m) die("OOM");
+  if (a) m[a++] = '\n';
+  memcpy(m + a, txt, b + 1);
+  *text = m;
+}
+
+static void srt_cue_push(SrtCue **arr, size_t *n, size_t *cap, int st, int en, char *text) {
+  if (*n + 1 > *cap) {
+    *cap = *cap ? *cap * 2 : 64;
+    *arr = (SrtCue *)realloc(*arr, *cap * sizeof(SrtCue));
+    if (!*arr) die("OOM");
+  }
+  (*arr)[*n].start = st;
+  (*arr)[*n].end = en;
+  (*arr)[*n].text = text;
+  (*n)++;
+}
+
+/* Parse a subtitle file into cues (in file order). */
+static bool srt_parse_cues(const char *data, SrtCue **out, size_t *out_n) {
+  *out = NULL;
+  *out_n = 0;
+
+  SrtCue *cues = NULL;
+  size_t n = 0, cap = 0;
+  bool open = false;
+  int  st = 0, en = 0;
+  char *text = NULL;
+
+  char *work = str_dup(data ? data : "");
+  if (!work) return false;
+
+  char *cur = work;
+  while (cur) {
+    char *nl = strchr(cur, '\n');
+    if (nl) *nl = '\0';
+    char *line = cur;
+    cur = nl ? nl + 1 : NULL;
+
+    size_t ll = strlen(line);
+    while (ll > 0 && (line[ll - 1] == '\r' || line[ll - 1] == ' ' || line[ll - 1] == '\t'))
+      line[--ll] = '\0';
+    while (*line == ' ' || *line == '\t') line++;
+
+    /* drop <i>/<b>/<u> style markup, keep the words */
+    for (;;) {
+      char *lt = strchr(line, '<');
+      if (!lt) break;
+      char *gt = strchr(lt, '>');
+      if (!gt) break;
+      memmove(lt, gt + 1, strlen(gt + 1) + 1);
     }
 
     char a[64], b[64];
@@ -709,16 +768,112 @@ static bool convert_srt_timestamps_to_seconds(const char *input_srt, const char 
       int s1 = timestamp_to_seconds(a);
       int s2 = timestamp_to_seconds(b);
       if (s1 >= 0 && s2 >= 0) {
-        fprintf(out, "%d --> %d\n", s1, s2);
-      } else {
-        fputs(line, out);
+        if (open && text) srt_cue_push(&cues, &n, &cap, st, en, text);
+        else if (text) free(text);
+        open = true; st = s1; en = s2; text = NULL;
+        continue;
       }
-    } else {
-      fputs(line, out);
+    }
+
+    if (*line == '\0') {
+      if (open && text) srt_cue_push(&cues, &n, &cap, st, en, text);
+      else if (text) free(text);
+      open = false; text = NULL;
+      continue;
+    }
+
+    if (open) {
+      bool digits_only = true;
+      for (const char *d = line; *d; d++)
+        if (*d < '0' || *d > '9') { digits_only = false; break; }
+      if (!digits_only) srt_cue_append(&text, line);
     }
   }
+  if (open && text) srt_cue_push(&cues, &n, &cap, st, en, text);
+  else if (text) free(text);
+  free(work);
 
-  fclose(in);
+  *out = cues;
+  *out_n = n;
+  return true;
+}
+
+/* True when the already-converted "seconds" subtitle file runs forwards.
+ * Older versions of the app wrote those files in the original (sometimes
+ * scrambled) order, so a cached file gets re-converted instead of reusing it. */
+static bool srt_seconds_file_is_ordered(const char *path) {
+  char *data = read_entire_file(path);
+  if (!data) return false;
+
+  bool ok = true;
+  int prev = -1;
+  char *cur = data;
+  while (cur) {
+    char *nl = strchr(cur, '\n');
+    if (nl) *nl = '\0';
+    int s1 = 0, s2 = 0;
+    if (sscanf(cur, "%d --> %d", &s1, &s2) == 2) {
+      if (s1 < prev) { ok = false; break; }
+      prev = s1;
+    }
+    cur = nl ? nl + 1 : NULL;
+  }
+  free(data);
+  return ok;
+}
+
+static bool convert_srt_timestamps_to_seconds(const char *input_srt, const char *output_srt) {
+  char *data = read_entire_file(input_srt);
+  if (!data) return false;
+
+  SrtCue *cues = NULL;
+  size_t n = 0;
+  srt_parse_cues(data, &cues, &n);
+  free(data);
+
+  if (n == 0) {
+    /* Nothing that looks like a cue (a plain text file?): keep a copy so the
+       pipeline still has something to plan from. */
+    FILE *in = plat_fopen(input_srt, "rb");
+    if (!in) { free(cues); return false; }
+    FILE *out = plat_fopen(output_srt, "wb");
+    if (!out) { fclose(in); free(cues); return false; }
+    char buf[8192];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, got, out);
+    fclose(in);
+    fclose(out);
+    return true;
+  }
+
+  bool was_unordered = false;
+  for (size_t i = 1; i < n; i++)
+    if (cues[i].start < cues[i - 1].start) { was_unordered = true; break; }
+
+  if (was_unordered) {                     /* stable insertion sort by start */
+    for (size_t i = 1; i < n; i++) {
+      SrtCue key = cues[i];
+      size_t j = i;
+      while (j > 0 && cues[j - 1].start > key.start) { cues[j] = cues[j - 1]; j--; }
+      cues[j] = key;
+    }
+    logw("The subtitle file was not in chronological order - sorted %zu cues "
+         "back into timeline order.", n);
+  }
+
+  FILE *out = plat_fopen(output_srt, "wb");
+  if (!out) {
+    for (size_t i = 0; i < n; i++) free(cues[i].text);
+    free(cues);
+    return false;
+  }
+
+  for (size_t i = 0; i < n; i++) {
+    fprintf(out, "%zu\n%d --> %d\n%s\n\n", i + 1, cues[i].start, cues[i].end,
+            cues[i].text ? cues[i].text : "");
+    free(cues[i].text);
+  }
+  free(cues);
   fclose(out);
   return true;
 }
@@ -1301,28 +1456,30 @@ static void anthropic_endpoint(const char *base, char *out, size_t outsz) {
   snprintf(out, outsz, "%s%s/messages", base, has_v1 ? "" : "/v1");
 }
 
+/* api.anthropic.com itself authenticates with x-api-key only and rejects an
+ * unexpected Authorization header; third-party Anthropic-compatible gateways
+ * (Azure AI Foundry, DeepSeek's /anthropic gateway, Ollama Cloud, ...) very
+ * often want the key in a Bearer token instead.  OAuth tokens (sk-ant-oat...)
+ * are always Bearer. */
+static bool anthropic_host_is_native(const char *base) {
+  return strcasestr_local(base, "api.anthropic.com") != NULL;
+}
+
 static MemBuf anthropic_post_messages(const Config *cfg, const char *sys_prompt,
-                                      const char *prompt, long *http_code, long timeout_s) {
+                                      const char *prompt, int max_tokens,
+                                      bool disable_thinking, long *http_code,
+                                      long timeout_s) {
   char endpoint[560];
   anthropic_endpoint(cfg->openai_base_url, endpoint, sizeof(endpoint));
-
-  char mdl_lc[128];
-  {
-    size_t i = 0;
-    for (; cfg->openai_model[i] && i + 1 < sizeof(mdl_lc); i++)
-      mdl_lc[i] = (char)tolower((unsigned char)cfg->openai_model[i]);
-    mdl_lc[i] = '\0';
-  }
-  bool is_deepseek = strstr(mdl_lc, "deepseek") != NULL;
 
   cJSON *req = cJSON_CreateObject();
   cJSON_AddStringToObject(req, "model", cfg->openai_model);
   /* A full clip plan is thousands of tokens; a small budget silently
      truncates the JSON and the run falls back to the offline planner. */
-  cJSON_AddNumberToObject(req, "max_tokens", 32000);
-  if (is_deepseek) {
-    /* DeepSeek models may default to thinking behind this gateway; the
-       reasoning would eat the output budget and truncate the plan. */
+  cJSON_AddNumberToObject(req, "max_tokens", max_tokens);
+  if (disable_thinking) {
+    /* DeepSeek models default to thinking behind their gateway; the reasoning
+       would eat the output budget and truncate the plan. */
     cJSON *th = cJSON_CreateObject();
     cJSON_AddStringToObject(th, "type", "disabled");
     cJSON_AddItemToObject(req, "thinking", th);
@@ -1338,15 +1495,118 @@ static MemBuf anthropic_post_messages(const Config *cfg, const char *sys_prompt,
   cJSON_Delete(req);
   if (!body) { if (http_code) *http_code = -1; return (MemBuf){0}; }
 
+  const char *key = cfg->openai_key;
   char keyhdr[1024], bearhdr[1024];
-  snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", cfg->openai_key);
-  snprintf(bearhdr, sizeof(bearhdr), "Authorization: Bearer %s", cfg->openai_key);
-  const char *hdrs[] = { keyhdr, "anthropic-version: 2023-06-01", bearhdr, NULL };
+  snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", key);
+  snprintf(bearhdr, sizeof(bearhdr), "Authorization: Bearer %s", key);
 
-  logi("Anthropic-compatible endpoint: %s", endpoint);
+  const char *hdrs[4];
+  int nh = 0;
+  hdrs[nh++] = "anthropic-version: 2023-06-01";
+  if (strncmp(key, "sk-ant-oat", 10) == 0) {
+    hdrs[nh++] = bearhdr;          /* OAuth token: Bearer only */
+  } else {
+    hdrs[nh++] = keyhdr;
+    if (!anthropic_host_is_native(cfg->openai_base_url)) hdrs[nh++] = bearhdr;
+  }
+  hdrs[nh] = NULL;
+
+  logi("Anthropic-compatible endpoint: %s (max_tokens=%d%s)", endpoint, max_tokens,
+       disable_thinking ? ", thinking disabled" : "");
   MemBuf r = http_post_json_headers(endpoint, hdrs, body, http_code, timeout_s);
   free(body);
   return r;
+}
+
+/* The provider tells us the real output limit in the error message, e.g.
+ *   "max_tokens: 32000 > 8192, which is the maximum allowed number of output
+ *    tokens for claude-3-5-sonnet-20241022"
+ * Return the largest plausible limit that is smaller than `current`. */
+static long anthropic_limit_from_error(const char *resp_json, long current) {
+  const char *msg = resp_json ? resp_json : "";
+  cJSON *root = cJSON_Parse(resp_json ? resp_json : "");
+  if (root) {
+    cJSON *err = cJSON_GetObjectItemCaseSensitive(root, "error");
+    if (cJSON_IsObject(err)) {
+      cJSON *m = cJSON_GetObjectItemCaseSensitive(err, "message");
+      if (cJSON_IsString(m) && m->valuestring) msg = m->valuestring;
+    }
+  }
+
+  long best = -1;
+  for (const char *p = msg; *p; ) {
+    if (isdigit((unsigned char)*p)) {
+      long v = strtol(p, (char **)&p, 10);
+      if (v >= 512 && v < current && v > best) best = v;
+    } else {
+      p++;
+    }
+  }
+  if (root) cJSON_Delete(root);
+  return best;
+}
+
+static bool anthropic_error_mentions(const char *resp_json, const char *needle) {
+  return resp_json && strcasestr_local(resp_json, needle) != NULL;
+}
+
+/* POST the plan to an Anthropic-compatible /v1/messages endpoint, adapting the
+ * request when the provider rejects it:
+ *   - "max_tokens too large"  -> retry with the limit named in the error
+ *   - "thinking ... not supported" -> retry without the thinking field
+ * The Messages API has no JSON mode, and questions of taste differ between
+ * Claude, DeepSeek's gateway and Azure, so this keeps the run alive instead of
+ * silently dropping to the raw-subtitle fallback planner. */
+static MemBuf anthropic_plan_request(const Config *cfg, const char *sys_prompt,
+                                     const char *prompt, long *http_code,
+                                     long timeout_s) {
+  char mdl_lc[160];
+  {
+    size_t i = 0;
+    for (; cfg->openai_model[i] && i + 1 < sizeof(mdl_lc); i++)
+      mdl_lc[i] = (char)tolower((unsigned char)cfg->openai_model[i]);
+    mdl_lc[i] = '\0';
+  }
+  /* DeepSeek models (whatever name the gateway maps them from) think by
+     default on the Anthropic endpoint, which truncates the JSON. */
+  bool deepseek = strstr(mdl_lc, "deepseek") != NULL ||
+                  strcasestr_local(cfg->openai_base_url, "deepseek") != NULL;
+  bool disable_thinking = deepseek;
+  int  budget = 32000;
+
+  MemBuf resp = {0};
+  for (int attempt = 0; attempt < 4; attempt++) {
+    resp = anthropic_post_messages(cfg, sys_prompt, prompt, budget, disable_thinking,
+                                   http_code, timeout_s);
+    long code = http_code ? *http_code : 0;
+    if (code >= 200 && code < 300) return resp;
+
+    bool retried = false;
+    if (anthropic_error_mentions(resp.data, "max_tokens") ||
+        anthropic_error_mentions(resp.data, "output tokens")) {
+      long limit = anthropic_limit_from_error(resp.data, budget);
+      int next = (limit > 0 && limit < budget) ? (int)limit : budget / 4;
+      if (next < 512) next = 512;
+      if (next != budget) {
+        logw("Anthropic endpoint rejected max_tokens=%d (HTTP %ld) - retrying with %d.",
+             budget, code, next);
+        budget = next;
+        retried = true;
+      }
+    } else if (disable_thinking &&
+               (anthropic_error_mentions(resp.data, "thinking") ||
+                anthropic_error_mentions(resp.data, "output_config"))) {
+      logw("Anthropic endpoint rejects the thinking field (HTTP %ld) - retrying without it.", code);
+      disable_thinking = false;
+      retried = true;
+    }
+
+    if (!retried) return resp;
+    if (resp.data) free(resp.data);
+    resp.data = NULL;
+    resp.size = 0;
+  }
+  return resp;
 }
 
 /* Extract content[0].text from an Anthropic Messages API reply. */
@@ -1511,6 +1771,97 @@ static char *json_extract_object(const char *in) {
   return out;
 }
 
+/* Models often run out of output tokens in the middle of the clips array
+ * (thinking budgets, small max_tokens, a chatty preamble).  Instead of throwing
+ * the whole answer away - which silently drops the run onto the offline
+ * raw-subtitle planner - rebuild a plan from the clip objects that were
+ * written completely.  Returns NULL when there is nothing to salvage. */
+static char *json_repair_truncated_clips(const char *in) {
+  if (!in || !in[0]) return NULL;
+
+  const char *key = strstr(in, "\"clips\"");
+  if (!key) return NULL;
+  const char *arr = strchr(key, '[');
+  if (!arr) return NULL;
+
+  bool in_str = false, esc = false;
+  int depth = 0;
+  const char *last_obj = NULL;      /* end of the last complete clip object */
+  for (const char *q = arr + 1; *q; q++) {
+    char c = *q;
+    if (in_str) {
+      if (esc) esc = false;
+      else if (c == '\\') esc = true;
+      else if (c == '"') in_str = false;
+      continue;
+    }
+    if (c == '"') { in_str = true; continue; }
+    if (c == '{') depth++;
+    else if (c == '}') {
+      if (depth == 1) last_obj = q;
+      if (depth > 0) depth--;
+    }
+  }
+  if (!last_obj) return NULL;
+
+  size_t head = strlen("{\"clips\":[");
+  size_t body = (size_t)(last_obj - (arr + 1)) + 1;
+  char *out = (char *)malloc(head + body + 3);
+  if (!out) return NULL;
+  memcpy(out, "{\"clips\":[", head);
+  memcpy(out + head, arr + 1, body);
+  memcpy(out + head + body, "]}", 3);
+  return out;
+}
+
+/* The prompt demands clips in increasing order of start time, but models do
+ * not always obey - and an out-of-order plan plays the movie out of order in
+ * the finished video (the narration and the burnt-in captions with it).  Sort
+ * the plan back into story order, drop unusable ranges and take out overlaps
+ * so the recap always runs forwards. */
+static void plan_normalize(ClipPlanList *lst) {
+  if (!lst || lst->count == 0) return;
+
+  bool was_unordered = false;
+  for (size_t i = 1; i < lst->count; i++)
+    if (lst->items[i].start < lst->items[i - 1].start) { was_unordered = true; break; }
+
+  for (size_t i = 1; i < lst->count; i++) {   /* stable insertion sort */
+    ClipPlan key = lst->items[i];
+    size_t j = i;
+    while (j > 0 && lst->items[j - 1].start > key.start) {
+      lst->items[j] = lst->items[j - 1];
+      j--;
+    }
+    lst->items[j] = key;
+  }
+
+  size_t keep = 0;
+  int prev_end = 0;
+  for (size_t i = 0; i < lst->count; i++) {
+    ClipPlan it = lst->items[i];
+    if (it.start <= 0 || it.end <= it.start || !it.narration || !it.narration[0]) {
+      free(it.narration);
+      continue;
+    }
+    if (keep > 0 && it.start < prev_end) {
+      if (prev_end >= it.end - 3) { free(it.narration); continue; }  /* mostly a repeat */
+      it.start = prev_end;
+    }
+    lst->items[keep++] = it;
+    prev_end = it.end;
+  }
+
+  size_t dropped = lst->count - keep;
+  lst->count = keep;
+
+  if (was_unordered)
+    logw("The AI returned the clips out of chronological order - sorted them "
+         "back into story order.");
+  if (dropped)
+    logw("Dropped %zu unusable or overlapping clip(s) from the plan.", dropped);
+}
+
 static ClipPlanList parse_clip_plan_json(const char *json_text) {
   ClipPlanList out = {0};
   cJSON *root = cJSON_Parse(json_text);
@@ -1520,6 +1871,17 @@ static ClipPlanList parse_clip_plan_json(const char *json_text) {
       root = cJSON_Parse(bare);
       free(bare);
       if (root) logw("Model wrapped the JSON in extra text - recovered the clip plan anyway.");
+    }
+  }
+  if (!root) {
+    /* Still broken: most likely the output hit the token limit mid-array. */
+    char *repaired = json_repair_truncated_clips(json_text);
+    if (repaired) {
+      root = cJSON_Parse(repaired);
+      free(repaired);
+      if (root)
+        logw("The reply was cut off mid-JSON (output limit) - kept the clip "
+             "ranges that were complete.");
     }
   }
   if (!root) return out;
@@ -1554,6 +1916,7 @@ static ClipPlanList parse_clip_plan_json(const char *json_text) {
   }
 
   cJSON_Delete(root);
+  plan_normalize(&out);
   return out;
 }
 
@@ -1687,6 +2050,27 @@ static bool plan_language_mismatch(const ClipPlan *items, size_t n, const char *
   return (double)hit / (double)total < 0.30;
 }
 
+/* Character names are the hardest part of the recap prompt (STEP 1): small or
+ * cheap models mix first names, surnames and ranks, or name people who are not
+ * in the clip at all.  Warn once per movie instead of shipping a confusing
+ * recap. */
+static void warn_if_model_is_small(const Config *cfg) {
+  char mdl[160];
+  to_lower_copy(cfg->openai_model, mdl, sizeof(mdl));
+
+  static const char *weak[] = { "mini", "nano", "tiny", "small", "haiku",
+                                "3b", "7b", "8b", NULL };
+  for (int i = 0; weak[i]; i++) {
+    if (strstr(mdl, weak[i])) {
+      logw("Model \"%s\" is a small/fast model - character names, the timeline "
+           "and the strict JSON often come out wrong with the recap prompt. "
+           "A strong model (for example gpt-5.2) gives much better names.",
+           cfg->openai_model);
+      return;
+    }
+  }
+}
+
 static ClipPlanList openai_make_plan(const Config *cfg,
                                      const char *movie_title,
                                      const char *subs_seconds_text,
@@ -1707,6 +2091,8 @@ static ClipPlanList openai_make_plan(const Config *cfg,
 
   char *subs_trim = trim_copy_utf8_safe(subs_utf8, MAX_SUB_CHARS);
 
+  /* Only the placeholder track needs an extra note: with real subtitles the
+     character rules are part of the prompt itself (STEP 1). */
   char placeholder_note[1024];
   if (subs_placeholder)
     snprintf(placeholder_note, sizeof(placeholder_note),
@@ -1716,22 +2102,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
              "runtime shown by the INPUT A timestamps.\n",
              movie_title);
   else
-    snprintf(placeholder_note, sizeof(placeholder_note),
-             "\nIMPORTANT - STAY TRUE TO THE SOURCE:\n"
-             "- Every narration must come ONLY from real events in INPUT A (the "
-             "actual subtitle file). Never invent events, outcomes or details "
-             "that are not there.\n"
-             "- Name every character correctly: use exactly the names that appear "
-             "in INPUT A, and keep each character's name consistent in every clip "
-             "- never call the same person by two different names.\n"
-             "- When it is unclear who is speaking or who someone is, refer to "
-             "them by their role from context (for example 'the sheriff', 'the "
-             "mother') instead of guessing a name.\n"
-             "- If a stretch of subtitles is confusing or incomplete, keep the "
-             "narration for that part short and factual instead of inventing an "
-             "explanation.\n"
-             "- Never use generic filler or trailer cliches like \"the stakes get "
-             "raised\".\n");
+    placeholder_note[0] = '\0';
 
   bool non_en_lang = cfg->recap_language[0] && str_icmp(cfg->recap_language, "english") != 0;
 
@@ -1761,21 +2132,23 @@ static ClipPlanList openai_make_plan(const Config *cfg,
              " Every narration you write must be entirely in %s, never English.",
              cfg->recap_language);
 
-  /* The exact outro, in the recap language - demanding an English outro for a
-     Chinese recap pushed models into writing the whole plan in English. */
-  char outro_rule[760];
+  /* The exact closing sentence, in the recap language - demanding an English
+     closing line for a Chinese recap pushed models into writing the whole plan
+     in English.  Only the sentence itself is stored here; STEP 3 of the prompt
+     wraps it in the "finish the story, then end with ..." instruction. */
+  char closing_line[600];
+  char closing_extra[512];
+  closing_extra[0] = '\0';
   {
     const char *ocode = recap_lang_code(cfg->recap_language);
     if (!strcmp(ocode, "zh"))
-      snprintf(outro_rule, sizeof(outro_rule),
-               "- The LAST narration must end EXACTLY with these Chinese "
-               "characters: \u6545\u4e8b\u5c31\u8bb2\u5230\u8fd9\u91cc\u3002"
+      snprintf(closing_line, sizeof(closing_line),
+               "\u6545\u4e8b\u5c31\u8bb2\u5230\u8fd9\u91cc\u3002"
                "\u5728\u8bc4\u8bba\u533a\u544a\u8bc9\u6211\u4eec\u4f60\u7684"
                "\u770b\u6cd5\uff0c\u522b\u5fd8\u4e86\u70b9\u8d5e\u89c6\u9891"
-               "\u5e76\u8ba2\u9605\u9891\u9053\u3002\n");
+               "\u5e76\u8ba2\u9605\u9891\u9053\u3002");
     else if (!strcmp(ocode, "ar"))
-      snprintf(outro_rule, sizeof(outro_rule),
-               "- The LAST narration must end EXACTLY with this Arabic text: "
+      snprintf(closing_line, sizeof(closing_line),
                "\u0648\u0628\u0647\u0630\u0627 \u062a\u0646\u062a\u0647\u064a "
                "\u0627\u0644\u0642\u0635\u0629 \u0647\u0646\u0627. "
                "\u0623\u062e\u0628\u0631\u0648\u0646\u0627 \u0641\u064a "
@@ -1784,144 +2157,203 @@ static ClipPlanList openai_make_plan(const Config *cfg,
                "\u0627\u0644\u0634\u0631\u062d\u060c \u0648\u0644\u0627 "
                "\u062a\u0646\u0633\u0648\u0627 \u0627\u0644\u0625\u0639\u062c\u0627\u0628 "
                "\u0628\u0627\u0644\u0641\u064a\u062f\u064a\u0648 \u0648\u0627\u0644\u0627\u0634\u062a\u0631\u0627\u0643 "
-               "\u0641\u064a \u0627\u0644\u0642\u0646\u0627\u0629.\n");
+               "\u0641\u064a \u0627\u0644\u0642\u0646\u0627\u0629.");
     else if (!strcmp(ocode, "es"))
-      snprintf(outro_rule, sizeof(outro_rule),
-               "- The LAST narration must end EXACTLY with: \"Y con esto la "
-               "historia termina justo aqu\u00ed. Cu\u00e9ntanos en los comentarios "
-               "qu\u00e9 te pareci\u00f3 esta explicaci\u00f3n y no olvides darle like al "
-               "video y suscribirte al canal.\"\n");
-    else if (non_en_lang)
-      snprintf(outro_rule, sizeof(outro_rule),
-               "- The LAST narration must end with a natural %s version of: "
-               "\"With that the story ends right here. Let us know in the comments "
-               "how you liked this explanation and don't forget to like the video "
-               "and subscribe to the channel.\"\n", cfg->recap_language);
+      snprintf(closing_line, sizeof(closing_line),
+               "Y con esto la historia termina justo aqu\u00ed. Cu\u00e9ntanos "
+               "en los comentarios qu\u00e9 te pareci\u00f3 esta explicaci\u00f3n "
+               "y no olvides darle like al video y suscribirte al canal.");
     else
-      snprintf(outro_rule, sizeof(outro_rule),
-               "- The LAST narration must end EXACTLY with: \"With that the story "
-               "ends right here. Let us know in the comments how you liked this "
-               "explanation and don't forget to like the video and subscribe to "
-               "the channel.\"\n");
+      snprintf(closing_line, sizeof(closing_line),
+               "With that the story ends right here. Let us know in the comments "
+               "how you liked this explanation and don't forget to like the video "
+               "and subscribe to the channel.");
+
+    /* Any other language: no fixed translation to quote, so ask for a natural
+       one instead of letting the model fall back to the English line. */
+    if (non_en_lang && strcmp(ocode, "zh") && strcmp(ocode, "ar") && strcmp(ocode, "es"))
+      snprintf(closing_extra, sizeof(closing_extra),
+               "- That closing sentence must be written in %s - a natural %s "
+               "translation of the English line above, never the English text "
+               "itself.\n", cfg->recap_language, cfg->recap_language);
   }
   char *scr_trim  = trim_copy_utf8_safe(scr_utf8,  MAX_SCRIPT_CHARS);
 
   free(subs_utf8);
   free(scr_utf8);
 
-  char range_line[220], words_line[300];
+  /* STEP 4/STEP 5 numbers.  The voice speaks ~2.6 words per second at
+     tts_rate = 110 (see config.json); the tuning band is 2.4 (audio gets cut
+     off / sped up too much) to 2.8 (voice ends before the clip does). */
+  const double wps = 2.6;
+  int min_sec, max_sec, sent_lo, sent_hi;
+  if (per_clip_sec >= 20) {
+    min_sec = per_clip_sec * 8 / 10;
+    max_sec = per_clip_sec * 12 / 10;
+    sent_lo = per_clip_sec / 12;
+    sent_hi = sent_lo + 2;
+    if (sent_lo < 3) sent_lo = 3;
+  } else {
+    min_sec = 8;
+    max_sec = 16;
+    sent_lo = 3;
+    sent_hi = 5;
+  }
+  if (min_sec < 6) min_sec = 6;
+  if (max_sec < min_sec + 3) max_sec = min_sec + 3;
+
+  /* Word counts are meaningless for Chinese (characters) and off for Arabic
+     (spoken slower), so those languages get an explicit override. */
+  char words_extra[360];
+  words_extra[0] = '\0';
   {
     const char *wcode = recap_lang_code(cfg->recap_language);
-    if (per_clip_sec >= 20) {
-      int lo  = per_clip_sec * 8 / 10;
-      int hi  = per_clip_sec * 12 / 10;
-      int slo = per_clip_sec / 12;
-      int shi = slo + 2;
-      if (slo < 3) slo = 3;
-      snprintf(range_line, sizeof(range_line),
-               "Each time range should usually be %d-%d seconds long (end-start). "
-               "Do not go below %d seconds.", lo, hi, lo > 8 ? lo - 4 : 8);
-      if (!strcmp(wcode, "zh")) {
-        /* Chinese speech ~4 characters/second - count characters, not words. */
-        int clo = per_clip_sec * 4, chi = per_clip_sec * 5;
-        snprintf(words_line, sizeof(words_line),
-                 "IMPORTANT: each narration MUST contain at least %d Chinese "
-                 "characters (%d-%d is ideal), in %d-%d short sentences, so the "
-                 "spoken audio fills the whole time range.", clo, clo, chi, slo, shi);
-      } else {
-        /* ~2.4 words/second for English & Spanish, ~2.1 for Arabic. */
-        int mult = !strcmp(wcode, "ar") ? 21 : 24;
-        int wlo = per_clip_sec * mult / 10;
-        int whi = per_clip_sec * 3;
-        snprintf(words_line, sizeof(words_line),
-                 "IMPORTANT: each narration MUST contain at least %d words "
-                 "(%d-%d is ideal), in %d-%d short sentences, so the spoken "
-                 "audio fills the whole time range.", wlo, wlo, whi, slo, shi);
-      }
-    } else {
-      snprintf(range_line, sizeof(range_line),
-               "Each time range should usually be 8-16 seconds long (end-start). Avoid >20 seconds.");
-      snprintf(words_line, sizeof(words_line),
-               "IMPORTANT: keep narrations punchy but never tiny - at least 25 "
-               "words, in 3-5 short sentences.");
+    if (!strcmp(wcode, "zh")) {
+      int clo = min_sec * 4, chi = max_sec * 5;
+      snprintf(words_extra, sizeof(words_extra),
+               "- In Chinese, count characters instead of words: each narration "
+               "needs about %d-%d Chinese characters, in %d-%d short sentences.\n",
+               clo, chi, sent_lo, sent_hi);
+    } else if (!strcmp(wcode, "ar")) {
+      int wlo = min_sec * 21 / 10, whi = max_sec * 3;
+      snprintf(words_extra, sizeof(words_extra),
+               "- Arabic is spoken a little slower: aim for %d-%d words, in %d-%d "
+               "short sentences, to fill the clip without gaps.\n",
+               wlo, whi, sent_lo, sent_hi);
     }
   }
 
-  const char *prompt_fmt =
-    "You are a movie recap narrator for a YouTube recap channel. You retell the\n"
-    "STORY of the movie - what the characters do and why it matters - never what\n"
-    "the camera shows.\n"
-    "\n"
-    "NARRATION STYLE (follow exactly, like the top movie recap channels):\n"
-    "- Third person, present tense. Follow the characters through the plot\n"
-    "beat by beat; every sentence must move the story one step forward.\n"
-    "- Fast-paced and suspenseful. Simple words and short sentences so the AI\n"
-    "voice never runs out of breath.\n"
-    "- Tell the story strictly in chronological order. No analysis of\n"
-    "cinematography or themes.\n"
-    "- FIRST narration: open instantly with 'The story begins...' and\n"
-    "immediately set the stage - the world, the time, the main character and\n"
-    "what they have lost or want - then start the story moving.\n"
-    "- Connect every action to its cause or consequence: because, so, to,\n"
-    "inspired by, after.\n"
-    "- When the story jumps in time or place, open the narration with a\n"
-    "transition: 'Meanwhile,', 'Later,', 'That night,', 'The next day,',\n"
-    "'Sometime later,', 'At the castle,'.\n"
-    "- Report dialogue instead of quoting it: 'he explains that his family is\n"
-    "dead, but the collector says he has no proof'.\n"
-    "- Use the real character names from the subtitles, concrete verbs, and\n"
-    "weave parallel storylines (hero and villain) with 'Meanwhile'.\n"
-    "- NEVER describe the scene, the visuals, the camera, the lighting or the\n"
-    "editing. NEVER say things like \"in this scene\", \"we see\", \"the movie\n"
-    "shows\", \"the audience watches\". No opinions, no filler.\n"
-    "\n"
-    "EXAMPLE of the exact style wanted:\n"
-    "GOOD: \"In a coastal town crushed by debt, old fisherman Elias still rows\n"
-    "out every dawn to feed his granddaughter. Meanwhile, the bank owner wakes\n"
-    "screaming from a nightmare about the coming storm and orders every boat\n"
-    "seized by noon. When the sheriff posts the notice, Elias quietly unties\n"
-    "his boat anyway - because the sea is the only thing he has left.\"\n"
-    "BAD (never write like this): \"In this scene, a man is on a boat. The\n"
-    "camera shows the ocean. The lighting is dramatic. This is an important\n"
-    "moment in the movie.\"\n"
-    "\n"
-    "You are given TWO inputs.\n"
-    "Movie: %s\n"
-    "\n"
-    "INPUT A (Subtitles with timestamps in SECONDS):\n"
-    "%s\n"
-    "%s"
-    "%s"
-    "%s"
-    "\n"
-    "INPUT B (Optional script text WITHOUT timestamps; may be empty):\n"
-    "%s\n"
-    "\n"
-    "TASK:\n"
-    "- Choose %d non-overlapping time ranges that best cover the full plot arc.\n"
-    "- ONLY use INPUT A for selecting start/end times (seconds). INPUT B is for story context.\n"
-    "- %s\n"
-    "- %s\n"
-    "- Prefer ranges with clear visual action (reveals, confrontations, entrances, big moments).\n"
-    "- Skip any range that starts at 0.\n"
-    "- Return STRICT JSON with this shape ONLY:\n"
-    "  {\"clips\":[{\"start\":120,\"end\":145,\"narration\":\"...\"}, ...]}\n"
-    "- Clips must be increasing by start time.\n"
-    "- Each narration must be at least 3 full sentences in the recap style above.\n"
-    "- NO intro talk: the first narration must start instantly with \"The story\n"
-    "begins\" or \"The movie starts\" - never \"welcome\", \"today we\" or any\n"
-    "channel greeting.\n"
-    "%s";
+  /* The recap-script prompt.  Maintainers' tuning notes:
+       - Languages: if {{LANGUAGE}} is not English, keep the closing line as a
+         natural translation, and keep character names as recognizable
+         transliterations (both are injected below).
+       - Pace: if the voice ends before the clip does, raise the multiplier to
+         2.8.  If the audio is cut off or sped up too much, lower it to 2.4.
+         It depends on tts_rate (config.json, currently 110).
+       - Model: a strong model matters most for character names.  Avoid small or
+         "mini" models for this prompt. */
+  char lang_label[96];
+  snprintf(lang_label, sizeof(lang_label), "%s",
+           cfg->recap_language[0] ? cfg->recap_language : "English");
 
-  int plen = snprintf(NULL, 0, prompt_fmt, title_utf8, subs_trim, placeholder_note,
-                      language_rule, demand_note, scr_trim, num_clips, range_line,
-                      words_line, outro_rule);
+  /* STEP 4: words = seconds x 2.6, at least 25 words per clip. */
+  char pace_line[340];
+  snprintf(pace_line, sizeof(pace_line),
+           "- The voice speaks about %.1f words per second. Aim for narration "
+           "word count = clip length in seconds x %.1f (for example 12 s = about "
+           "%d words, 16 s = about %d words). Never fewer than 25 words per clip. "
+           "Use %d-%d short sentences per clip.\n",
+           wps, wps, (int)(12.0 * wps + 0.5), (int)(16.0 * wps + 0.5),
+           sent_lo, sent_hi);
+
+  const char *prompt_fmt =
+    "Movie: %s\n"
+    "Narration language: %s\n"
+    "Number of clips: %d\n"
+    "Target clip length: %d-%d seconds each\n"
+    "%s"
+    "\n"
+    "INPUT A: subtitles with timestamps in SECONDS (the only source for start/end times):\n"
+    "%s\n"
+    "%s"
+    "\n"
+    "INPUT B: script text without timestamps (optional, may be empty; use it for story context and to confirm who is who):\n"
+    "%s\n"
+    "\n"
+    "STEP 1: BUILD A CHARACTER LIST FIRST (do this silently, never output it)\n"
+    "\n"
+    "Before writing any narration, read INPUT A and INPUT B and work out who the characters are.\n"
+    "\n"
+    "- Subtitles rarely label speakers. Names appear when someone is addressed, introduced, or mentioned (\"Sergeant Reyes!\", \"Tell Anna I'm coming\"). Collect every name you find this way.\n"
+    "- Use INPUT B (character cues, scene headings) and your own knowledge of \"%s\" to confirm the correct full name and spelling of each major character. If the subtitles and your memory disagree, trust the subtitles.\n"
+    "- For each character, fix ONE name and keep it for the entire video. Never switch between first name, surname, nickname and rank for the same person. Pick the form used most in the movie (e.g. \"Miller\", not \"Miller\" in one clip and \"John\" in the next).\n"
+    "- Name a character in a narration only when that character takes part in the events of that clip's own time range. Never mention someone who is not part of the moment you are describing.\n"
+    "- On a character's first appearance, introduce them once with a short role plus their name, for example: \"a young radio operator, Private Daniels\". After that, use only the name.\n"
+    "- If you cannot tell who someone is, call them by their role and keep that same role label every time (\"the old farmer\", \"the colonel\"). Never guess a name. Never invent a name. Never use actor names.\n"
+    "- Spell names exactly the same way every time. Check the whole list again before you finish.\n"
+    "\n"
+    "STEP 2: HOW THE NARRATION MUST SOUND (follow exactly)\n"
+    "\n"
+    "- Third person, present tense, strictly chronological. You are telling the STORY, not describing the video.\n"
+    "- One continuous voice. Each clip must feel like the next sentence of the same story, not a separate summary. The reader should never notice where one clip ends and the next begins.\n"
+    "- Fast pace. Every sentence moves the plot forward: someone does something, something goes wrong, someone decides, something changes. No scenery, no mood-setting, no reflection.\n"
+    "- Short, simple, spoken sentences (about 8-16 words each). Plain words. No long clauses, no semicolons, no brackets, no emojis, no stage directions. Write for the ear, not for the eye.\n"
+    "- Link events with cause and effect: \"because\", \"so\", \"after\", \"but\", \"until\", \"which means\". Jump in time or place with a short connector: \"Meanwhile,\", \"Later,\", \"That night,\", \"The next morning,\", \"Hours later,\", \"Back at the base,\".\n"
+    "- Report dialogue instead of quoting it: \"He tells her the bridge is gone, but she refuses to turn back.\" Direct quotes only when a single short line is the turning point of the story.\n"
+    "- Name the stakes early and keep them alive: what does the hero want, what is in the way, what happens if they fail.\n"
+    "- Use concrete verbs: grabs, runs, hides, shoots, lies, betrays, discovers, escapes. Avoid vague words like \"things\", \"situation\", \"something happens\".\n"
+    "- NEVER describe the screen: no \"in this scene\", \"we see\", \"the camera\", \"the movie shows\", \"the audience\". No opinions, no analysis, no themes, no spoilers-warnings, no jokes about the movie, no rhetorical questions to the viewer.\n"
+    "- No filler or trailer cliches: \"the stakes get raised\", \"everything changes\", \"little does he know\", \"will he survive?\".\n"
+    "- Do not invent anything. Every event must be supported by INPUT A (or INPUT B). If a stretch of subtitles is unclear, keep that narration short and factual instead of guessing.\n"
+    "\n"
+    "STEP 3: OPENING AND ENDING\n"
+    "\n"
+    "- The FIRST narration starts immediately with \"The story begins...\" and in the first two sentences sets up who the main character is, where and when they are, and what they want or have lost. Then the story starts moving. No greeting, no channel intro, no \"welcome\", no \"today we\".\n"
+    "- The LAST narration finishes the story (the outcome for the main characters) and then ends EXACTLY with: \"%s\"\n"
+    "%s"
+    "\n"
+    "STEP 4: PACE AND LENGTH (so the voice fills the clip with no gaps)\n"
+    "\n"
+    "%s"
+    "%s"
+    "- The narration must be spoken-length for the time range, so the audio fills the clip without silence and without needing to be cut off.\n"
+    "- Do not leave plot holes between clips. Together the clips must tell the complete story from beginning to ending, with no important event skipped.\n"
+    "\n"
+    "STEP 5: CHOOSING THE CLIPS\n"
+    "\n"
+    "- Choose exactly %d non-overlapping time ranges that cover the whole plot arc from the opening to the ending, spaced so that early, middle and final parts of the movie all get fair coverage. Do not spend more than a few clips on the first quarter of the movie.\n"
+    "- Each range must be %d-%d seconds long (end minus start). Never start at 0.\n"
+    "- Use INPUT A only for the start and end times. Choose moments with clear action: arrivals, discoveries, confrontations, betrayals, escapes, deaths, big decisions, the climax and the ending.\n"
+    "- Each narration must match what happens in its own time range, but may add one short line of setup from earlier so the story stays clear.\n"
+    "- Clips must be in increasing order of start time.\n"
+    "\n"
+    "STEP 6: FINAL CHECK (do this silently before answering)\n"
+    "\n"
+    "1. Is every character named the same way in every clip, and spelled the same way?\n"
+    "2. Does the first narration begin with \"The story begins...\" and the last end with the exact closing line?\n"
+    "3. Does every narration have enough words for its time range (seconds x 2.6, minimum 25)?\n"
+    "4. Is any sentence describing the screen, the camera, or giving an opinion? Remove it.\n"
+    "5. Is anything in the narration not supported by the subtitles or script? Remove it.\n"
+    "6. Is the output valid JSON with nothing else around it?\n"
+    "7. Are the clips in increasing order of start time, with no overlapping ranges and no repeated scene?\n"
+    "\n"
+    "OUTPUT FORMAT (strict JSON only)\n"
+    "\n"
+    "{\"clips\":[{\"start\":120,\"end\":135,\"narration\":\"...\"},{\"start\":142,\"end\":157,\"narration\":\"...\"}]}\n"
+    "\n"
+    "STYLE EXAMPLE\n"
+    "\n"
+    "GOOD: \"The story begins in the winter of 1944, deep behind enemy lines. Sergeant Cole and his four-man team are dropped into a frozen forest to cut a German supply route. But the landing goes wrong. Within minutes, enemy patrols surround them, and Cole is the only one who makes it out alive.\"\n"
+    "\n"
+    "BAD: \"In this scene we see soldiers in a forest. The camera pans across the snow and the lighting is dark. This is a very tense moment in the movie.\"\n";
+
+  int plen = snprintf(NULL, 0, prompt_fmt,
+                      title_utf8,          /* Movie:                    */
+                      lang_label,          /* Narration language:       */
+                      num_clips,           /* Number of clips:          */
+                      min_sec, max_sec,    /* Target clip length:       */
+                      language_rule,
+                      subs_trim,           /* INPUT A                   */
+                      placeholder_note,
+                      scr_trim,            /* INPUT B                   */
+                      title_utf8,          /* STEP 1: your knowledge of */
+                      closing_line,        /* STEP 3: closing sentence  */
+                      closing_extra,
+                      pace_line,           /* STEP 4                    */
+                      words_extra,
+                      num_clips,           /* STEP 5: how many clips    */
+                      min_sec, max_sec);   /* STEP 5: range length      */
   if (plen < 0) die("snprintf failed building prompt");
-  char *prompt = (char *)malloc((size_t)plen + 1);
+  /* demand_note (language retry) is appended separately: it is empty on the
+     first attempt and only set when the model answered in the wrong language. */
+  size_t demand_len = strlen(demand_note);
+  char *prompt = (char *)malloc((size_t)plen + demand_len + 1);
   if (!prompt) die("OOM");
-  snprintf(prompt, (size_t)plen + 1, prompt_fmt, title_utf8, subs_trim, placeholder_note,
-           language_rule, demand_note, scr_trim, num_clips, range_line, words_line,
-           outro_rule);
+  snprintf(prompt, (size_t)plen + 1, prompt_fmt,
+           title_utf8, lang_label, num_clips, min_sec, max_sec, language_rule,
+           subs_trim, placeholder_note, scr_trim, title_utf8, closing_line,
+           closing_extra, pace_line, words_extra, num_clips, min_sec, max_sec);
+  if (demand_len) memcpy(prompt + plen, demand_note, demand_len + 1);
 
   free(title_utf8);
   free(subs_trim);
@@ -1935,11 +2367,13 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   cJSON_AddItemToObject(req, "reasoning", reasoning);
 
   cJSON *input = cJSON_CreateArray();
-  char sys_buf[640];
+  char sys_buf[900];
   snprintf(sys_buf, sizeof(sys_buf),
-           "You are a professional movie recap scriptwriter for a popular recap "
-           "channel. You retell movie plots as gripping present-tense stories that "
-           "follow the characters. You always answer with strict JSON only.%s",
+           "You are the narrator-scriptwriter for a top YouTube movie recap "
+           "channel. You retell a whole movie as one continuous, gripping spoken "
+           "story, the way a storyteller would tell it to a friend who has not "
+           "seen it. You always answer with strict JSON only: no markdown, no "
+           "commentary, no text before or after the JSON.%s",
            sys_lang_extra);
   const char *sys_prompt = sys_buf;
   cJSON *sys = cJSON_CreateObject();
@@ -2000,13 +2434,35 @@ static ClipPlanList openai_make_plan(const Config *cfg,
 
   if (anthropic_base) {
     free(body);
-    resp = anthropic_post_messages(cfg, sys_prompt, prompt, &http_code, timeout_s);
+    resp = anthropic_plan_request(cfg, sys_prompt, prompt, &http_code, timeout_s);
     if (http_code < 200 || http_code >= 300) {
-      logw("Anthropic-compatible HTTP %ld", http_code);
+      logw("Anthropic-compatible HTTP %ld from %s", http_code, cfg->openai_base_url);
       if (resp.data && resp.size) logw("Anthropic raw body: %.800s", resp.data);
+      if (http_code == 401 || http_code == 403)
+        logw("The key was rejected. api.anthropic.com wants an Anthropic API key "
+             "(sk-ant-api...); Anthropic-compatible gateways (DeepSeek, Azure Foundry, "
+             "...) want THEIR key while the base URL points at their /anthropic path.");
+      else if (http_code == 404)
+        logw("Endpoint not found. For native Claude use \"openai_base_url\": "
+             "\"https://api.anthropic.com/v1\"; for DeepSeek use "
+             "\"https://api.deepseek.com/anthropic\".");
+      else if (http_code == 429)
+        logw("Rate limited or out of quota on the Anthropic-compatible endpoint.");
       if (resp.data) free(resp.data);
       resp.data = NULL;
       resp.size = 0;
+
+      /* api.anthropic.com only speaks the Messages API - the OpenAI-style
+         /chat/completions retry below can only ever 404 there. */
+      if (anthropic_host_is_native(cfg->openai_base_url)) {
+        logw("api.anthropic.com has no OpenAI-style /chat/completions endpoint, "
+             "so there is nothing to fall back to.");
+        free(chat_body);
+        free(prompt);
+        ClipPlanList empty = {0};
+        return empty;
+      }
+
       /* Rescue: gateways like DeepSeek's also serve /chat/completions on the
          plain base URL - derive it and retry with the SAME prompt. */
       char base2[512];
@@ -2086,8 +2542,10 @@ have_response:;
 
   /* Anthropic-style gateways truncate or refuse more often than the plain
      chat endpoint - give /chat/completions one chance with the SAME prompt
-     before the run drops to the offline subtitle planner. */
-  if (plan.count == 0 && anthropic_base && chat_body) {
+     before the run drops to the offline subtitle planner.  (Skipped for
+     api.anthropic.com, which does not implement that endpoint at all.) */
+  if (plan.count == 0 && anthropic_base && chat_body &&
+      !anthropic_host_is_native(cfg->openai_base_url)) {
     char base2[512];
     snprintf(base2, sizeof(base2), "%s", cfg->openai_base_url);
     size_t bl = strlen(base2);
@@ -3381,7 +3839,13 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
 
   if (generator_cancel_requested()) return false;
 
-  if (!file_exists(srt_mod)) {
+  bool need_convert = !file_exists(srt_mod);
+  if (!need_convert && !srt_seconds_file_is_ordered(srt_mod)) {
+    logw("The cached converted subtitles are not in timeline order - rebuilding: %s", srt_mod);
+    plat_unlink(srt_mod);
+    need_convert = true;
+  }
+  if (need_convert) {
     logi("Converting SRT timestamps -> seconds: %s -> %s", srt_in, srt_mod);
     if (!convert_srt_timestamps_to_seconds(srt_in, srt_mod)) {
       logw("Failed to convert SRT for %s", movie_title);
@@ -3444,6 +3908,7 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
 
   report_progress(GEN_STAGE_PLANNING, movie_index, movie_total, 0, 0, movie_title);
   logi("Requesting OpenAI clip plan (%d clips target)...", num_clips);
+  warn_if_model_is_small(cfg);
   bool retry_no_script = false;
   ClipPlanList plan = openai_make_plan(cfg, movie_title, subs_seconds,
                                        imsdb_script ? imsdb_script : "",

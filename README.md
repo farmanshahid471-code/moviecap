@@ -78,7 +78,11 @@ Given a movie file, AI-Movie-Shorts will:
 
 1. **Fetch subtitles (SRT)** automatically (and convert timestamps to seconds)
 2. **Optionally fetch a script** (used only as extra story context)
-3. Ask **OpenAI** to generate a **clip plan** (timestamps + narration per clip)
+3. Ask **OpenAI** (or any OpenAI-compatible / Anthropic-compatible endpoint, see
+   *Notes & troubleshooting*) to generate a **clip plan** (timestamps + narration per clip).
+   The prompt builds a character list from the subtitles first, keeps one name per character
+   and forbids naming people who are not part of that clip's moment; the plan is sorted back
+   into story order and overlaps are trimmed before any clip is cut
 4. Generate voiceover audio for each clip (ElevenLabs by default, or a free
    local engine — XTTS / Piper / any OpenAI-compatible server)
 5. Use **FFmpeg** to:
@@ -419,6 +423,11 @@ If no music files exist, output will be narration-only.
 ## Subtitles / script fetching
 
 - Subtitles (SRT) are auto-downloaded (subf2m) when missing and extracted from the downloaded zip.
+- The SRT is converted to a "seconds" file (`scripts\srt_files\<Title>_modified.srt`) that the planner reads.
+  That file is **written in chronological order** — a subtitle track whose cues are out of order (merged
+  tracks, per-CD files glued together) is sorted first and the log says so, because scrambled timestamps
+  make the whole recap (clip ranges, narration and captions) come out in the wrong order. An already
+  cached `_modified.srt` from an older run is re-converted automatically when its cues are not in order.
 - Script fetching (IMSDb) is **best effort** and **optional**. If it fails, the program continues with subtitles only.
   If OpenAI rejects the request because the script makes it too large, it automatically retries without the script.
 
@@ -463,8 +472,10 @@ Saved to `tiktok_output\`.
 | URLs | raw titles pasted into subtitle/script URLs | percent-encoded, so `Amélie's Test (2001)` works |
 | Testing | needs real API keys | `tools\mock_api_server.py` + the base-URL settings run the whole pipeline offline |
 
-The pipeline logic itself is unchanged: prompt, clip counts (20–30), durations, speed cap, FFmpeg filters,
-BGM mixing and vertical crop all match the original.
+The pipeline is the same shape: clip counts (20–30), durations, speed cap, FFmpeg filters, BGM mixing
+and vertical crop match the original. The recap prompt was rewritten (character list first, clip length
+targets in seconds x 2.6 words, strict JSON), the plan is force-sorted chronologically, and the
+subtitle -> seconds conversion sorts out-of-order tracks.
 
 ### Source layout
 - `src\generator.c/.h` — the pipeline (subtitles → OpenAI → ElevenLabs → FFmpeg),
@@ -503,6 +514,27 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
   - your OpenAI key (the exact error from OpenAI is shown in the log)
   - network connectivity
   - that the SRT conversion output is not empty
+- **Claude / Anthropic-compatible endpoints** (any `openai_base_url` containing `anthropic`):
+  - native Claude: `"openai_base_url": "https://api.anthropic.com/v1"` with an Anthropic key
+    (`sk-ant-api...`) and a `claude-...` model. The key goes in the `x-api-key` header only —
+    sent as a Bearer token instead, the API rejects it.
+  - gateways (DeepSeek `https://api.deepseek.com/anthropic`, Azure AI Foundry, ...) get the key in
+    **both** headers and the model name is what the gateway expects.
+  - the request adapts itself instead of silently dropping to the fallback planner: an output-token
+    limit that is too high is retried with the limit named in the error (e.g. 32000 → 8192), a
+    rejected `thinking` field is dropped and retried, and a reply that was cut off mid-JSON still
+    yields the clip ranges that were complete. `api.anthropic.com` is not retried on the
+    OpenAI-style `/chat/completions` path (it does not exist there) — the log tells you instead.
+  - DeepSeek's gateway maps `claude-*` model names to its own models, so a `claude-sonnet-...` model
+    works against `https://api.deepseek.com/anthropic` too.
+- **Characters get mixed up / people who are not in the shot get named?** The recap prompt
+  (`openai_make_plan` in `src/generator.c`) builds a character list from the subtitles first and is
+  told never to guess or invent a name, to use one name per character everywhere and to only mention
+  characters that are part of that clip's moment. Small/fast models ignore that far more often — the
+  log warns when the configured model looks like a mini/small one. Use a strong model (e.g. `gpt-5.2`).
+- **The clips play out of order?** The plan is sorted back into story order after every AI answer
+  (and overlaps are trimmed), so an answer that lists the ranges in the wrong order can no longer
+  produce a video that jumps around in time. The log says when that happened.
 - If the UI font looks wrong: confirm `resources\Inter-Regular.ttf` exists (the log shows a warning if it's missing).
 - If vertical render fails, confirm:
   - FFmpeg is installed and in PATH
