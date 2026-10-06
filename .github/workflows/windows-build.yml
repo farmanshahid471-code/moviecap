@@ -80,7 +80,31 @@ jobs:
           if (-not (Select-String -Path smoke.log -Pattern "Processing: Amélie's Test \(2001\)" -Quiet)) { throw "unicode movie was not picked up" }
           if (-not (Select-String -Path smoke.log -Pattern "All done" -Quiet)) { throw "run did not finish" }
           if (-not (Select-String -Path smoke.log -Pattern "NO REAL SUBTITLES" -Quiet)) { throw "no-subtitle placeholder warning did not run" }
-          if (-not (Select-String -Path smoke.log -Pattern "offline planner" -Quiet)) { throw "free local planner did not run" }
+
+          # With an unreachable API the app must NOT turn the raw subtitle lines
+          # into the narration: no plan, no video, and the reason in the log.
+          if (-not (Select-String -Path smoke.log -Pattern "skipping this movie instead of turning the raw subtitle lines" -Quiet)) {
+            throw "the run did not refuse to narrate the raw subtitles"
+          }
+          if (Select-String -Path smoke.log -Pattern "offline planner = the narration will be RAW SUBTITLE LINES" -Quiet) {
+            throw "the raw-subtitle fallback ran even though offline_planner is off"
+          }
+          if (Test-Path "smoke\output") {
+            $made = @(Get-ChildItem "smoke\output" -Filter *.mp4 -ErrorAction SilentlyContinue)
+            if ($made.Count -gt 0) { throw "a video was rendered from the raw subtitles" }
+          }
+
+          # The fallback is still there, but only when it is asked for.
+          (Get-Content smoke\config.json) -replace '"open_api_key"', '"offline_planner":true,"open_api_key"' |
+            Set-Content smoke\config.json
+          Push-Location smoke
+          .\movie_summary_cli.exe 2>&1 | Tee-Object -FilePath ..\smoke_offline.log
+          $rc2 = $LASTEXITCODE
+          Pop-Location
+          if ($rc2 -ne 0) { throw "CLI returned $rc2 with offline_planner=true" }
+          if (-not (Select-String -Path smoke_offline.log -Pattern "offline planner" -Quiet)) {
+            throw "the local planner did not run with offline_planner=true"
+          }
 
       - name: Test the portable FFmpeg lookup (nothing on PATH)
         shell: pwsh
