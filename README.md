@@ -716,9 +716,11 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
     again, and a movie whose video already exists is not planned at all.
   - **quality is never traded away:** a request that errored/expired, came back without a usable
     plan, or stopped at the output limit (`stop_reason: max_tokens`) is re-asked **live** at the
-    normal price — streamed, with a doubled budget — so the recap is the same one you would have
-    got without batching. The language check and the length audit run on batched plans exactly as on
-    live ones, and a "write longer narrations" / "answer in <language>" correction always goes live.
+    normal price (streamed, and retried with more room if it is cut off again), so the recap is the
+    same one you would have got without batching. The language check and the length audit run on
+    batched plans exactly as on live ones, and a "write longer narrations" / "answer in <language>"
+    correction always goes live. A plan that failed in the batch is remembered as failed, so it is
+    not submitted a second time either.
   - `"batch_max_wait_minutes"` (default 720 = 12 h) caps the wait. When a batch is not finished by
     then, the run stops cleanly and the next run fetches the same batch — you are told the batch id.
   - batches are chunked at 100 requests / 32 MB, so a big queue is safe; each chunk is fetched before
