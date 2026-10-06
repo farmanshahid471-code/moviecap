@@ -529,8 +529,14 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
   - the request adapts itself instead of silently dropping to the fallback planner: an output-token
     limit that is too high is retried with the limit named in the error (e.g. 32000 → 8192), a
     rejected `thinking` field is dropped and retried, and a reply that was cut off mid-JSON still
-    yields the clip ranges that were complete. `api.anthropic.com` is not retried on the
+    yields the clip ranges that were complete. A reply that stopped at the provider's output limit
+    (`stop_reason: max_tokens`) is retried with a doubled budget (32000 → 64000) while the provider
+    allows it. `api.anthropic.com` is not retried on the
     OpenAI-style `/chat/completions` path (it does not exist there) — the log tells you instead.
+  - the OpenAI-style paths ask for a full plan too: `max_output_tokens` on the Responses API and
+    `max_completion_tokens` on `/chat/completions` (dropped automatically for providers that only
+    know `max_tokens`). If a reply still stops early, the log warns that only part of the clip plan
+    arrived instead of quietly shipping a half-length recap.
   - DeepSeek's gateway maps `claude-*` model names to its own models, so a `claude-sonnet-...` model
     works against `https://api.deepseek.com/anthropic` too.
 - **Characters get mixed up / people who are not in the shot get named?** The recap prompt

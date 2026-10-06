@@ -1595,6 +1595,51 @@ static bool anthropic_error_mentions(const char *resp_json, const char *needle) 
   return resp_json && strcasestr_local(resp_json, needle) != NULL;
 }
 
+/* An HTTP 200 can still be a cut-off answer: the provider stopped at its output
+ * limit in the middle of the clips array.  Anthropic-compatible replies say so
+ * in stop_reason, OpenAI-style replies in finish_reason / status. */
+static bool anthropic_body_hit_output_limit(const char *body) {
+  if (!body) return false;
+  cJSON *root = cJSON_Parse(body);
+  if (!root) return false;
+  const cJSON *sr = cJSON_GetObjectItemCaseSensitive(root, "stop_reason");
+  bool hit = cJSON_IsString(sr) && sr->valuestring &&
+             strcmp(sr->valuestring, "max_tokens") == 0;
+  cJSON_Delete(root);
+  return hit;
+}
+
+static bool openai_body_hit_output_limit(const char *body) {
+  if (!body) return false;
+  cJSON *root = cJSON_Parse(body);
+  if (!root) return false;
+
+  bool hit = false;
+  const cJSON *status = cJSON_GetObjectItemCaseSensitive(root, "status");
+  if (cJSON_IsString(status) && status->valuestring &&
+      strcmp(status->valuestring, "incomplete") == 0)
+    hit = true;                                   /* Responses API */
+  const cJSON *choices = cJSON_GetObjectItemCaseSensitive(root, "choices");
+  if (cJSON_IsArray(choices)) {
+    const cJSON *first = cJSON_GetArrayItem(choices, 0);
+    const cJSON *fr = first ? cJSON_GetObjectItemCaseSensitive(first, "finish_reason") : NULL;
+    if (cJSON_IsString(fr) && fr->valuestring && strcmp(fr->valuestring, "length") == 0)
+      hit = true;                                 /* chat/completions */
+  }
+  cJSON_Delete(root);
+  return hit;
+}
+
+/* Say out loud when a 200 reply stopped at the provider's output limit: the
+ * plan that comes out is then only as long as the provider let it be. */
+static void warn_if_plan_was_cut_short(const char *resp_body, size_t clips) {
+  if (clips == 0 || !resp_body) return;
+  if (!openai_body_hit_output_limit(resp_body)) return;
+  logw("The reply was cut off by the provider's output limit and only %zu clip%s "
+       "arrived - raise the model's output/token limit (or lower the clip count) "
+       "for a full-length recap.", clips, clips == 1 ? "" : "s");
+}
+
 /* POST the plan to an Anthropic-compatible /v1/messages endpoint, adapting the
  * request when the provider rejects it:
  *   - "max_tokens too large"  -> retry with the limit named in the error
@@ -1618,13 +1663,32 @@ static MemBuf anthropic_plan_request(const Config *cfg, const char *sys_prompt,
                   strcasestr_local(cfg->openai_base_url, "deepseek") != NULL;
   bool disable_thinking = deepseek;
   int  budget = 32000;
+  int  raised = 0;              /* times we asked for more room */
+  bool lowered = false;         /* provider told us its ceiling */
 
   MemBuf resp = {0};
-  for (int attempt = 0; attempt < 4; attempt++) {
+  for (int attempt = 0; attempt < 5; attempt++) {
     resp = anthropic_post_messages(cfg, sys_prompt, prompt, budget, disable_thinking,
                                    http_code, timeout_s);
     long code = http_code ? *http_code : 0;
-    if (code >= 200 && code < 300) return resp;
+    if (code >= 200 && code < 300) {
+      /* Cut off mid-array?  Ask for more room, unless the provider already
+         named its ceiling (then the plan is simply as long as it can be). */
+      if (anthropic_body_hit_output_limit(resp.data) && !lowered && raised < 2 &&
+          budget < 160000) {
+        int next = budget * 2;
+        if (next > 160000) next = 160000;
+        logw("The reply was cut off in the middle of the plan (stop_reason=max_tokens) - "
+             "retrying with max_tokens=%d so all clips arrive.", next);
+        budget = next;
+        raised++;
+        if (resp.data) free(resp.data);
+        resp.data = NULL;
+        resp.size = 0;
+        continue;
+      }
+      return resp;
+    }
 
     bool retried = false;
     if (anthropic_error_mentions(resp.data, "max_tokens") ||
@@ -1636,6 +1700,7 @@ static MemBuf anthropic_plan_request(const Config *cfg, const char *sys_prompt,
         logw("Anthropic endpoint rejected max_tokens=%d (HTTP %ld) - retrying with %d.",
              budget, code, next);
         budget = next;
+        lowered = true;
         retried = true;
       }
     } else if (disable_thinking &&
@@ -2116,6 +2181,31 @@ static void warn_if_model_is_small(const Config *cfg) {
   }
 }
 
+/* POST an OpenAI-style chat body that carries an output-token limit; retry the
+ * plain body once when the provider rejects the parameter name. */
+static MemBuf openai_post_chat_tokens(const char *endpoint, const char *key,
+                                      const char *chat_body_limited,
+                                      const char *chat_body_plain,
+                                      long *http_code, long timeout_s) {
+  MemBuf r = http_post_json_to_mem(endpoint, key,
+                                   chat_body_limited ? chat_body_limited : "{}",
+                                   http_code, timeout_s);
+  long code = http_code ? *http_code : 0;
+  if (code == 400 && r.data && chat_body_plain &&
+      (strcasestr_local(r.data, "max_completion_tokens") ||
+       strcasestr_local(r.data, "unsupported parameter") ||
+       strcasestr_local(r.data, "unrecognized") ||
+       strcasestr_local(r.data, "unknown parameter"))) {
+    logw("The provider rejected max_completion_tokens - retrying the chat endpoint "
+         "without an output-token limit.");
+    free(r.data);
+    r.data = NULL;
+    r.size = 0;
+    r = http_post_json_to_mem(endpoint, key, chat_body_plain, http_code, timeout_s);
+  }
+  return r;
+}
+
 static ClipPlanList openai_make_plan(const Config *cfg,
                                      const char *movie_title,
                                      const char *subs_seconds_text,
@@ -2406,6 +2496,9 @@ static ClipPlanList openai_make_plan(const Config *cfg,
 
   cJSON *req = cJSON_CreateObject();
   cJSON_AddStringToObject(req, "model", cfg->openai_model);
+  /* A 20-30 clip plan is several thousand tokens; without an explicit limit the
+     provider's default can cut the JSON off mid-array. */
+  cJSON_AddNumberToObject(req, "max_output_tokens", 32000);
 
   cJSON *reasoning = cJSON_CreateObject();
   cJSON_AddStringToObject(reasoning, "effort", "high");
@@ -2459,11 +2552,19 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   cJSON *rfmt = cJSON_CreateObject();
   cJSON_AddStringToObject(rfmt, "type", "json_object");
   cJSON_AddItemToObject(creq, "response_format", rfmt);
+
+  /* A 20-30 clip plan needs a few thousand output tokens.  Newer OpenAI models
+     only accept max_completion_tokens (max_tokens is an error there), while
+     some compatible providers do not know the newer name at all - so the plain
+     body is kept around and used if the provider complains. */
   char *chat_body = cJSON_PrintUnformatted(creq);
+  cJSON_AddNumberToObject(creq, "max_completion_tokens", 32000);
+  char *chat_body_limited = cJSON_PrintUnformatted(creq);
   cJSON_Delete(creq);
 
   if (!body) {
     free(chat_body);
+    free(chat_body_limited);
     free(prompt);
     ClipPlanList empty = {0};
     return empty;
@@ -2503,6 +2604,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
         logw("api.anthropic.com has no OpenAI-style /chat/completions endpoint, "
              "so there is nothing to fall back to.");
         free(chat_body);
+        free(chat_body_limited);
         free(prompt);
         ClipPlanList empty = {0};
         return empty;
@@ -2517,8 +2619,9 @@ static ClipPlanList openai_make_plan(const Config *cfg,
       if (bl >= 10 && strcmp(base2 + bl - 10, "/anthropic") == 0) base2[bl - 10] = '\0';
       snprintf(endpoint, sizeof(endpoint), "%s/chat/completions", base2);
       logi("Anthropic endpoint failed - trying the OpenAI-style endpoint instead: %s", endpoint);
-      resp = http_post_json_to_mem(endpoint, cfg->openai_key,
-                                   chat_body ? chat_body : "{}", &http_code, timeout_s);
+      resp = openai_post_chat_tokens(endpoint, cfg->openai_key,
+                                     chat_body_limited ? chat_body_limited : chat_body,
+                                     chat_body, &http_code, timeout_s);
       if (http_code < 200 || http_code >= 300) {
         logw("Chat-completions HTTP %ld", http_code);
         if (resp.data && resp.size) logw("Chat raw body: %.800s", resp.data);
@@ -2527,6 +2630,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
         }
         if (resp.data) free(resp.data);
         free(chat_body);
+        free(chat_body_limited);
         free(prompt);
         ClipPlanList empty = {0};
         return empty;
@@ -2553,13 +2657,15 @@ static ClipPlanList openai_make_plan(const Config *cfg,
 
     logi("Trying the provider's /chat/completions endpoint instead (DeepSeek and other OpenAI-compatible APIs)...");
     snprintf(endpoint, sizeof(endpoint), "%s/chat/completions", cfg->openai_base_url);
-    resp = http_post_json_to_mem(endpoint, cfg->openai_key,
-                                 chat_body ? chat_body : "{}", &http_code, timeout_s);
+    resp = openai_post_chat_tokens(endpoint, cfg->openai_key,
+                                   chat_body_limited ? chat_body_limited : chat_body,
+                                   chat_body, &http_code, timeout_s);
     if (http_code < 200 || http_code >= 300) {
       logw("Chat-completions HTTP %ld", http_code);
       if (resp.data && resp.size) logw("Chat raw body: %.800s", resp.data);
       if (resp.data) free(resp.data);
       free(chat_body);
+      free(chat_body_limited);
       free(prompt);
       ClipPlanList empty = {0};
       return empty;
@@ -2584,6 +2690,7 @@ have_response:;
          "off (output limit) or the model refused.");
     logw("Reply started: %.300s", out_text);
   }
+  warn_if_plan_was_cut_short(resp.data, plan.count);
 
   /* Anthropic-style gateways truncate or refuse more often than the plain
      chat endpoint - give /chat/completions one chance with the SAME prompt
@@ -2599,12 +2706,15 @@ have_response:;
     snprintf(endpoint, sizeof(endpoint), "%s/chat/completions", base2);
     logi("Trying the OpenAI-style endpoint instead: %s", endpoint);
     long code2 = 0;
-    MemBuf r2 = http_post_json_to_mem(endpoint, cfg->openai_key, chat_body, &code2, timeout_s);
+    MemBuf r2 = openai_post_chat_tokens(endpoint, cfg->openai_key,
+                                        chat_body_limited ? chat_body_limited : chat_body,
+                                        chat_body, &code2, timeout_s);
     if (code2 >= 200 && code2 < 300) {
       char *t2 = openai_extract_output_text(r2.data ? r2.data : "");
       if (t2) {
         plan = parse_clip_plan_json(t2);
         free(t2);
+        warn_if_plan_was_cut_short(r2.data, plan.count);
         if (plan.count > 0) logok("Recovered the clip plan via %s", endpoint);
       }
     } else {
@@ -2616,6 +2726,7 @@ have_response:;
 
   free(out_text);
   free(chat_body);
+  free(chat_body_limited);
   free(resp.data);
   return plan;
 }
