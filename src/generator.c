@@ -1243,6 +1243,111 @@ static bool download_imsdb_script_ex(const char *movie_title,
 
 /* ----------------------- OpenAI response parsing ----------------------- */
 
+/* POST JSON with fully custom headers (Anthropic-compatible endpoints use
+ * x-api-key + anthropic-version instead of a Bearer token). */
+static MemBuf http_post_json_headers(const char *url, const char *const *headers_extra,
+                                     const char *json_body, long *http_code_out,
+                                     long timeout_s) {
+  if (http_code_out) *http_code_out = -1;
+
+  CURL *curl = curl_easy_init();
+  if (!curl) {
+    logw("curl init failed (out of memory?)");
+    return (MemBuf){0};
+  }
+
+  MemBuf buf = (MemBuf){0};
+  struct curl_slist *headers = NULL;
+  headers = curl_slist_append(headers, "Content-Type: application/json");
+  for (int i = 0; headers_extra && headers_extra[i]; i++)
+    headers = curl_slist_append(headers, headers_extra[i]);
+
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(json_body));
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&buf);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_s);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+  CURLcode res = curl_easy_perform(curl);
+  long code = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+  if (http_code_out) *http_code_out = code;
+
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+
+  if (res != CURLE_OK) {
+    logw("HTTP POST failed: %s", curl_easy_strerror(res));
+    free(buf.data);
+    return (MemBuf){0};
+  }
+  return buf;
+}
+
+/* ------------------------------------------- Anthropic Messages API (Claude) */
+
+/* Anthropic-compatible base URLs come with or without the /v1 suffix:
+ *   https://api.anthropic.com/v1  ->  https://api.anthropic.com/v1/messages
+ *   https://api.deepseek.com/anthropic -> https://api.deepseek.com/anthropic/v1/messages */
+static void anthropic_endpoint(const char *base, char *out, size_t outsz) {
+  size_t bl = strlen(base);
+  bool has_v1 = bl >= 3 && strcmp(base + bl - 3, "/v1") == 0;
+  snprintf(out, outsz, "%s%s/messages", base, has_v1 ? "" : "/v1");
+}
+
+static MemBuf anthropic_post_messages(const Config *cfg, const char *sys_prompt,
+                                      const char *prompt, long *http_code, long timeout_s) {
+  char endpoint[560];
+  anthropic_endpoint(cfg->openai_base_url, endpoint, sizeof(endpoint));
+
+  cJSON *req = cJSON_CreateObject();
+  cJSON_AddStringToObject(req, "model", cfg->openai_model);
+  cJSON_AddNumberToObject(req, "max_tokens", 16000);
+  cJSON_AddStringToObject(req, "system", sys_prompt);
+  cJSON *msgs = cJSON_CreateArray();
+  cJSON *u = cJSON_CreateObject();
+  cJSON_AddStringToObject(u, "role", "user");
+  cJSON_AddStringToObject(u, "content", prompt);
+  cJSON_AddItemToArray(msgs, u);
+  cJSON_AddItemToObject(req, "messages", msgs);
+  char *body = cJSON_PrintUnformatted(req);
+  cJSON_Delete(req);
+  if (!body) { if (http_code) *http_code = -1; return (MemBuf){0}; }
+
+  char keyhdr[1024], bearhdr[1024];
+  snprintf(keyhdr, sizeof(keyhdr), "x-api-key: %s", cfg->openai_key);
+  snprintf(bearhdr, sizeof(bearhdr), "Authorization: Bearer %s", cfg->openai_key);
+  const char *hdrs[] = { keyhdr, "anthropic-version: 2023-06-01", bearhdr, NULL };
+
+  logi("Anthropic-compatible endpoint: %s", endpoint);
+  MemBuf r = http_post_json_headers(endpoint, hdrs, body, http_code, timeout_s);
+  free(body);
+  return r;
+}
+
+/* Extract content[0].text from an Anthropic Messages API reply. */
+static char *anthropic_extract_text(const cJSON *root) {
+  const cJSON *content = cJSON_GetObjectItemCaseSensitive(root, "content");
+  if (!cJSON_IsArray(content)) return NULL;
+  const cJSON *item = NULL;
+  cJSON_ArrayForEach(item, content) {
+    if (!cJSON_IsObject(item)) continue;
+    const cJSON *type = cJSON_GetObjectItemCaseSensitive(item, "type");
+    const cJSON *text = cJSON_GetObjectItemCaseSensitive(item, "text");
+    if (cJSON_IsString(type) && type->valuestring &&
+        strcmp(type->valuestring, "text") == 0 &&
+        cJSON_IsString(text) && text->valuestring)
+      return str_dup(text->valuestring);
+  }
+  return NULL;
+}
+
 static char *openai_extract_output_text(const char *resp_json) {
   cJSON *root = cJSON_Parse(resp_json);
   if (!root) return NULL;
@@ -1274,8 +1379,10 @@ static char *openai_extract_output_text(const char *resp_json) {
         return out;
       }
     }
+    /* Anthropic Messages shape: {"content":[{"type":"text","text":"..."}]} */
+    char *anth = anthropic_extract_text(root);
     cJSON_Delete(root);
-    return NULL;
+    return anth;
   }
 
   cJSON *item = NULL;
@@ -1858,10 +1965,9 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   char *chat_body = cJSON_PrintUnformatted(creq);
   cJSON_Delete(creq);
 
-  free(prompt);
-
   if (!body) {
     free(chat_body);
+    free(prompt);
     ClipPlanList empty = {0};
     return empty;
   }
@@ -1870,10 +1976,29 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   bool has_script = (optional_script_text && optional_script_text[0] != 0);
   long timeout_s = has_script ? 14400L : 3600L;
 
-  char endpoint[512];
-  snprintf(endpoint, sizeof(endpoint), "%s/responses", cfg->openai_base_url);
+  bool anthropic_base = strstr(cfg->openai_base_url, "anthropic") != NULL;
+  char endpoint[560];
+  MemBuf resp;
 
-  MemBuf resp = http_post_json_to_mem(endpoint, cfg->openai_key, body, &http_code, timeout_s);
+  if (anthropic_base) {
+    free(body);
+    free(chat_body);
+    resp = anthropic_post_messages(cfg, sys_prompt, prompt, &http_code, timeout_s);
+    if (http_code < 200 || http_code >= 300) {
+      logw("Anthropic-compatible HTTP %ld", http_code);
+      if (resp.data && resp.size) logw("Anthropic raw body: %.800s", resp.data);
+      if (has_script && resp.data && openai_resp_should_retry_without_script(resp.data)) {
+        if (out_retry_without_script) *out_retry_without_script = true;
+      }
+      free(resp.data);
+      ClipPlanList empty = {0};
+      return empty;
+    }
+    goto have_response;
+  }
+
+  snprintf(endpoint, sizeof(endpoint), "%s/responses", cfg->openai_base_url);
+  resp = http_post_json_to_mem(endpoint, cfg->openai_key, body, &http_code, timeout_s);
   free(body);
 
   if (http_code < 200 || http_code >= 300) {
@@ -1897,11 +2022,15 @@ static ClipPlanList openai_make_plan(const Config *cfg,
       if (resp.data && resp.size) logw("Chat raw body: %.800s", resp.data);
       if (resp.data) free(resp.data);
       free(chat_body);
+      free(prompt);
       ClipPlanList empty = {0};
       return empty;
     }
   }
   free(chat_body);
+
+have_response:;
+  free(prompt);
 
   char *out_text = openai_extract_output_text(resp.data ? resp.data : "");
   if (!out_text) {
