@@ -233,7 +233,20 @@ if(BUILD_UNIT_TESTS)
     target_include_directories(${_t} PRIVATE "${cjson_SOURCE_DIR}")
     # the retry backoff must not put the tests to sleep
     target_compile_definitions(${_t} PRIVATE MOVIECAP_UNIT_TEST)
-    target_link_libraries(${_t} PRIVATE CURL::libcurl miniz Threads::Threads)
+    target_link_libraries(${_t} PRIVATE miniz Threads::Threads)
+
+    if(_t STREQUAL "anthropic_endpoint_test")
+      # This one drives the Claude / Anthropic-compatible request path against a
+      # scripted transport: it compiles against tests/curl_stub (a tiny stand-in
+      # for libcurl that records requests and replays queued replies) instead of
+      # the real CURL::libcurl, so the URL, headers, stream flag and every retry
+      # path can be checked without a network or an API key.
+      target_include_directories(${_t} BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/curl_stub")
+      target_sources(${_t} PRIVATE tests/curl_stub/curl_stub.c)
+    else()
+      target_link_libraries(${_t} PRIVATE CURL::libcurl)
+    endif()
     if(WIN32)
       target_compile_definitions(${_t} PRIVATE
         UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX CJSON_HIDE_SYMBOLS)
