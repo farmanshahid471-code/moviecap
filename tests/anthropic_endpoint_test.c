@@ -1306,6 +1306,8 @@ static void test_over_long_narration_is_trimmed_to_the_target(void) {
   double speech = plan_speech_seconds(lst.items, lst.count, "en");
   ck(speech <= 60.0 * 1.15, "a 277 s narration set is trimmed to a 60 s target");
   ck(speech >= 60.0 * 0.50, "the trim keeps each clip narrated, not emptied");
+  ck(speech >= 60.0 * 0.85,
+     "the refill pass hands the sentence slack back, so the target is nearly met");
   bool whole = true;
   for (size_t i = 0; i < lst.count; i++) {
     size_t n = strlen(lst.items[i].narration);
@@ -1342,17 +1344,20 @@ static void test_trim_never_cuts_the_closing_line(void) {
   ck(tail[0] != 0, "the English closing line is known");
   lst.items[0].start = 5;  lst.items[0].end = 35;
   lst.items[1].start = 40; lst.items[1].end = 70;
-  lst.items[0].narration = str_dup(
-      "He opens the door and steps inside the dark room. Then he hears a noise behind "
-      "him and turns around. Someone is standing there and he freezes.");
-  char last[1200];
-  snprintf(last, sizeof(last),
-           "He takes the key and the story ends with the two of them driving away. "
-           "The house burns behind them as the sun comes up. %s", tail);
+  const char *sent = "He opens the door and steps inside the dark room. "
+                     "Then he hears a noise behind him and turns around.";
+  char long_body[2048];
+  int at = 0;
+  for (int k = 0; k < 4; k++) at += snprintf(long_body + at, sizeof(long_body) - at, "%s", sent);
+  lst.items[0].narration = str_dup(long_body);
+  char last[2600];
+  snprintf(last, sizeof(last), "%s %s", long_body, tail);
   lst.items[1].narration = str_dup(last);
-  cap_plan_narration_length(&lst, 100.0, 0.0, "en", "English");
+  cap_plan_narration_length(&lst, 60.0, 0.0, "en", "English");
   double speech = plan_speech_seconds(lst.items, lst.count, "en");
-  ck(speech <= 100.0 * 1.15, "the trimmed plan fits the target");
+  ck(speech <= 60.0 * 1.15, "the trimmed plan fits the target");
+  ck(speech >= 60.0 * 0.85,
+     "the trimmed plan fills the target as far as whole sentences allow");
   size_t n = strlen(lst.items[1].narration), tl = strlen(tail);
   ck(n >= tl && memcmp(lst.items[1].narration + n - tl, tail, tl) == 0,
      "the closing line of the last clip survives the trim");

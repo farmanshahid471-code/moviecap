@@ -7072,60 +7072,11 @@ static void recap_closing_line_for(const char *recap_language, char *out, size_t
 /* Keep whole sentences of `text` while they fit in `budget_units`.  At least
    one sentence always stays.  `tail` (when non-empty and at the very end of
    the text) is preserved: that is the fixed closing line. */
-static char *narration_trim_to_budget(const char *text, double budget_units,
-                                      const char *code, const char *tail,
-                                      bool *out_trimmed) {
-  if (out_trimmed) *out_trimmed = false;
-  if (!text) return str_dup("");
-  size_t n = strlen(text);
-  if (count_speech_units(text, code) <= budget_units) return str_dup(text);
-
-  size_t body_n = n;
-  if (tail && tail[0]) {
-    size_t tl = strlen(tail);
-    if (tl <= n && memcmp(text + n - tl, tail, tl) == 0) body_n = n - tl;
-  }
-
-  double used = 0.0;
-  size_t keep_end = 0, pos = 0;
-  int kept = 0;
-  while (pos < body_n) {
-    size_t nx = next_sentence_cursor(text, body_n, pos);
-    if (nx <= pos) break;
-    double u = units_of_slice(text + pos, nx - pos, code);
-    if (kept > 0 && used + u > budget_units) break;
-    used += u;
-    keep_end = nx;
-    kept++;
-    pos = nx;
-  }
-  if (kept == 0) {
-    size_t nx = next_sentence_cursor(text, body_n, 0);
-    keep_end = nx > 0 ? nx : body_n;
-  }
-  while (keep_end > 0 && (text[keep_end - 1] == ' ' || text[keep_end - 1] == '\n' ||
-                          text[keep_end - 1] == '\r' || text[keep_end - 1] == '\t'))
-    keep_end--;
-
-  size_t tl = (tail && tail[0] && body_n < n) ? strlen(tail) : 0;
-  char *out = (char *)malloc(keep_end + tl + 2);
-  if (!out) die("OOM");
-  memcpy(out, text, keep_end);
-  size_t at = keep_end;
-  if (tl) {
-    if (at > 0) out[at++] = ' ';
-    memcpy(out + at, tail, tl);
-    at += tl;
-  }
-  out[at] = '\0';
-  if (out_trimmed) *out_trimmed = true;
-  return out;
-}
-
 /* Deterministic length guarantee: hand the plan exactly `target_sec (+ the
-   crossfade overlap the render will eat) of speech by trimming whole sentences
-   off the end of the narrations that are over their share.  The clips stay
-   where they are and the last clip keeps the closing line. */
+   crossfade overlap the render will eat) of speech.  Sentences are the smallest
+   unit the trim may cut, so a strict per-clip allocation under-shoots by up to
+   one sentence per clip; the refill pass then gives that slack back to the
+   clips that have room left inside their own time range. */
 static void cap_plan_narration_length(ClipPlanList *plan, double target_sec, double overlap_sec,
                                       const char *lang_code, const char *recap_language) {
   if (!plan || plan->count == 0) return;
@@ -7149,12 +7100,23 @@ static void cap_plan_narration_length(ClipPlanList *plan, double target_sec, dou
   }
   double tail_units = last_has_tail ? count_speech_units(tail, lang_code) : 0.0;
 
+  /* The originals stay around: the refill pass needs the sentences the trim cut. */
+  char **orig = (char **)calloc(plan->count, sizeof(char *));
+  size_t *used = (size_t *)calloc(plan->count, sizeof(size_t));
+  size_t *orig_len = (size_t *)calloc(plan->count, sizeof(size_t));
+  if (!orig || !used || !orig_len) die("OOM");
+  for (size_t i = 0; i < plan->count; i++) {
+    orig[i] = str_dup(plan->items[i].narration ? plan->items[i].narration : "");
+    orig_len[i] = strlen(orig[i]);
+    used[i] = orig_len[i];
+  }
+
   double before_min = total / per_sec / 60.0;
   double remaining_budget = budget;
   double remaining_units = total;
   size_t trimmed_clips = 0;
   for (size_t i = 0; i < plan->count; i++) {
-    double u = count_speech_units(plan->items[i].narration, lang_code);
+    double u = count_speech_units(orig[i], lang_code);
     double alloc;
     if (i + 1 == plan->count) {
       alloc = remaining_budget;          /* the ending keeps what is left */
@@ -7162,46 +7124,102 @@ static void cap_plan_narration_length(ClipPlanList *plan, double target_sec, dou
       alloc = remaining_units > 0.0 ? remaining_budget * (u / remaining_units)
                                     : remaining_budget;
     }
-    bool trimmed = false;
-    const char *use_tail = (i + 1 == plan->count && last_has_tail) ? tail : NULL;
-    char *shorter = narration_trim_to_budget(plan->items[i].narration, alloc, lang_code,
-                                             use_tail, &trimmed);
-    double kept = count_speech_units(shorter, lang_code);
-    if (trimmed && kept < u) {
-      free(plan->items[i].narration);
-      plan->items[i].narration = shorter;
-      trimmed_clips++;
-    } else {
-      free(shorter);
-      kept = u;
+    bool is_last = (i + 1 == plan->count);
+    const char *use_tail = (is_last && last_has_tail) ? tail : NULL;
+    size_t body_n = orig_len[i];
+    if (use_tail) {
+      size_t tl = strlen(use_tail);
+      if (tl <= body_n) body_n -= tl;
     }
-    remaining_budget -= kept;
+    /* keep at least one sentence, even when it is over the allocation */
+    size_t keep = 0;
+    {
+      double acc = 0.0;
+      size_t pos = 0;
+      int kept = 0;
+      while (pos < body_n) {
+        size_t nx = next_sentence_cursor(orig[i], body_n, pos);
+        if (nx <= pos) break;
+        double su = units_of_slice(orig[i] + pos, nx - pos, lang_code);
+        if (kept > 0 && acc + su > alloc) break;
+        acc += su;
+        keep = nx;
+        kept++;
+        pos = nx;
+      }
+      if (kept == 0) {
+        size_t nx = next_sentence_cursor(orig[i], body_n, 0);
+        keep = nx > 0 ? nx : body_n;
+      }
+      while (keep > 0 && (orig[i][keep - 1] == ' ' || orig[i][keep - 1] == '\n' ||
+                          orig[i][keep - 1] == '\r' || orig[i][keep - 1] == '\t'))
+        keep--;
+    }
+    if (keep < orig_len[i]) {
+      used[i] = keep;
+      trimmed_clips++;
+    }
+    double now = units_of_slice(orig[i], used[i], lang_code);
+    if (is_last && last_has_tail) now += tail_units;
+    remaining_budget -= now;
     remaining_units -= u;
     if (remaining_budget < 0.0) remaining_budget = 0.0;
     if (remaining_units < 0.0) remaining_units = 0.0;
   }
 
-  /* The last clip swallows whatever is left, so a very long ending can push the
-     total back over the budget.  Trim it once more against the real remainder. */
-  double now = 0.0;
-  for (size_t i = 0; i < plan->count; i++)
-    now += count_speech_units(plan->items[i].narration, lang_code);
-  if (now > budget * 1.02 && plan->count > 0) {
-    size_t i = plan->count - 1;
-    double others = now - count_speech_units(plan->items[i].narration, lang_code);
-    double alloc = budget - others;
-    if (alloc < tail_units) alloc = tail_units;    /* never cut the closing line */
-    bool trimmed = false;
-    char *shorter = narration_trim_to_budget(plan->items[i].narration, alloc, lang_code,
-                                             last_has_tail ? tail : NULL, &trimmed);
-    if (trimmed) {
-      free(plan->items[i].narration);
-      plan->items[i].narration = shorter;
-      trimmed_clips++;
-    } else {
-      free(shorter);
-    }
+  /* Refill: hand the slack back as the smallest next sentence that still fits
+     both the whole budget and the clip's own time range. */
+  double kept_total = 0.0;
+  for (size_t i = 0; i < plan->count; i++) {
+    double u = units_of_slice(orig[i], used[i], lang_code);
+    if (i + 1 == plan->count && last_has_tail) u += tail_units;
+    kept_total += u;
   }
+  for (int guard = 0; guard < (int)plan->count * 64; guard++) {
+    if (kept_total > budget * 0.97) break;
+    size_t best = (size_t)-1;
+    double best_u = 0.0;
+    for (size_t i = 0; i < plan->count; i++) {
+      if (used[i] >= orig_len[i]) continue;
+      double window_units = (double)(plan->items[i].end - plan->items[i].start) * per_sec;
+      if (window_units <= 0.0) window_units = budget;
+      double here = units_of_slice(orig[i], used[i], lang_code);
+      if (i + 1 == plan->count && last_has_tail) here += tail_units;
+      size_t nx = next_sentence_cursor(orig[i], orig_len[i], used[i]);
+      if (nx <= used[i]) continue;
+      double su = units_of_slice(orig[i] + used[i], nx - used[i], lang_code);
+      if (su <= 0.0) continue;
+      if (kept_total + su > budget) continue;
+      if (here + su > window_units) continue;
+      if (best == (size_t)-1 || su < best_u) { best = i; best_u = su; }
+    }
+    if (best == (size_t)-1) break;
+    used[best] = next_sentence_cursor(orig[best], orig_len[best], used[best]);
+    kept_total += best_u;
+  }
+
+  /* Rebuild the narrations from the kept prefixes (the closing line last). */
+  for (size_t i = 0; i < plan->count; i++) {
+    bool is_last = (i + 1 == plan->count);
+    bool append_tail = is_last && last_has_tail && used[i] < orig_len[i];
+    size_t tl = append_tail ? strlen(tail) : 0;
+    char *out = (char *)malloc(used[i] + tl + 2);
+    if (!out) die("OOM");
+    memcpy(out, orig[i], used[i]);
+    size_t at = used[i];
+    if (append_tail) {
+      if (at > 0) out[at++] = ' ';
+      memcpy(out + at, tail, tl);
+      at += tl;
+    }
+    out[at] = '\0';
+    free(plan->items[i].narration);
+    plan->items[i].narration = out;
+    free(orig[i]);
+  }
+  free(orig);
+  free(used);
+  free(orig_len);
 
   double after = plan_speech_seconds(plan->items, plan->count, lang_code);
   logw("The narrations were longer than the requested length: trimmed whole sentences "
