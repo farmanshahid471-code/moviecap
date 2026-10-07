@@ -795,6 +795,9 @@ jobs:
           if ($dur -gt 80) {
             Write-Host "::error title=plen::the 1 minute recap came out at $dur s - the length was not held"
             exit 1 }
+          if ($dur -lt 40) {
+            Write-Host "::error title=plen::the trim left the 1 minute target far behind ($dur s)"
+            exit 1 }
           Write-Host "recap length OK: over-long narrations trimmed, 1 minute target held ($dur s)"
 
       - name: "Test run.bat web brings the control panel up"

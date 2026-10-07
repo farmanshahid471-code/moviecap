@@ -7124,6 +7124,10 @@ static void cap_plan_narration_length(ClipPlanList *plan, double target_sec, dou
       alloc = remaining_units > 0.0 ? remaining_budget * (u / remaining_units)
                                     : remaining_budget;
     }
+    /* never more speech than the clip's own time range can show: a narration
+       longer than its window would be stretched into slow motion by the render */
+    double window_units = (double)(plan->items[i].end - plan->items[i].start) * per_sec;
+    if (window_units > 0.0 && alloc > window_units) alloc = window_units;
     bool is_last = (i + 1 == plan->count);
     const char *use_tail = (is_last && last_has_tail) ? tail : NULL;
     size_t body_n = orig_len[i];

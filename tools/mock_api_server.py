@@ -153,12 +153,15 @@ def plan_from_prompt(prompt, clips_wanted, honour_length=False):
     """The same plan, built from the prompt text alone - which is all a batched
     Messages request carries (its params hold system + messages)."""
     target_sec = 0
+    m = re.search(r"Target clip length:\s*(\d+)-(\d+) seconds each", prompt or "")
+    if m:
+        # the middle of the asked range: a real model plans windows of about the
+        # length the prompt asks for, so the mock does too
+        target_sec = (int(m.group(1)) + int(m.group(2))) // 2
+        if target_sec < 4:
+            target_sec = 4
     if honour_length:
-        m = re.search(r"Target clip length:\s*(\d+)-(\d+) seconds each", prompt)
-        if m:
-            target_sec = (int(m.group(1)) + int(m.group(2))) // 2   # the middle of
-                                                                   # the asked range
-        m = re.search(r"Number of clips:\s*(\d+)", prompt)
+        m = re.search(r"Number of clips:\s*(\d+)", prompt or "")
         if m:
             clips_wanted = max(1, min(50, int(m.group(1))))        # the asked count
     subs = ""
@@ -179,9 +182,10 @@ def plan_from_prompt(prompt, clips_wanted, honour_length=False):
         print(f"[mock-openai] using character names from INPUT C: {', '.join(names)}", flush=True)
 
     clips = []
+    clip_len = target_sec if target_sec > 0 else 12
     for i in range(clips_wanted):
         start = int(lo + step * (i + 0.5))
-        end = start + 12
+        end = start + clip_len
         if end > hi:
             end = hi
         if end - start < 4:
