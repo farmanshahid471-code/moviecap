@@ -503,7 +503,24 @@ jobs:
           $srv = Start-Process -FilePath "python" `
             -ArgumentList "tools/mock_api_server.py","--openai-port","9100","--eleven-port","9101","--tts-port","8020","--truncate-first-batch" `
             -PassThru -RedirectStandardOutput "mockbatch.log" -RedirectStandardError "mockbatch.err"
-          Start-Sleep -Seconds 4
+          Start-Sleep -Seconds 2
+          # a fresh python process can need more than a few seconds on a cold
+          # runner - wait until the mock really accepts connections, and if it
+          # never does, say so with the mock's own output instead of failing
+          # later with "no batch was created"
+          $up = $false
+          foreach ($attempt in 1..25) {
+            try {
+              $probe = New-Object System.Net.Sockets.TcpClient
+              $probe.Connect("127.0.0.1", 9100); $probe.Close(); $up = $true; break
+            } catch { Start-Sleep -Seconds 1 }
+          }
+          if (-not $up) {
+            Write-Host "::error title=pbatch::the mock API server never listened on port 9100"
+            Write-Host "--- mockbatch.err ---"; Get-Content mockbatch.err -Tail 20 -ErrorAction SilentlyContinue
+            Write-Host "--- mockbatch.log ---"; Get-Content mockbatch.log -Tail 20 -ErrorAction SilentlyContinue
+            exit 1
+          }
           try {
             $env:Path = "C:\ProgramData\chocolatey\bin;C:\Windows\System32;C:\Windows"
             Push-Location $pb
@@ -695,7 +712,24 @@ jobs:
           $srv = Start-Process -FilePath "python" `
             -ArgumentList "tools/mock_api_server.py","--openai-port","9200","--eleven-port","9201","--tts-port","8021","--wiki-port","9202","--oversized-first-plan" `
             -PassThru -RedirectStandardOutput "mockbig.log" -RedirectStandardError "mockbig.err"
-          Start-Sleep -Seconds 4
+          Start-Sleep -Seconds 2
+          # a fresh python process can need more than a few seconds on a cold
+          # runner - wait until the mock really accepts connections, and if it
+          # never does, say so with the mock's own output instead of failing
+          # later with "no batch was created"
+          $up = $false
+          foreach ($attempt in 1..25) {
+            try {
+              $probe = New-Object System.Net.Sockets.TcpClient
+              $probe.Connect("127.0.0.1", 9200); $probe.Close(); $up = $true; break
+            } catch { Start-Sleep -Seconds 1 }
+          }
+          if (-not $up) {
+            Write-Host "::error title=pbig::the mock API server never listened on port 9200"
+            Write-Host "--- mockbig.err ---"; Get-Content mockbig.err -Tail 20 -ErrorAction SilentlyContinue
+            Write-Host "--- mockbig.log ---"; Get-Content mockbig.log -Tail 20 -ErrorAction SilentlyContinue
+            exit 1
+          }
           try {
             $env:Path = "C:\ProgramData\chocolatey\bin;C:\Windows\System32;C:\Windows"
             Push-Location $pg
@@ -767,7 +801,24 @@ jobs:
           $srv = Start-Process -FilePath "python" `
             -ArgumentList "tools/mock_api_server.py","--openai-port","9300","--eleven-port","9301","--tts-port","8022","--wiki-port","9302","--overlong-plans" `
             -PassThru -RedirectStandardOutput "mocklen.log" -RedirectStandardError "mocklen.err"
-          Start-Sleep -Seconds 4
+          Start-Sleep -Seconds 2
+          # a fresh python process can need more than a few seconds on a cold
+          # runner - wait until the mock really accepts connections, and if it
+          # never does, say so with the mock's own output instead of failing
+          # later with "no batch was created"
+          $up = $false
+          foreach ($attempt in 1..25) {
+            try {
+              $probe = New-Object System.Net.Sockets.TcpClient
+              $probe.Connect("127.0.0.1", 9300); $probe.Close(); $up = $true; break
+            } catch { Start-Sleep -Seconds 1 }
+          }
+          if (-not $up) {
+            Write-Host "::error title=plen::the mock API server never listened on port 9300"
+            Write-Host "--- mocklen.err ---"; Get-Content mocklen.err -Tail 20 -ErrorAction SilentlyContinue
+            Write-Host "--- mocklen.log ---"; Get-Content mocklen.log -Tail 20 -ErrorAction SilentlyContinue
+            exit 1
+          }
           try {
             $env:Path = "C:\ProgramData\chocolatey\bin;C:\Windows\System32;C:\Windows"
             Push-Location $pl

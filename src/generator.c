@@ -2505,6 +2505,21 @@ static bool batch_submit(const Config *cfg, const size_t *idx, size_t n,
   MemBuf resp = http_post_json_headers(endpoint, hdrs, body, &code, 900);
   free(body);
 
+  /* HTTP 0 means the request never reached the server at all - a refused
+     connection, a DNS hiccup, a server still coming up.  That loses the whole
+     batch and the 50% discount for no reason, so ask once more before giving
+     up.  A real HTTP status is the server's answer and is not retried here. */
+  if (code == 0) {
+    logw("No answer from the batch endpoint (%s) - asking once more.", endpoint);
+    plat_sleep_ms(2000);
+    char *again = batch_create_body(idx, n, budget);
+    if (again) {
+      free(resp.data);
+      resp = http_post_json_headers(endpoint, hdrs, again, &code, 900);
+      free(again);
+    }
+  }
+
   /* A model with a smaller output ceiling (an older Claude caps at 8192) would
    * lose the whole batch over one rejected cap - and every plan in it would
    * then be asked live at full price.  Name the ceiling, resubmit once. */
