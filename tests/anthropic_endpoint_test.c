@@ -1720,6 +1720,17 @@ static void test_plan_request_asks_for_the_band_and_audits_it(void) {
   free_clip_plan_list(&under);
 }
 
+static void test_minutes_print_without_lying(void) {
+  char b[24];
+  fmt_minutes(20.0, b, sizeof(b));  ck_str(b, "20", "whole minutes print whole");
+  fmt_minutes(10.0, b, sizeof(b));  ck_str(b, "10", "ten prints as ten");
+  fmt_minutes(0.5, b, sizeof(b));   ck_str(b, "0.5", "a half minute is not zero");
+  fmt_minutes(0.0, b, sizeof(b));   ck_str(b, "0", "zero prints as zero");
+  fmt_minutes(12.5, b, sizeof(b));  ck_str(b, "12.5", "half minutes keep their half");
+  fmt_minutes(7.04, b, sizeof(b));  ck_str(b, "7", "a rounding hair is not a decimal");
+  fmt_minutes(7.6, b, sizeof(b));   ck_str(b, "7.6", "a real fraction is shown");
+}
+
 int main(void) {
   test_endpoint_shapes();
   test_native_claude_request();
@@ -1758,6 +1769,7 @@ int main(void) {
   test_recap_band_is_a_range();
   test_transition_styles_and_join_length();
   test_plan_request_asks_for_the_band_and_audits_it();
+  test_minutes_print_without_lying();
   test_openai_no_limit_means_no_extra_requests();
   test_batch_custom_id_shape();
   test_batch_collect_then_render();

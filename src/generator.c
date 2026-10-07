@@ -556,6 +556,14 @@ static void recap_band_minutes(const Config *cfg, double *lo, double *hi) {
   if (hi) *hi = top;
 }
 
+/* Minutes as a short string: whole minutes without decimals, anything else with
+   one ("10", "20", "0.5") - a 0.5 minute floor must not print as "0". */
+static void fmt_minutes(double v, char *buf, size_t n) {
+  if (!buf || n == 0) return;
+  if (fabs(v - floor(v + 0.5)) < 0.05) snprintf(buf, n, "%.0f", v);
+  else snprintf(buf, n, "%.1f", v);
+}
+
 static const char *cfg_get_str(const cJSON *node, const char *def) {
   if (cJSON_IsString(node) && node->valuestring && node->valuestring[0]) return node->valuestring;
   return def;
@@ -7685,10 +7693,13 @@ static void audit_plan_length_and_script(const Config *cfg, const char *movie_ti
 
   double speech = plan_speech_seconds(plan->items, plan->count, lang_code);
   if (want_length) {
+    char lo_s[24], hi_s[24];
+    fmt_minutes(band_lo, lo_s, sizeof(lo_s));
+    fmt_minutes(band_hi, hi_s, sizeof(hi_s));
     if (band_lo < band_hi - 0.05)
-      logi("Plan speech: about %.1f min of narration for the %.0f-%.0f min target "
-           "(%zu clips, aiming at %.0f).",
-           speech / 60.0, band_lo, band_hi, plan->count, band_hi);
+      logi("Plan speech: about %.1f min of narration for the %s-%s min target "
+           "(%zu clips, aiming at %s).",
+           speech / 60.0, lo_s, hi_s, plan->count, hi_s);
     else
       logi("Plan speech: about %.1f min of narration for the %.0f min target (%zu clips).",
            speech / 60.0, band_hi, plan->count);
@@ -7820,11 +7831,15 @@ static void audit_plan_length_and_script(const Config *cfg, const char *movie_ti
       cap_plan_narration_length(plan, target_sec, -join_sec, lang_code, cfg->recap_language);
       speech = plan_speech_seconds(plan->items, plan->count, lang_code);
     }
-    if (speech > budget_sec * 1.05)
-      logw("Even after trimming the narrations hold %.1f min of speech for the %.0f min "
-           "top of the %.0f-%.0f min band - the model ignored the length rule by too much. "
+    if (speech > budget_sec * 1.05) {
+      char lo_s[24], hi_s[24];
+      fmt_minutes(band_lo, lo_s, sizeof(lo_s));
+      fmt_minutes(band_hi, hi_s, sizeof(hi_s));
+      logw("Even after trimming the narrations hold %.1f min of speech for the %s min "
+           "top of the %s-%s min band - the model ignored the length rule by too much. "
            "Try a stronger model, or lower min_clips/max_clips so the plan starts smaller.",
-           speech / 60.0, band_hi, band_lo, band_hi);
+           speech / 60.0, hi_s, lo_s, hi_s);
+    }
     else if (!too_short && speech < floor_budget * 0.85)
       logw("The narrations hold %.1f min of speech, under the %.0f min floor of the "
            "%.0f-%.0f min target - expect a recap near %.1f min. A stronger model, fewer "
@@ -8008,10 +8023,13 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     if (per_clip_sec > 0) {
       double band_lo = 0.0, band_hi = 0.0;
       recap_band_minutes(cfg, &band_lo, &band_hi);
+      char lo_s[24], hi_s[24];
+      fmt_minutes(band_lo, lo_s, sizeof(lo_s));
+      fmt_minutes(band_hi, hi_s, sizeof(hi_s));
       if (band_lo < band_hi - 0.05)
-        logi("Target recap length %.0f-%.0f min => about %d s per clip at %d clips. "
+        logi("Target recap length %s-%s min => about %d s per clip at %d clips. "
              "(min_recap_minutes = 0 means half of recap_minutes.)",
-             band_lo, band_hi, per_clip_sec, num_clips);
+             lo_s, hi_s, per_clip_sec, num_clips);
       else
         logi("Target recap length ~%.0f min => about %d s per clip.", band_hi, per_clip_sec);
     }
@@ -8344,33 +8362,35 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     double band_lo = 0.0, band_hi = 0.0;
     recap_band_minutes(cfg, &band_lo, &band_hi);
     double want = band_hi * 60.0;
-    char band_note[160];
+    char band_note[192];
     band_note[0] = '\0';
+    char lo_s[24], hi_s[24];
+    fmt_minutes(band_lo, lo_s, sizeof(lo_s));
+    fmt_minutes(band_hi, hi_s, sizeof(hi_s));
     if (band_lo < band_hi - 0.05) {
       if (final_dur < band_lo * 60.0 * 0.98)
-        snprintf(band_note, sizeof(band_note), " - below the %.0f min floor of the band.",
-                 band_lo);
+        snprintf(band_note, sizeof(band_note), " - below the %s min floor of the band.",
+                 lo_s);
       else if (final_dur > want * 1.05)
-        snprintf(band_note, sizeof(band_note), " - above the %.0f min top of the band.",
-                 band_hi);
+        snprintf(band_note, sizeof(band_note), " - above the %s min top of the band.",
+                 hi_s);
       else
-        snprintf(band_note, sizeof(band_note), " - inside the %.0f-%.0f min band.",
-                 band_lo, band_hi);
+        snprintf(band_note, sizeof(band_note), " - inside the %s-%s min band.", lo_s, hi_s);
     }
     logi("Recap length: %.1f min of the %.0f min target (%.0f%%)%s",
          final_dur / 60.0, band_hi, 100.0 * final_dur / want, band_note);
     if (final_dur < band_lo * 60.0 * 0.98)
-      logw("This recap is shorter than the %.0f minutes the band bottoms out at (%.1f min). "
+      logw("This recap is shorter than the %s minutes the band bottoms out at (%.1f min). "
            "Each clip is sped up at most %.2fx and then cut down to its narration, so the "
            "spoken lines were too short for their clip ranges. Try a stronger model, "
            "fewer clips (min_clips/max_clips), or set \"recap_minutes\": 0.",
-           band_lo, final_dur / 60.0, cfg->max_video_speedup);
+           lo_s, final_dur / 60.0, cfg->max_video_speedup);
     else if (final_dur > want * 1.15)
-      logw("This recap came out longer than the %.0f minutes at the top of the band (%.1f min). "
+      logw("This recap came out longer than the %s minutes at the top of the band (%.1f min). "
            "The plan held too many clips or its narrations were longer than their "
            "clip ranges; the log above names which. Lower max_clips so the model "
            "plans fewer clips, or check the model did not ignore the clip count.",
-           band_hi, final_dur / 60.0);
+           hi_s, final_dur / 60.0);
   }
 
   /* Cancelled after the clips were joined: keep the recap we already have and
@@ -8631,9 +8651,12 @@ int run_generation(void) {
   {
     double band_lo = 0.0, band_hi = 0.0;
     recap_band_minutes(&cfg, &band_lo, &band_hi);
+    char lo_s[24], hi_s[24];
+    fmt_minutes(band_lo, lo_s, sizeof(lo_s));
+    fmt_minutes(band_hi, hi_s, sizeof(hi_s));
     if (band_hi >= 1.0)
-      logi("Recap length band: %.0f-%.0f min (aiming at %.0f, never over it).",
-           band_lo, band_hi, band_hi);
+      logi("Recap length band: %s-%s min (aiming at %s, never over it).",
+           lo_s, hi_s, hi_s);
   }
 
   /* Collect the movie list first: process_movie() moves files out of movies/,

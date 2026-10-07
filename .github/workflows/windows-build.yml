@@ -850,10 +850,10 @@ jobs:
             Write-Host "::error title=plen::the over-long plan was never served - the test did not run"
             exit 1 }
           # 1b. the requested length is a band, and the run says where it landed
-          if (-not (Select-String -Path plen.log -Pattern "Recap length band: 0-1 min" -Quiet)) {
+          if (-not (Select-String -Path plen.log -Pattern "Recap length band: 0.5-1 min" -Quiet)) {
             Write-Host "::error title=plen::the recap length band was not reported"
             exit 1 }
-          if (-not (Select-String -Path plen.log -Pattern "inside the 0-1 min band" -Quiet)) {
+          if (-not (Select-String -Path plen.log -Pattern "inside the 0.5-1 min band" -Quiet)) {
             Write-Host "::error title=plen::the run never said the recap is inside the band"
             exit 1 }
           # 2. the app noticed and re-asked once with the length rule
