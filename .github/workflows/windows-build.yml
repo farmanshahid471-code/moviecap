@@ -513,6 +513,8 @@ jobs:
           }
           $tail = (Get-Content pbatch.log -Tail 12) -join " ||| "
           Write-Host "::warning title=pbatch-tail::$tail"
+          $keys = (Select-String -Path pbatch.log -Pattern "Clip plan ready|Plan speech|clip .* window|trimmed whole sentences|Crossfad|Joined with|Final duration|Recap length|correction" | ForEach-Object { $_.Line }) -join " ||| "
+          Write-Host "::warning title=pbatch-key::$keys"
           if ($rc -ne 0) { Write-Host "::error title=pbatch::cli exited $rc"; exit 1 }
 
           if (-not (Select-String -Path pbatch.log -Pattern "Batch planning is ON" -Quiet)) {

@@ -7482,6 +7482,19 @@ static void audit_plan_length_and_script(const Config *cfg, const char *movie_ti
     logi("Plan speech: about %.1f min of narration for the %.0f min target (%zu clips).",
          speech / 60.0, cfg->recap_minutes, plan->count);
 
+  if (want_length) {
+    for (size_t i = 0; i < plan->count; i++) {
+      double cs = count_speech_units(plan->items[i].narration, lang_code) /
+                  (lang_speech_units_per_sec(lang_code) > 0.0
+                       ? lang_speech_units_per_sec(lang_code) : 1.0);
+      logi("Clip %zu/%zu: window %d-%d s (%d s), narration %.1f s (%.2f of the window).",
+           i + 1, plan->count, plan->items[i].start, plan->items[i].end,
+           plan->items[i].end - plan->items[i].start, cs,
+           (plan->items[i].end - plan->items[i].start) > 0
+               ? cs / (double)(plan->items[i].end - plan->items[i].start) : 0.0);
+    }
+  }
+
   bool too_short = want_length && speech < budget_sec * 0.80;
   bool too_long  = want_length && speech > budget_sec * 1.15;
   bool english = (lang_code[0] == 'e' && lang_code[1] == 'n' && lang_code[2] == 0);
