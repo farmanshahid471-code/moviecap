@@ -399,7 +399,10 @@ jobs:
             $idx++
           }
           ($lines -join "`r`n") | Set-Content "$free\scripts\srt_files\Free Run 2026 1080p.srt"
-          & "C:\ProgramData\chocolatey\bin\ffmpeg.exe" -hide_banner -loglevel error -f lavfi `            -i testsrc=size=640x360:duration=60 -c:v libx264 "$free\movies\Free Run (2026).mp4"
+          # Deliberately an .mkv: a source movie does NOT have to be .mp4, and a
+          # scan that only accepted ".mp4" is exactly how a run once ended with
+          # "No .mp4 files found in movies/" while the movie sat right there.
+          & "C:\ProgramData\chocolatey\bin\ffmpeg.exe" -hide_banner -loglevel error -f lavfi `            -i testsrc=size=640x360:duration=60 -c:v libx264 "$free\movies\Free Run (2026).mkv"
           $env:Path = "C:\ProgramData\chocolatey\bin;C:\Windows\System32;C:\Windows"
           Push-Location $free
           .\movie_summary_cli.exe 2>&1 | Tee-Object -FilePath ..\pfree.log
@@ -414,6 +417,10 @@ jobs:
             Write-Host "::error title=pfree::the app did not auto-start the Piper server"; exit 1 }
           if (-not (Select-String -Path pfree.log -Pattern "Matched a subtitle file" -Quiet)) {
             Write-Host "::error title=pfree::fuzzy SRT matching did not find the subtitle file"; exit 1 }
+          if (-not (Select-String -Path pfree.log -Pattern "Source movie: movies/Free Run \(2026\)\.mkv" -Quiet)) {
+            Write-Host "::error title=pfree::the .mkv source movie was not picked up - the movies/ scan is mp4-only again"; exit 1 }
+          if (Select-String -Path pfree.log -Pattern "could not be read as a video" -Quiet) {
+            Write-Host "::error title=pfree::the app reported the valid .mkv as unreadable"; exit 1 }
           if (-not (Select-String -Path pfree.log -Pattern "Processed: 1" -Quiet)) {
             Write-Host "::error title=pfree::the free keyless generation did not finish"; exit 1 }
           if (-not (Select-String -Path pfree.log -Pattern "Target recap length" -Quiet)) {
@@ -1006,7 +1013,14 @@ jobs:
             $up2 = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8123/api/upload?dir=movies&name=clip.srt" `
                      -InFile smoke\clip.srt -ContentType "text/plain"
             if ($up2.dir -ne "srt") { throw "an srt uploaded to the Movies tab landed in '$($up2.dir)' instead of the subtitle folder" }
-            Write-Host "upload filing by type OK (mp4 -> movies/, srt -> srt/)"
+            # ... and every common container counts as a movie, not just .mp4
+            Set-Content -Path smoke\clip.mkv -Value "not a real movie either"
+            $up3 = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8123/api/upload?dir=srt&name=clip.mkv" `
+                     -InFile smoke\clip.mkv -ContentType "video/x-matroska"
+            if ($up3.dir -ne "movies") { throw "an mkv uploaded to the Subtitles tab landed in '$($up3.dir)' instead of movies" }
+            $mlist2 = Invoke-RestMethod "http://127.0.0.1:8123/api/list?dir=movies"
+            if (-not ($mlist2.files | Where-Object { $_.name -eq "clip.mkv" })) { throw "the mkv is not in movies/" }
+            Write-Host "upload filing by type OK (mp4/mkv -> movies/, srt -> srt/)"
 
             $logs = Invoke-RestMethod "http://127.0.0.1:8123/api/logs?since=0"
             Write-Host "web UI smoke test OK ($($logs.lines.Count) log lines buffered)"

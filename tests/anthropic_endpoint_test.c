@@ -1766,9 +1766,12 @@ static void test_stray_movie_files_are_adopted(void) {
   ensure_dir("backgroundmusic");
   ensure_dir("movies");
 
-  /* a movie in the wrong place, a subtitle that must NOT be touched, and music */
+  /* a movie in the wrong place, a subtitle that must NOT be touched, and music.
+     One of the strays is an .mkv: adopting must not be limited to .mp4 either. */
   FILE *f = plat_fopen("scripts/srt_files/Stray Movie.mp4", "wb");
   if (f) { fputs("not a real movie", f); fclose(f); }
+  f = plat_fopen("scripts/srt_files/Stray Movie Two.mkv", "wb");
+  if (f) { fputs("not a real movie either", f); fclose(f); }
   f = plat_fopen("scripts/srt_files/Stray Movie.srt", "wb");
   if (f) { fputs("1\n00:00:01,000 --> 00:00:02,000\nhi\n", f); fclose(f); }
   f = plat_fopen("backgroundmusic/piano.mp3", "wb");
@@ -1779,9 +1782,11 @@ static void test_stray_movie_files_are_adopted(void) {
   if (f) { fputs("1\n00:00:01,000 --> 00:00:02,000\nhi\n", f); fclose(f); }
 
   size_t moved = adopt_stray_movies();
-  ck(moved == 1, "the stray movie was adopted");
+  ck(moved == 2, "both stray movies were adopted");
   ck(file_exists("movies/Stray Movie.mp4"), "the movie is now in movies/");
   ck(!file_exists("scripts/srt_files/Stray Movie.mp4"), "and no longer in the subtitle folder");
+  ck(file_exists("movies/Stray Movie Two.mkv"), "the .mkv stray was adopted too");
+  ck(!file_exists("scripts/srt_files/Stray Movie Two.mkv"), "and left the subtitle folder");
   ck(file_exists("scripts/srt_files/Stray Movie.srt"), "the subtitle next to it stayed put");
   ck(file_exists("backgroundmusic/piano.mp3"), "music was not mistaken for a movie");
 
@@ -1815,6 +1820,7 @@ static void test_stray_movie_files_are_adopted(void) {
   if (!plat_chdir(cwd)) ck(false, "chdir back");
   /* tidy up the scratch tree */
   plat_unlink("testadopt/movies/Stray Movie.mp4");
+  plat_unlink("testadopt/movies/Stray Movie Two.mkv");
   plat_unlink("testadopt/movies/Movie With Srt (2026).mp4");
   plat_unlink("testadopt/movies/Other Film.srt");
   plat_unlink("testadopt/movies/Twin.mp4");
@@ -1827,6 +1833,97 @@ static void test_stray_movie_files_are_adopted(void) {
   plat_rmdir("testadopt/backgroundmusic");
   plat_rmdir("testadopt/movies");
   plat_rmdir("testadopt");
+}
+
+/* A source movie does not have to be .mp4.  The scanner used to accept nothing
+   else, so a run ended with "No .mp4 files found in movies/" while the uploaded
+   movie sat in movies/ in another container. */
+static void test_scan_accepts_every_video_type(void) {
+  const char *root = "testscan";
+  char cwd[PATH_MAX];
+  if (!plat_getcwd(cwd, sizeof(cwd))) { ck(false, "cwd"); return; }
+  ensure_dir(root);
+  if (!plat_chdir(root)) { ck(false, "chdir into the scratch tree"); return; }
+
+  ensure_dir("movies");
+  const char *videos[] = { "a.mp4", "B.MKV", "c.mov", "d.avi", "e.webm", "f.m4v",
+                           "g.mpg", "h.m2ts", "i.ogv", NULL };
+  for (int i = 0; videos[i]; i++) {
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "movies/%s", videos[i]);
+    FILE *vf = plat_fopen(p, "wb");
+    if (vf) { fputs("video", vf); fclose(vf); }
+  }
+  /* files that must NOT be taken as the source movie */
+  const char *others[] = { "notes.txt", "song.mp3", "hello.srt", "README", NULL };
+  for (int i = 0; others[i]; i++) {
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "movies/%s", others[i]);
+    FILE *vf = plat_fopen(p, "wb");
+    if (vf) { fputs("x", vf); fclose(vf); }
+  }
+
+  char **names = NULL;
+  size_t n = 0, cap = 0;
+  scan_movies_dir(&names, &n, &cap);
+  ck(n == 9, "every video container in movies/ is picked up (9 of them)");
+  ck(g_movies_skipped == 4, "the non-video files are counted as skipped");
+  int remembered = 0, seen_notes = 0, seen_srt = 0;
+  for (int i = 0; i < 3; i++) {
+    if (g_movies_skipped_names[i][0]) remembered++;
+    if (strcmp(g_movies_skipped_names[i], "notes.txt") == 0) seen_notes = 1;
+    if (strcmp(g_movies_skipped_names[i], "hello.srt") == 0) seen_srt = 1;
+  }
+  ck(remembered == 3, "three skipped names are remembered for the message");
+  ck(seen_notes && seen_srt, "and they name the files that were skipped");
+
+  bool saw_upper = false, saw_mov = false;
+  for (size_t i = 0; i < n; i++) {
+    if (strcmp(names[i], "B.MKV") == 0) saw_upper = true;   /* case is kept as-is */
+    if (strcmp(names[i], "c.mov") == 0) saw_mov = true;
+  }
+  ck(saw_upper, "an uppercase extension is accepted");
+  ck(saw_mov, "and the names arrive intact");
+
+  /* the help text is built from the same table the scanner uses */
+  const char *list = movie_extension_list();
+  ck(strstr(list, "mkv") && strstr(list, "mov") && strstr(list, "avi"),
+     "the supported-video list names the common containers");
+  ck(media_kind_for_name("Movie.vob") == MEDIA_MOVIE, ".vob counts as a movie");
+  ck(media_kind_for_name("Movie.rmvb") == MEDIA_MOVIE, ".rmvb counts as a movie");
+  ck(media_kind_for_name("notes.txt") == MEDIA_SUBTITLE, ".txt still counts as a subtitle");
+  ck(media_kind_for_name("song.mp3") == MEDIA_MUSIC, ".mp3 still counts as music");
+
+  free_str_list(names, n);
+
+  if (!plat_chdir(cwd)) ck(false, "chdir back");
+  for (int i = 0; videos[i]; i++) {
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "testscan/movies/%s", videos[i]);
+    plat_unlink(p);
+  }
+  for (int i = 0; others[i]; i++) {
+    char p[PATH_MAX];
+    snprintf(p, sizeof(p), "testscan/movies/%s", others[i]);
+    plat_unlink(p);
+  }
+  plat_rmdir("testscan/movies");
+  plat_rmdir("testscan");
+}
+
+/* Retiring a finished source movie keeps its container: an .mkv must come back
+   out of movies_retired/ as the .mkv the user put in, not as a fake .mp4. */
+static void test_retired_movie_keeps_its_container(void) {
+  char buf[PATH_MAX];
+  retired_source_path("movies/SpiderManBrandNewDay.mkv", "SpiderManBrandNewDay",
+                      buf, sizeof(buf));
+  ck_str(buf, "movies_retired/SpiderManBrandNewDay.mkv", "an .mkv is retired as .mkv");
+  retired_source_path("movies/Some Movie (2026).MP4", "Some Movie (2026)", buf, sizeof(buf));
+  ck_str(buf, "movies_retired/Some Movie (2026).MP4", "the extension case is kept");
+  retired_source_path("movies/No Extension", "No Extension", buf, sizeof(buf));
+  ck_str(buf, "movies_retired/No Extension.mp4", "a missing extension falls back to .mp4");
+  retired_source_path("movies/Weird.name.xyz", "Weird.name", buf, sizeof(buf));
+  ck_str(buf, "movies_retired/Weird.name.xyz", "only the last dot decides the extension");
 }
 
 int main(void) {
@@ -1870,6 +1967,8 @@ int main(void) {
   test_minutes_print_without_lying();
   test_upload_landing_folder_by_file_type();
   test_stray_movie_files_are_adopted();
+  test_scan_accepts_every_video_type();
+  test_retired_movie_keeps_its_container();
   test_openai_no_limit_means_no_extra_requests();
   test_batch_custom_id_shape();
   test_batch_collect_then_render();

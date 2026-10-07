@@ -6809,24 +6809,49 @@ static void cap_clip_plan_to_max(ClipPlanList *lst, int max_clips,
 /* Which of the project's folders a file belongs in, judged from its name.
    The web panel files uploads by this, so a movie chosen while the Subtitles
    tab is open cannot end up in scripts/srt_files (which is exactly how a run
-   ended with "No .mp4 files found in movies/" after two successful uploads). */
+   ended with "No .mp4 files found in movies/" after two successful uploads).
+
+   The video list also decides which files in movies/ can be used as the source
+   movie, so it is deliberately every container ffmpeg reads in practice - a
+   source movie does NOT have to be .mp4 (a second run once ended with "No .mp4
+   files found in movies/" while an .mkv sat right there). */
+static const char *const g_video_ext[] = {
+  ".mp4", ".m4v", ".mkv", ".mov", ".avi", ".webm", ".wmv", ".flv", ".mpg", ".mpeg",
+  ".m2ts", ".mts", ".m2t", ".ts", ".3gp", ".3g2", ".ogv", ".vob", ".divx", ".f4v",
+  ".m2v", ".mpv", ".rm", ".rmvb", ".asf", ".mxf", NULL };
+static const char *const g_subtitle_ext[] = {
+  ".srt", ".vtt", ".ass", ".ssa", ".sub", ".idx", ".txt", ".md", NULL };
+static const char *const g_audio_ext[] = {
+  ".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".opus", ".wma", ".aiff", NULL };
+
 MediaKind media_kind_for_name(const char *name) {
-  static const char *vid[] = { ".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".mpg",
-                               ".mpeg", ".wmv", ".flv", ".m2ts", ".mts", ".ts", ".3gp", NULL };
-  static const char *subf[] = { ".srt", ".vtt", ".ass", ".ssa", ".sub", ".idx", ".txt",
-                                ".md", NULL };
-  static const char *aud[] = { ".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".opus",
-                               ".wma", ".aiff", NULL };
   if (!name) return MEDIA_OTHER;
   const char *dot = strrchr(name, '.');
   if (!dot || dot == name) return MEDIA_OTHER;      /* no extension / dot file */
-  for (int i = 0; vid[i]; i++)
-    if (str_icmp(dot, vid[i]) == 0) return MEDIA_MOVIE;
-  for (int i = 0; subf[i]; i++)
-    if (str_icmp(dot, subf[i]) == 0) return MEDIA_SUBTITLE;
-  for (int i = 0; aud[i]; i++)
-    if (str_icmp(dot, aud[i]) == 0) return MEDIA_MUSIC;
+  for (int i = 0; g_video_ext[i]; i++)
+    if (str_icmp(dot, g_video_ext[i]) == 0) return MEDIA_MOVIE;
+  for (int i = 0; g_subtitle_ext[i]; i++)
+    if (str_icmp(dot, g_subtitle_ext[i]) == 0) return MEDIA_SUBTITLE;
+  for (int i = 0; g_audio_ext[i]; i++)
+    if (str_icmp(dot, g_audio_ext[i]) == 0) return MEDIA_MUSIC;
   return MEDIA_OTHER;
+}
+
+/* "mp4, mkv, mov, ..." for the messages, built from the same table the panel
+   and the scanner use, so the help text cannot drift away from the code. */
+static const char *movie_extension_list(void) {
+  static char buf[512];
+  if (!buf[0]) {
+    size_t o = 0;
+    for (int i = 0; g_video_ext[i] && o + 8 < sizeof(buf); i++) {
+      if (i) buf[o++] = ',';
+      if (i) buf[o++] = ' ';
+      const char *e = g_video_ext[i] + 1;            /* without the dot */
+      while (*e && o + 1 < sizeof(buf)) buf[o++] = *e++;
+    }
+    buf[o] = '\0';
+  }
+  return buf;
 }
 
 /* Move files of one kind out of `from_dir` into `to_dir`, returning how many
@@ -7938,6 +7963,18 @@ static void audit_plan_length_and_script(const Config *cfg, const char *movie_ti
   }
 }
 
+/* Where a source movie is parked once its recap is rendered.  The container is
+   kept (an .mkv stays an .mkv, rather than being renamed to .mp4 behind the
+   user's back), so the retired file is still playable from movies_retired/. */
+static void retired_source_path(const char *movie_path, const char *title,
+                                char *out, size_t outsz) {
+  const char *dot = strrchr(movie_path, '.');
+  char ext[16] = ".mp4";
+  if (dot && dot != movie_path && dot[1] && strlen(dot) < sizeof(ext))
+    snprintf(ext, sizeof(ext), "%s", dot);
+  snprintf(out, outsz, "movies_retired/%s%s", title, ext);
+}
+
 static bool process_movie(const Config *cfg, const char *movie_path, const char *movie_title,
                           int num_clips, int movie_index, int movie_total,
                           const char *out_suffix, bool retire_after) {
@@ -8625,7 +8662,7 @@ after_bgm:
     logi("More recap languages to render - leaving %s in movies/ for now.", movie_path);
   } else if (cfg->retire_movies) {
     char retired[PATH_MAX];
-    snprintf(retired, sizeof(retired), "movies_retired/%s.mp4", movie_title);
+    retired_source_path(movie_path, movie_title, retired, sizeof(retired));
     if (plat_rename(movie_path, retired) == 0) {
       logok("Retired source movie -> %s", retired);
     } else {
@@ -8661,18 +8698,29 @@ static void strip_ext(const char *filename, char *out, size_t outsz) {
 static PlatDir *g_movies_dir = NULL;
 static bool     g_curl_inited = false;
 
+/* Files in movies/ that could not be recognised as videos, remembered so the
+   "nothing to do" message can name them instead of leaving the user guessing. */
+static size_t g_movies_skipped = 0;
+static char   g_movies_skipped_names[3][256];
+
 /* Everything in movies/ that looks like a video.  Called at the start of a run
    and again when stray movie files were just adopted. */
 static void scan_movies_dir(char ***arr, size_t *out_n, size_t *cap) {
+  g_movies_skipped = 0;
+  for (int i = 0; i < 3; i++) g_movies_skipped_names[i][0] = '\0';
   g_movies_dir = plat_opendir("movies");
   if (!g_movies_dir) die("Failed to open movies/");
   const char *name;
   bool is_dir = false;
   while ((name = plat_readdir(g_movies_dir, &is_dir))) {
     if (name[0] == '.' || is_dir) continue;
-    size_t ln = strlen(name);
-    if (ln < 4) continue;
-    if (str_icmp(name + ln - 4, ".mp4") != 0) continue;
+    if (media_kind_for_name(name) != MEDIA_MOVIE) {
+      if (g_movies_skipped < 3)
+        snprintf(g_movies_skipped_names[g_movies_skipped],
+                 sizeof(g_movies_skipped_names[0]), "%s", name);
+      g_movies_skipped++;
+      continue;
+    }
     if (*out_n + 1 > *cap) {
       *cap = *cap ? *cap * 2 : 16;
       *arr = (char **)realloc(*arr, *cap * sizeof(char *));
@@ -8788,11 +8836,48 @@ int run_generation(void) {
     scan_movies_dir(&names, &n_names, &cap_names);
   }
 
+  /* One file in movies/ that is not a known video type is almost always the
+     movie itself with an unexpected extension (.mkv from a phone share, .part
+     from a download, a name the panel could not classify).  ffmpeg reads by
+     content, so ask ffprobe whether it holds video before giving up on it. */
+  if (n_names == 0 && g_movies_skipped == 1) {
+    char cand[PATH_MAX];
+    snprintf(cand, sizeof(cand), "movies/%s", g_movies_skipped_names[0]);
+    int probe_w = 0, probe_h = 0;
+    if (ffprobe_video_dimensions(cand, &probe_w, &probe_h)) {
+      logi("movies/%s is not a known video type, but it holds a %dx%d video stream - using it.",
+           g_movies_skipped_names[0], probe_w, probe_h);
+      if (n_names + 1 > cap_names) {
+        cap_names = cap_names ? cap_names * 2 : 16;
+        names = (char **)realloc(names, cap_names * sizeof(char *));
+        if (!names) die("OOM");
+      }
+      names[n_names++] = str_dup(g_movies_skipped_names[0]);
+    }
+  }
+
   if (n_names == 0) {
-    logw("No .mp4 files found in movies/. Put e.g. movies\\Citizen Kane.mp4 there and press START again.");
+    if (g_movies_skipped > 0) {
+      logw("No usable movie in movies/: %zu file%s there could not be read as a video.",
+           g_movies_skipped, g_movies_skipped == 1 ? "" : "s");
+      for (size_t si = 0; si < 3 && si < g_movies_skipped; si++)
+        logi("    movies\\%s", g_movies_skipped_names[si]);
+      if (g_movies_skipped > 3)
+        logi("    ... and %zu more file(s).", g_movies_skipped - 3);
+      logi("If one of the files above IS your movie, rename it to .mp4 (or .mkv) and "
+           "press START again.  Video types the app recognises: %s.",
+           movie_extension_list());
+    } else {
+      logw("No movie file found in movies/. Put e.g. movies\\Citizen Kane.mp4 there and "
+           "press START again.");
+      logi("Any common video file works: %s.", movie_extension_list());
+    }
     logi("In the web panel: open the Movies tab, press UPLOAD and pick the file. Uploads "
          "are filed by type (video -> movies/, subtitles -> scripts/srt_files/, music -> "
          "backgroundmusic/) whichever tab is open.");
+  } else if (g_movies_skipped > 0) {
+    logi("Ignoring %zu file(s) in movies/ that are not videos, e.g. %s.",
+         g_movies_skipped, g_movies_skipped_names[0]);
   }
 
   /* Batch mode runs the movie list twice: the first pass collects every plan
@@ -8842,6 +8927,7 @@ int run_generation(void) {
     snprintf(banner, sizeof(banner), "=== Processing: %s ===", title);
     emit_line("");
     emit_line(banner);
+    logi("Source movie: %s", path);
     if (generator_cancel_requested()) { free_str_list(names, n_names); break; }
 
     report_progress(GEN_STAGE_SETUP, (int)(i + 1), (int)n_names, 0, 0, title);

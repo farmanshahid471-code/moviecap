@@ -62,7 +62,7 @@ set the API keys, drop movies in, watch the live log and preview the result.
 (A bare `run.bat` only downloads/checks the tools, prints the confirmation and
 stops — you open the app yourself; `run.bat cli` runs headless.)
 
-Then put a movie in `movies\` (e.g. `movies\Citizen Kane.mp4`) and click **START GENERATION**.
+Then put a movie in `movies\` (e.g. `movies\Citizen Kane.mp4` or `.mkv` - any common video container) and click **START GENERATION**.
 
 > **No compiler?** Every push is built by GitHub Actions on Windows (see `.github/workflows/windows-build.yml`).
 > Download the **AI-Movie-Shorts-Windows** zip from the latest run's *Artifacts* section. It contains the
@@ -133,6 +133,13 @@ no browser extension, nothing to install. The page gives you:
   `scripts\srt_files\`, `backgroundmusic\` or the project root are moved into `movies\` (and a
   `Title.srt` left next to the movie is moved into `scripts\srt_files\`), never overwriting
   anything
+- **any video container works as the source movie** - `mp4`, `mkv`, `m4v`, `mov`, `avi`,
+  `webm`, `wmv`, `flv`, `mpg`/`mpeg`, `m2ts`/`mts`/`ts`, `3gp`, `ogv`, `vob`, `divx`, `f4v`
+  and more; ffmpeg reads by content, so an `.mkv` off a phone or a download is fine. The file
+  need not even be a recognised type: if it is the only file in `movies\`, the app asks ffprobe
+  whether it holds video and uses it when it does. If a run still finds nothing to do, the log
+  names the file(s) it could not read as video and says to rename them (`.mp4`/`.mkv`) instead
+  of a bare *"no movies found"*
 - **every setting** in `config.json` editable in the form (API keys, models, voice,
   clip count, speed cap, music/narration volume, BGM on/off, vertical render on/off,
   auto-retire on/off, API base URLs) — keys are shown masked and are never echoed back
@@ -200,7 +207,7 @@ executable and in up to 5 parent folders, then switches to it.
 
 ## Folder structure
 
-- `movies\` — input `.mp4` files (filename should be the movie title)
+- `movies\` — input movie files, any common video container (`.mp4`, `.mkv`, `.mov`, ...); the filename should be the movie title
 - `movies_retired\` — processed movies are moved here
 - `output\` — final horizontal recap videos
 - `tiktok_output\` — final vertical recap videos
