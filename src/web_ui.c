@@ -94,6 +94,17 @@ static void hook_log(const char *line) {
   /* generator.c already mirrors every line to stderr, so do not print it again */
 }
 
+/* Logger for the panel's own lines (generator.c supplies the printf-style one). */
+static void hook_log_printf(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  char line[1024];
+  vsnprintf(line, sizeof(line), fmt, ap);
+  va_end(ap);
+  hook_log(line);
+}
+
+
 static void hook_progress(const GeneratorProgress *p) {
   if (!p) return;
   app_lock();
@@ -1057,6 +1068,7 @@ static const char *PAGE_HTML[] = {
   "        <button id='btnOpen' class='btn'>OPEN IN FILE MANAGER</button>",
   "        <span id='upMsg' class='hint'></span>",
   "      </div>",
+  "      <div class='hint' style='margin:-4px 0 10px'>Files are filed by type, whichever tab is open: <b>video</b> (mp4, mkv, mov, ...) &rarr; <b>movies/</b>, <b>subtitles/scripts</b> (srt, vtt, ass, txt) &rarr; <b>scripts/srt_files/</b>, <b>music</b> (mp3, m4a, wav) &rarr; <b>backgroundmusic/</b>. The list below jumps to the folder the file landed in.</div>",
   "      <div id='files' class='files'></div>",
   "    </div>",
   "  </section>",
@@ -1257,12 +1269,24 @@ static const char *PAGE_HTML[] = {
   "  if (!files || !files.length) return;",
   "  var i = 0;",
   "  el('upMsg').textContent = 'uploading ' + files.length + ' file(s)...';",
+  "  var landed = {};",
   "  function next(){",
-  "    if (i >= files.length){ el('upMsg').textContent = 'done'; refreshFiles(); tick(); el('file').value = ''; return; }",
+  "    if (i >= files.length){",
+  "      var went = Object.keys(landed);",
+  "      el('upMsg').textContent = went.length ? ('done - saved to ' + went.join(', ')) : 'done';",
+  "      if (went.length === 1 && landed[went[0]] !== tab) setTab(landed[went[0]]);",
+  "      else refreshFiles();",
+  "      tick(); el('file').value = ''; return;",
+  "    }",
   "    var f = files[i++];",
   "    var url = '/api/upload?dir=' + encodeURIComponent(tab) + '&name=' + encodeURIComponent(f.name);",
   "    fetch(url, {method:'POST', body:f}).then(function(r){ return r.json(); }).then(function(j){",
-  "      el('upMsg').textContent = (j && j.ok) ? ('saved ' + f.name) : ('failed: ' + f.name);",
+  "      if (j && j.ok){",
+  "        el('upMsg').textContent = 'saved ' + f.name + ' to ' + (j.dirLabel || tab);",
+  "        landed[j.dir || tab] = f.name;",
+  "      } else {",
+  "        el('upMsg').textContent = 'failed: ' + f.name;",
+  "      }",
   "      next();",
   "    }).catch(function(){ el('upMsg').textContent = 'failed: ' + f.name; next(); });",
   "  }",
@@ -1507,6 +1531,20 @@ static void handle_upload(Req *r) {
     http_error(r, 400, "missing or invalid file name");
     return;
   }
+
+  /* File the upload by what it IS, not by the tab that happened to be open: a
+     movie picked while the Subtitles tab is up used to land in
+     scripts/srt_files, and the run then reported "No .mp4 files found in
+     movies/" although the upload had succeeded. */
+  const DirEntry *by_kind = NULL;
+  switch (media_kind_for_name(name)) {
+    case MEDIA_MOVIE:    by_kind = dir_find("movies"); break;
+    case MEDIA_SUBTITLE: by_kind = dir_find("srt");    break;
+    case MEDIA_MUSIC:    by_kind = dir_find("bgm");    break;
+    default: break;
+  }
+  bool refiled = (by_kind && by_kind != de);
+  if (refiled) de = by_kind;
   if (!r->have_content_length || r->content_length <= 0) {
     http_error(r, 413, "upload needs a Content-Length (no chunked uploads)");
     return;
@@ -1556,10 +1594,17 @@ static void handle_upload(Req *r) {
     return;
   }
 
-  hook_log("[INFO] Uploaded file saved.");
+  if (refiled)
+    hook_log_printf("[INFO] Uploaded file saved to %s (%s) - files are filed by type.",
+                    de->path, de->label);
+  else
+    hook_log("[INFO] Uploaded file saved.");
   cJSON *o = cJSON_CreateObject();
   cJSON_AddBoolToObject(o, "ok", true);
   json_str(o, "path", dest);
+  json_str(o, "dir", de->key);
+  json_str(o, "dirLabel", de->label);
+  cJSON_AddBoolToObject(o, "refiled", refiled);
   cJSON_AddNumberToObject(o, "size", (double)done);
   http_json(r, 200, o);
 }

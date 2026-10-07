@@ -41,6 +41,9 @@ void        plat_closedir(PlatDir *d);
 /* Absolute path of the current working directory (UTF-8). */
 bool plat_getcwd(char *out, size_t outsz);
 
+/* Change the working directory (UTF-8); returns true on success. */
+bool plat_chdir(const char *path);
+
 /*
  * If the working directory does not look like the project root
  * (contains resources/Inter-Regular.ttf or config.json), look next to the

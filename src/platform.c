@@ -204,6 +204,15 @@ bool plat_getcwd(char *out, size_t outsz) {
   return true;
 }
 
+bool plat_chdir(const char *path) {
+  if (!path) return false;
+  wchar_t *w = utf8_to_wide(path);
+  if (!w) return false;
+  bool ok = (_wchdir(w) == 0);
+  free(w);
+  return ok;
+}
+
 static bool looks_like_project_root_w(const wchar_t *dir) {
   static const wchar_t *markers[] = { L"resources\\Inter-Regular.ttf", L"config.json", NULL };
   for (int i = 0; markers[i]; i++) {
@@ -581,6 +590,10 @@ bool plat_getcwd(char *out, size_t outsz) {
   if (!out || outsz == 0) return false;
   if (!getcwd(out, outsz)) { snprintf(out, outsz, "."); return false; }
   return true;
+}
+
+bool plat_chdir(const char *path) {
+  return path && chdir(path) == 0;
 }
 
 /* Same idea as the Windows version: prefer a bundled/portable FFmpeg that was

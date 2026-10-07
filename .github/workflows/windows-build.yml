@@ -989,6 +989,25 @@ jobs:
             $list = Invoke-RestMethod "http://127.0.0.1:8123/api/list?dir=srt"
             if (-not ($list.files | Where-Object { $_.name -eq "hello.srt" })) { throw "upload failed" }
 
+            # Uploads are filed by TYPE, not by the open tab: a movie picked while
+            # the Subtitles tab is up used to land in scripts/srt_files and the run
+            # then reported "No .mp4 files found in movies/" after a successful
+            # upload.  The response says where the file went, and it must be movies.
+            Set-Content -Path smoke\clip.mp4 -Value "not a real movie"
+            $up = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8123/api/upload?dir=srt&name=clip.mp4" `
+                    -InFile smoke\clip.mp4 -ContentType "video/mp4"
+            if ($up.dir -ne "movies") { throw "an mp4 uploaded to the Subtitles tab landed in '$($up.dir)' instead of movies" }
+            $mlist = Invoke-RestMethod "http://127.0.0.1:8123/api/list?dir=movies"
+            if (-not ($mlist.files | Where-Object { $_.name -eq "clip.mp4" })) { throw "the mp4 is not in movies/" }
+            $slist = Invoke-RestMethod "http://127.0.0.1:8123/api/list?dir=srt"
+            if ($slist.files | Where-Object { $_.name -eq "clip.mp4" }) { throw "the mp4 was left in the subtitle folder" }
+            # ... and a subtitle uploaded to the Movies tab goes the other way
+            Set-Content -Path smoke\clip.srt -Value "1`n00:00:01,000 --> 00:00:02,000`nhi"
+            $up2 = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8123/api/upload?dir=movies&name=clip.srt" `
+                     -InFile smoke\clip.srt -ContentType "text/plain"
+            if ($up2.dir -ne "srt") { throw "an srt uploaded to the Movies tab landed in '$($up2.dir)' instead of the subtitle folder" }
+            Write-Host "upload filing by type OK (mp4 -> movies/, srt -> srt/)"
+
             $logs = Invoke-RestMethod "http://127.0.0.1:8123/api/logs?since=0"
             Write-Host "web UI smoke test OK ($($logs.lines.Count) log lines buffered)"
           } finally {

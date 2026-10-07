@@ -1731,6 +1731,104 @@ static void test_minutes_print_without_lying(void) {
   fmt_minutes(7.6, b, sizeof(b));   ck_str(b, "7.6", "a real fraction is shown");
 }
 
+static void test_upload_landing_folder_by_file_type(void) {
+  /* The panel files every upload by what the file IS: a movie picked while the
+     Subtitles tab is open must still land in movies/ (a real run reported "No
+     .mp4 files found in movies/" after the movie went to scripts/srt_files). */
+  ck(media_kind_for_name("Citizen Kane.mp4") == MEDIA_MOVIE, "mp4 is a movie");
+  ck(media_kind_for_name("Dune.Part.Two.MKV") == MEDIA_MOVIE, "extensions ignore case");
+  ck(media_kind_for_name("movie.mov") == MEDIA_MOVIE, "mov is a movie");
+  ck(media_kind_for_name("a.webm") == MEDIA_MOVIE, "webm is a movie");
+  ck(media_kind_for_name("Citizen Kane.srt") == MEDIA_SUBTITLE, "srt is a subtitle file");
+  ck(media_kind_for_name("subs.vtt") == MEDIA_SUBTITLE, "vtt is a subtitle file");
+  ck(media_kind_for_name("notes.txt") == MEDIA_SUBTITLE, "txt goes with the scripts");
+  ck(media_kind_for_name("theme.mp3") == MEDIA_MUSIC, "mp3 is music");
+  ck(media_kind_for_name("theme.m4a") == MEDIA_MUSIC, "m4a is music");
+  ck(media_kind_for_name("config.json") == MEDIA_OTHER, "unknown types stay in the tab");
+  ck(media_kind_for_name("noextension") == MEDIA_OTHER, "a bare name stays in the tab");
+  ck(media_kind_for_name(".mp4") == MEDIA_OTHER, "a dot file is not a movie");
+  ck(media_kind_for_name(NULL) == MEDIA_OTHER, "no name is not a movie");
+  ck(media_kind_for_name("archive.mp4.zip") == MEDIA_OTHER, "the LAST extension wins");
+}
+
+static void test_stray_movie_files_are_adopted(void) {
+  /* A video that sits in the subtitle folder (an older upload, or a drag and
+     drop) must not end the run with "no movies found": it is moved into
+     movies/ and the run continues with it.  Runs on a scratch tree. */
+  const char *root = "testadopt";
+  char cwd[PATH_MAX];
+  if (!plat_getcwd(cwd, sizeof(cwd))) { ck(false, "cwd"); return; }
+  ensure_dir(root);
+  if (!plat_chdir(root)) { ck(false, "chdir into the scratch tree"); return; }
+
+  ensure_dir("scripts");              /* ensure_dir makes one level at a time */
+  ensure_dir("scripts/srt_files");
+  ensure_dir("backgroundmusic");
+  ensure_dir("movies");
+
+  /* a movie in the wrong place, a subtitle that must NOT be touched, and music */
+  FILE *f = plat_fopen("scripts/srt_files/Stray Movie.mp4", "wb");
+  if (f) { fputs("not a real movie", f); fclose(f); }
+  f = plat_fopen("scripts/srt_files/Stray Movie.srt", "wb");
+  if (f) { fputs("1\n00:00:01,000 --> 00:00:02,000\nhi\n", f); fclose(f); }
+  f = plat_fopen("backgroundmusic/piano.mp3", "wb");
+  if (f) { fputs("tune", f); fclose(f); }
+  f = plat_fopen("movies/Movie With Srt (2026).mp4", "wb");
+  if (f) { fputs("movie", f); fclose(f); }
+  f = plat_fopen("movies/Movie With Srt (2026).srt", "wb");
+  if (f) { fputs("1\n00:00:01,000 --> 00:00:02,000\nhi\n", f); fclose(f); }
+
+  size_t moved = adopt_stray_movies();
+  ck(moved == 1, "the stray movie was adopted");
+  ck(file_exists("movies/Stray Movie.mp4"), "the movie is now in movies/");
+  ck(!file_exists("scripts/srt_files/Stray Movie.mp4"), "and no longer in the subtitle folder");
+  ck(file_exists("scripts/srt_files/Stray Movie.srt"), "the subtitle next to it stayed put");
+  ck(file_exists("backgroundmusic/piano.mp3"), "music was not mistaken for a movie");
+
+  /* the other direction: a subtitle dropped next to the movie */
+  size_t subs = adopt_stray_subtitle("Movie With Srt (2026)");
+  ck(subs == 1, "the subtitle dropped next to the movie was adopted");
+  ck(file_exists("scripts/srt_files/Movie With Srt (2026).srt"),
+     "the subtitle is now where the app looks for it");
+  ck(!file_exists("movies/Movie With Srt (2026).srt"), "and gone from movies/");
+  size_t again = adopt_stray_subtitle("Movie With Srt (2026)");
+  ck(again == 0, "adopting twice does nothing the second time");
+
+  /* an unrelated subtitle in movies/ is left alone - only the title match counts */
+  f = plat_fopen("movies/Other Film.srt", "wb");
+  if (f) { fputs("1\n00:00:01,000 --> 00:00:02,000\nhi\n", f); fclose(f); }
+  size_t other = adopt_stray_subtitle("Movie With Srt (2026)");
+  ck(other == 0, "an unrelated subtitle is not taken");
+  ck(file_exists("movies/Other Film.srt"), "and is still where the user put it");
+
+  /* never overwrite: a stray with the same name as an existing movie is left */
+  f = plat_fopen("scripts/srt_files/Twin.mp4", "wb");
+  if (f) { fputs("stray", f); fclose(f); }
+  f = plat_fopen("movies/Twin.mp4", "wb");
+  if (f) { fputs("the real one", f); fclose(f); }
+  adopt_stray_movies();
+  char keep[64] = "";
+  f = plat_fopen("movies/Twin.mp4", "rb");
+  if (f) { size_t n = fread(keep, 1, sizeof(keep) - 1, f); keep[n] = 0; fclose(f); }
+  ck_str(keep, "the real one", "an existing movie of the same name is never overwritten");
+
+  if (!plat_chdir(cwd)) ck(false, "chdir back");
+  /* tidy up the scratch tree */
+  plat_unlink("testadopt/movies/Stray Movie.mp4");
+  plat_unlink("testadopt/movies/Movie With Srt (2026).mp4");
+  plat_unlink("testadopt/movies/Other Film.srt");
+  plat_unlink("testadopt/movies/Twin.mp4");
+  plat_unlink("testadopt/scripts/srt_files/Stray Movie.srt");
+  plat_unlink("testadopt/scripts/srt_files/Movie With Srt (2026).srt");
+  plat_unlink("testadopt/scripts/srt_files/Twin.mp4");
+  plat_unlink("testadopt/backgroundmusic/piano.mp3");
+  plat_rmdir("testadopt/scripts/srt_files");
+  plat_rmdir("testadopt/scripts");
+  plat_rmdir("testadopt/backgroundmusic");
+  plat_rmdir("testadopt/movies");
+  plat_rmdir("testadopt");
+}
+
 int main(void) {
   test_endpoint_shapes();
   test_native_claude_request();
@@ -1770,6 +1868,8 @@ int main(void) {
   test_transition_styles_and_join_length();
   test_plan_request_asks_for_the_band_and_audits_it();
   test_minutes_print_without_lying();
+  test_upload_landing_folder_by_file_type();
+  test_stray_movie_files_are_adopted();
   test_openai_no_limit_means_no_extra_requests();
   test_batch_custom_id_shape();
   test_batch_collect_then_render();

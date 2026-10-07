@@ -6806,6 +6806,96 @@ static void cap_clip_plan_to_max(ClipPlanList *lst, int max_clips,
  * Names are normalized to lowercase alphanumerics, so "Toy Story 5 (2026)
  * [1080p].mp4" matches "Toy Story 5.srt". Files ending in _modified.srt or
  * _placeholder.srt are ignored. Returns false when nothing plausible exists. */
+/* Which of the project's folders a file belongs in, judged from its name.
+   The web panel files uploads by this, so a movie chosen while the Subtitles
+   tab is open cannot end up in scripts/srt_files (which is exactly how a run
+   ended with "No .mp4 files found in movies/" after two successful uploads). */
+MediaKind media_kind_for_name(const char *name) {
+  static const char *vid[] = { ".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".mpg",
+                               ".mpeg", ".wmv", ".flv", ".m2ts", ".mts", ".ts", ".3gp", NULL };
+  static const char *subf[] = { ".srt", ".vtt", ".ass", ".ssa", ".sub", ".idx", ".txt",
+                                ".md", NULL };
+  static const char *aud[] = { ".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".opus",
+                               ".wma", ".aiff", NULL };
+  if (!name) return MEDIA_OTHER;
+  const char *dot = strrchr(name, '.');
+  if (!dot || dot == name) return MEDIA_OTHER;      /* no extension / dot file */
+  for (int i = 0; vid[i]; i++)
+    if (str_icmp(dot, vid[i]) == 0) return MEDIA_MOVIE;
+  for (int i = 0; subf[i]; i++)
+    if (str_icmp(dot, subf[i]) == 0) return MEDIA_SUBTITLE;
+  for (int i = 0; aud[i]; i++)
+    if (str_icmp(dot, aud[i]) == 0) return MEDIA_MUSIC;
+  return MEDIA_OTHER;
+}
+
+/* Move files of one kind out of `from_dir` into `to_dir`, returning how many
+   moved.  With a `title`, only names that look like that movie are taken (the
+   same punctuation-free comparison find_subtitle_srt uses). */
+static size_t adopt_files_from(const char *from_dir, const char *to_dir, MediaKind want,
+                               const char *title) {
+  PlatDir *d = plat_opendir(from_dir);
+  if (!d) return 0;
+  size_t moved = 0;
+  const char *name;
+  bool is_dir = false;
+  while ((name = plat_readdir(d, &is_dir))) {
+    if (name[0] == '.' || is_dir) continue;
+    if (media_kind_for_name(name) != want) continue;
+    if (title && title[0]) {
+      /* only names that carry the movie title, so an unrelated subtitle stays put */
+      char want_norm[256], cand[256];
+      size_t wo = 0, co = 0;
+      for (const char *q = title; *q && wo + 1 < sizeof(want_norm); q++) {
+        char c = *q;
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) want_norm[wo++] = c;
+      }
+      want_norm[wo] = '\0';
+      for (const char *q = name; *q && co + 1 < sizeof(cand); q++) {
+        char c = *q;
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) cand[co++] = c;
+      }
+      cand[co] = '\0';
+      if (wo < 3 || co < 3) continue;
+      if (!strstr(cand, want_norm) && !strstr(want_norm, cand)) continue;
+    }
+    char src[PATH_MAX], dest[PATH_MAX];
+    snprintf(src, sizeof(src), "%s/%s", from_dir, name);
+    snprintf(dest, sizeof(dest), "%s/%s", to_dir, name);
+    if (file_exists(dest)) continue;               /* never overwrite anything */
+    ensure_dir(to_dir);
+    if (plat_rename(src, dest))
+      logw("Moved %s into %s/ - it was sitting in %s/, which is not where the app "
+           "looks for it (the panel now files uploads by file type).",
+           name, to_dir, from_dir);
+    else
+      logw("Found %s in %s/ but could not move it into %s/ - please move it there.",
+           name, from_dir, to_dir);
+    moved++;
+  }
+  plat_closedir(d);
+  return moved;
+}
+
+/* Before telling the user there is no movie: a video file in the subtitle or
+   music folder is an upload that landed in the wrong place (or a manual copy),
+   and it is the movie they meant to run. */
+static size_t adopt_stray_movies(void) {
+  size_t moved = 0;
+  moved += adopt_files_from("scripts/srt_files", "movies", MEDIA_MOVIE, NULL);
+  moved += adopt_files_from("backgroundmusic", "movies", MEDIA_MOVIE, NULL);
+  moved += adopt_files_from(".", "movies", MEDIA_MOVIE, NULL);
+  return moved;
+}
+
+/* The same trap on the subtitle side: a .srt uploaded to another tab - or
+   dropped next to the movie out of habit - is that movie's subtitle file. */
+static size_t adopt_stray_subtitle(const char *movie_title) {
+  return adopt_files_from("movies", "scripts/srt_files", MEDIA_SUBTITLE, movie_title);
+}
+
 static bool find_subtitle_srt(const char *movie_title, char *out, size_t outsz, const char *code) {
   size_t n = 0;
   char **files = list_files_with_ext("scripts/srt_files", ".srt", NULL, &n);
@@ -7900,6 +7990,10 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     }
   }
 
+  if (!file_exists(srt_in) && adopt_stray_subtitle(movie_title) > 0 &&
+      find_subtitle_srt(movie_title, srt_in, sizeof(srt_in), lang_code))
+    logok("Using the subtitle file that was found for %s: %s", movie_title, srt_in);
+
   if (!file_exists(srt_in)) {
     logi("No exact SRT found for %s; attempting download...", movie_title);
     if (!download_subtitle_srt(movie_title, srt_in)) {
@@ -8567,6 +8661,30 @@ static void strip_ext(const char *filename, char *out, size_t outsz) {
 static PlatDir *g_movies_dir = NULL;
 static bool     g_curl_inited = false;
 
+/* Everything in movies/ that looks like a video.  Called at the start of a run
+   and again when stray movie files were just adopted. */
+static void scan_movies_dir(char ***arr, size_t *out_n, size_t *cap) {
+  g_movies_dir = plat_opendir("movies");
+  if (!g_movies_dir) die("Failed to open movies/");
+  const char *name;
+  bool is_dir = false;
+  while ((name = plat_readdir(g_movies_dir, &is_dir))) {
+    if (name[0] == '.' || is_dir) continue;
+    size_t ln = strlen(name);
+    if (ln < 4) continue;
+    if (str_icmp(name + ln - 4, ".mp4") != 0) continue;
+    if (*out_n + 1 > *cap) {
+      *cap = *cap ? *cap * 2 : 16;
+      *arr = (char **)realloc(*arr, *cap * sizeof(char *));
+      if (!*arr) die("OOM");
+    }
+    (*arr)[(*out_n)++] = str_dup(name);
+  }
+  plat_closedir(g_movies_dir);
+  g_movies_dir = NULL;
+}
+
+
 int run_generation(void) {
   g_movies_dir = NULL;
   g_curl_inited = false;
@@ -8661,30 +8779,20 @@ int run_generation(void) {
 
   /* Collect the movie list first: process_movie() moves files out of movies/,
      and modifying a directory while enumerating it is unreliable on Windows. */
-  g_movies_dir = plat_opendir("movies");
-  if (!g_movies_dir) die("Failed to open movies/");
-
   char **names = NULL;
   size_t n_names = 0, cap_names = 0;
-  const char *name;
-  bool is_dir = false;
-  while ((name = plat_readdir(g_movies_dir, &is_dir))) {
-    if (name[0] == '.' || is_dir) continue;
-    size_t ln = strlen(name);
-    if (ln < 4) continue;
-    if (str_icmp(name + ln - 4, ".mp4") != 0) continue;
-    if (n_names + 1 > cap_names) {
-      cap_names = cap_names ? cap_names * 2 : 16;
-      names = (char **)realloc(names, cap_names * sizeof(char *));
-      if (!names) die("OOM");
-    }
-    names[n_names++] = str_dup(name);
+  scan_movies_dir(&names, &n_names, &cap_names);
+
+  if (n_names == 0 && adopt_stray_movies() > 0) {
+    logok("Adopted the movie file(s) above - movies/ is where the app reads from.");
+    scan_movies_dir(&names, &n_names, &cap_names);
   }
-  plat_closedir(g_movies_dir);
-  g_movies_dir = NULL;
 
   if (n_names == 0) {
     logw("No .mp4 files found in movies/. Put e.g. movies\\Citizen Kane.mp4 there and press START again.");
+    logi("In the web panel: open the Movies tab, press UPLOAD and pick the file. Uploads "
+         "are filed by type (video -> movies/, subtitles -> scripts/srt_files/, music -> "
+         "backgroundmusic/) whichever tab is open.");
   }
 
   /* Batch mode runs the movie list twice: the first pass collects every plan

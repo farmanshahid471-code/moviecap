@@ -6,6 +6,19 @@
 extern "C" {
 #endif
 
+/* Which project folder a file belongs in, judged from its name: the web panel
+   files uploads by this, so a movie picked while another tab is open still
+   lands in movies/ (and subtitles in scripts/srt_files, music in
+   backgroundmusic).  MEDIA_OTHER means "leave it in the tab the user chose". */
+typedef enum {
+  MEDIA_MOVIE = 0,
+  MEDIA_SUBTITLE,
+  MEDIA_MUSIC,
+  MEDIA_OTHER
+} MediaKind;
+
+MediaKind media_kind_for_name(const char *name);
+
 // Log hook type (generator.c currently expects this name)
 typedef void (*GeneratorLogHook)(const char *line);
 
