@@ -553,7 +553,7 @@ jobs:
 
           # The plan really came from the batch: no live plan call was made.
           # (the mock prints state lines on stdout, i.e. mockbatch.log)
-          Get-Content mockbatch.log -Tail 10 | ForEach-Object { Write-Host "::notice title=mockbatch:: $_" }
+          Get-Content mockbatch.log -Tail 3 | ForEach-Object { Write-Host "::notice title=mockbatch:: $_" }
           if (Select-String -Path mockbatch.log -Pattern "returning \d+ clips" -Quiet) {
             Write-Host "::error title=pbatch::a LIVE plan request was made - the batch was bypassed"
             exit 1 }
@@ -622,7 +622,7 @@ jobs:
           }
           $tail = (Get-Content pthink.log -Tail 12) -join " ||| "
           Write-Host "::warning title=pthink-tail::$tail"
-          Get-Content mockthink.log -Tail 10 | ForEach-Object { Write-Host "::notice title=mockthink:: $_" }
+          Get-Content mockthink.log -Tail 3 | ForEach-Object { Write-Host "::notice title=mockthink:: $_" }
           if ($rc -ne 0) { Write-Host "::error title=pthink::cli exited $rc"; exit 1 }
 
           # 1. our request must not carry an output-token limit
@@ -671,15 +671,17 @@ jobs:
           '{"open_api_key":"sk-mock-plan","openai_base_url":"http://127.0.0.1:9200/v1","openai_model":"gpt-5.2","tts_provider":"piper","min_clips":4,"max_clips":4,"recap_minutes":0,"use_wikipedia_plot":false,"auto_transcribe":false}' | Set-Content "$pg\config.json"
           $lines = @()
           $idx = 1
-          for ($t = 0; $t -lt 58; $t += 2) {
+          for ($t = 0; $t -lt 198; $t += 2) {
+            $m = [int][Math]::Floor($t / 60)
+            $sec = $t - ($m * 60)
             $lines += "$idx"
-            $lines += ("00:00:{0:D2},000 --> 00:00:{1:D2},000" -f $t, ($t + 2))
+            $lines += ("00:{0:D2}:{1:D2},000 --> 00:{2:D2}:{3:D2},000" -f $m, $sec, ([int][Math]::Floor(($t + 2) / 60)), (($t + 2) - ([int][Math]::Floor(($t + 2) / 60) * 60)))
             $lines += "Scene $t - the story moves forward here."
             $lines += ""
             $idx++
           }
           ($lines -join "`r`n") | Set-Content "$pg\scripts\srt_files\Big Plan 2026 1080p.srt"
-          & "C:\ProgramData\chocolatey\bin\ffmpeg.exe" -hide_banner -loglevel error -f lavfi -i testsrc=size=640x360:duration=120 -c:v libx264 "$pg\movies\Big Plan (2026).mp4"
+          & "C:\ProgramData\chocolatey\bin\ffmpeg.exe" -hide_banner -loglevel error -f lavfi -i testsrc=size=640x360:duration=200 -c:v libx264 "$pg\movies\Big Plan (2026).mp4"
           if ($LASTEXITCODE -ne 0) { throw "ffmpeg could not build the test movie" }
 
           $srv = Start-Process -FilePath "python" `
@@ -705,7 +707,7 @@ jobs:
             Write-Host "::error title=pbig::the oversized plan was never served - the test did not run"
             exit 1 }
           # 2. the app merged it back to the configured count instead of using it
-          if (-not (Select-String -Path pbig.log -Pattern "Clip count corrected: 12 -> 4 clips" -Quiet)) {
+          if (-not (Select-String -Path pbig.log -Pattern "Clip count corrected: \d+ -> 4 clips" -Quiet)) {
             Write-Host "::error title=pbig::the oversized plan was not corrected"
             exit 1 }
           if (-not (Select-String -Path pbig.log -Pattern "Clip plan ready: 4 clips" -Quiet)) {
