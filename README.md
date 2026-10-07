@@ -278,6 +278,8 @@ Edit `config.json` in the project root (or use the **Settings** card in the web 
   "min_clips": 20,
   "max_clips": 30,
   "max_video_speedup": 1.75,
+  "transitions": true,
+  "transition_seconds": 0.35,
   "narration_volume": 2.5,
   "bgm_volume": 0.1,
   "bgm_enabled": true,
@@ -303,6 +305,8 @@ Edit `config.json` in the project root (or use the **Settings** card in the web 
 | `tts_api_key` | empty | optional bearer token for `openai_tts`; falls back to `open_api_key` |
 | `min_clips` / `max_clips` | `20` / `30` | a random clip count in this range is requested per run (1-200) |
 | `max_video_speedup` | `1.75` | cap for the video speed-up when the narration is short |
+| `transitions` | `true` | crossfade between clips instead of a hard cut: a short blend hides the rough scene-to-scene jump. `false` = hard cuts |
+| `transition_seconds` | `0.35` | length of that crossfade, 0.10-1.50 s. The fade eats this much of the video per joint, so the narration length is allowed for it |
 | `narration_volume` | `2.5` | narration gain when mixing |
 | `bgm_volume` | `0.1` | background-music gain when mixing |
 | `bgm_enabled` | `true` | set `false` for narration-only output |
@@ -709,6 +713,30 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
   the recap, and it obeys any ceiling the provider names (e.g. "maximum 8192"). The model's own
   output limit is the only limit in play — raise it in your provider's dashboard if a very long recap
   still cannot be written in one reply.
+- **Smooth scene changes (crossfade)** — clips are joined with a short crossfade instead of a hard
+  cut (`"transitions": true`, `"transition_seconds": 0.35`; both in the panel). The clips are
+  normalised first (same size, same frame rate, yuv420p, 48 kHz stereo) because the ffmpeg fade
+  filters refuse mismatched inputs; the join happens in chunks of 8 and the chunks are joined again,
+  so a 100-clip recap still fits in one command line. If a clip is too short for the fade or ffmpeg
+  rejects the graph, the run logs it and falls back to the plain concat (hard cuts) instead of
+  failing. Set `"transitions": false` for the old behaviour.
+- **The recap length is held, not hoped for** — a model that writes more narration than the time
+  budget allows (the reported "asked for 20 minutes, got 20+") is told once, in one combined note,
+  exactly what is wrong: the words it may use per clip, the names it invented, any subtitle line it
+  copied word for word, a missing closing line. Its corrected plan replaces the first only if it
+  really is closer to the rules; then, whatever the model did, the narrations are **trimmed whole
+  sentence by sentence** until the speech fits the requested minutes (+ the crossfade overlap the
+  render will eat). The last clip always keeps the exact closing line, and the log prints what
+  happened (`trimmed whole sentences from N of M clips to hold the target`). The prompt also now
+  states the words per clip as a hard maximum on top of the minimum.
+- **The script rules as a standalone spec** — `docs/RECAP_SCRIPT_INSTRUCTIONS.md` is the
+  complete instruction set (character naming, retelling, continuity, word budget, opening and
+  exact closing line, JSON contract, DeepSeek v4 Pro settings). Hand it to your own AI, or read
+  it to see exactly what the app asks the model for.
+- **Script-quality audit on every plan** — the accepted plan is checked against the Wikipedia plot
+  summary and the subtitles the model was given: character names that appear nowhere in the summary
+  are reported by name, and narrations that repeat a whole subtitle line word for word are counted.
+  Both feed the same correction request, so a bad plan is fixed once instead of rendered.
 - **The clip plan is held to the configured clip count** — a model that overshoots (a user run
   asked for 111 clips, a 20-minute recap, and the reply held 249 clips, i.e. 45.9 minutes of
   narration) no longer gets its plan rendered as-is. The count is a hard limit in the prompt, and

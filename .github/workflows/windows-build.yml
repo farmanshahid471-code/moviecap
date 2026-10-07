@@ -728,6 +728,75 @@ jobs:
           Write-Host "pbig video: $($vid.Length) bytes, $dur s"
           Write-Host "oversized plan OK: 12 clips merged down to 4, only 4 clips rendered, video written"
 
+      - name: "Test a too-long AI plan is trimmed to the requested recap length"
+        shell: pwsh
+        run: |
+          # The reported failure: a "20 minute" recap came out longer than 20
+          # minutes because the model wrote more narration than the time budget.
+          # The pipeline must hold the requested length: one replay of the plan
+          # with the length rule called out, then a deterministic trim of the
+          # narrations to the requested speaking time.
+          $ErrorActionPreference = 'Continue'
+          $pl = Join-Path (Get-Location) "plen"
+          New-Item -ItemType Directory -Force "$pl\movies" | Out-Null
+          New-Item -ItemType Directory -Force "$pl\scripts\srt_files" | Out-Null
+          Copy-Item build\Release\movie_summary_cli.exe $pl\
+          Copy-Item -Recurse resources $pl\resources
+          '{"open_api_key":"sk-mock-len","openai_base_url":"http://127.0.0.1:9300/v1","openai_model":"gpt-5.2","tts_provider":"piper","min_clips":3,"max_clips":3,"recap_minutes":1,"use_wikipedia_plot":false,"auto_transcribe":false,"transitions":false}' | Set-Content "$pl\config.json"
+          $lines = @()
+          $idx = 1
+          for ($t = 0; $t -lt 118; $t += 2) {
+            $lines += "$idx"
+            $lines += ("00:00:{0:D2},000 --> 00:00:{1:D2},000" -f $t, ($t + 2))
+            $lines += "Scene $t - the story moves forward here."
+            $lines += ""
+            $idx++
+          }
+          ($lines -join "`r`n") | Set-Content "$pl\scripts\srt_files\Long Plan 2026 1080p.srt"
+          & "C:\ProgramData\chocolatey\bin\ffmpeg.exe" -hide_banner -loglevel error -f lavfi -i testsrc=size=640x360:duration=120 -c:v libx264 "$pl\movies\Long Plan (2026).mp4"
+          if ($LASTEXITCODE -ne 0) { throw "ffmpeg could not build the test movie" }
+
+          $srv = Start-Process -FilePath "python" `
+            -ArgumentList "tools/mock_api_server.py","--openai-port","9300","--eleven-port","9301","--tts-port","8022","--wiki-port","9302","--overlong-plans" `
+            -PassThru -RedirectStandardOutput "mocklen.log" -RedirectStandardError "mocklen.err"
+          Start-Sleep -Seconds 4
+          try {
+            $env:Path = "C:\ProgramData\chocolatey\bin;C:\Windows\System32;C:\Windows"
+            Push-Location $pl
+            .\movie_summary_cli.exe 2>&1 | Tee-Object -FilePath ..\plen.log
+            $rc = $LASTEXITCODE
+            Pop-Location
+          } finally {
+            Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+          }
+          $tail = (Get-Content plen.log -Tail 12) -join " ||| "
+          Write-Host "::warning title=plen-tail::$tail"
+          Get-Content mocklen.log -Tail 4 | ForEach-Object { Write-Host "::notice title=mocklen:: $_" }
+          if ($rc -ne 0) { Write-Host "::error title=plen::cli exited $rc"; exit 1 }
+
+          # 1. the mock really did write far more narration than the target
+          if (-not (Select-String -Path mocklen.log -Pattern "writing an over-long plan" -Quiet)) {
+            Write-Host "::error title=plen::the over-long plan was never served - the test did not run"
+            exit 1 }
+          # 2. the app noticed and re-asked once with the length rule
+          if (-not (Select-String -Path plen.log -Pattern "Asking the model once more for a corrected plan" -Quiet)) {
+            Write-Host "::error title=plen::the over-long plan was not sent back to the model"
+            exit 1 }
+          # 3. and then held the length deterministically, whatever the model did
+          if (-not (Select-String -Path plen.log -Pattern "trimmed whole sentences" -Quiet)) {
+            Write-Host "::error title=plen::the narrations were not trimmed to the target"
+            exit 1 }
+          if (-not (Select-String -Path plen.log -Pattern "All done. Processed: 1" -Quiet)) {
+            Write-Host "::error title=plen::the run did not finish the movie"; exit 1 }
+          $vid = Get-Item "$pl\output\Long Plan (2026).mp4" -ErrorAction SilentlyContinue
+          if (-not $vid) { Write-Host "::error title=plen::no video was rendered"; exit 1 }
+          $dur = [double](& "C:\ProgramData\chocolatey\bin\ffprobe.exe" -v error -show_entries format=duration -of csv=p=0 "$pl\output\Long Plan (2026).mp4")
+          Write-Host "plen video: $($vid.Length) bytes, $dur s"
+          if ($dur -gt 80) {
+            Write-Host "::error title=plen::the 1 minute recap came out at $dur s - the length was not held"
+            exit 1 }
+          Write-Host "recap length OK: over-long narrations trimmed, 1 minute target held ($dur s)"
+
       - name: "Test run.bat web brings the control panel up"
         shell: pwsh
         run: |

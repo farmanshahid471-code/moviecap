@@ -1283,6 +1283,234 @@ static void test_openai_plan_249_clips_for_111_target(void) {
   free_clip_plan_list(&plan);
 }
 
+
+/* ------------------------------ recap length guarantee and script quality */
+
+static void test_over_long_narration_is_trimmed_to_the_target(void) {
+  /* 4 clips, 15 seconds of speech each (60 s) for a 30 s target: the trim must
+     cut whole sentences until the speech fits, keeping every clip usable. */
+  ClipPlanList lst;
+  lst.count = 4;
+  lst.items = (ClipPlan *)calloc(4, sizeof(ClipPlan));
+  const char *sent = "He opens the door and steps inside the dark room. "
+                     "Then he hears a noise behind him and turns around.";
+  for (int i = 0; i < 4; i++) {
+    lst.items[i].start = 100 + i * 40;
+    lst.items[i].end   = 100 + i * 40 + 30;
+    char buf[512];
+    int at = 0;
+    for (int k = 0; k < 6; k++) at += snprintf(buf + at, sizeof(buf) - at, "%s", sent);
+    lst.items[i].narration = str_dup(buf);
+  }
+  cap_plan_narration_length(&lst, 60.0, 0.0, "en", "English");
+  double speech = plan_speech_seconds(lst.items, lst.count, "en");
+  ck(speech <= 60.0 * 1.15, "a 277 s narration set is trimmed to a 60 s target");
+  ck(speech >= 60.0 * 0.50, "the trim keeps each clip narrated, not emptied");
+  bool whole = true;
+  for (size_t i = 0; i < lst.count; i++) {
+    size_t n = strlen(lst.items[i].narration);
+    if (n == 0 || lst.items[i].narration[n - 1] != '.') whole = false;
+    if (count_speech_units(lst.items[i].narration, "en") < 2.0) whole = false;
+  }
+  ck(whole, "every trimmed narration ends on a whole sentence and keeps words");
+  free_clip_plan_list(&lst);
+}
+
+static void test_narration_at_the_target_is_not_touched(void) {
+  ClipPlanList lst;
+  lst.count = 2;
+  lst.items = (ClipPlan *)calloc(2, sizeof(ClipPlan));
+  for (int i = 0; i < 2; i++) {
+    lst.items[i].start = 10 + i * 20;
+    lst.items[i].end   = 10 + i * 20 + 15;
+    lst.items[i].narration = str_dup("He runs for the door and makes it out.");
+  }
+  char *before = str_dup(lst.items[0].narration);
+  cap_plan_narration_length(&lst, 300.0, 0.0, "en", "English");
+  ck_str(lst.items[0].narration, before,
+         "a narration already under the target is never trimmed");
+  free(before);
+  free_clip_plan_list(&lst);
+}
+
+static void test_trim_never_cuts_the_closing_line(void) {
+  ClipPlanList lst;
+  lst.count = 2;
+  lst.items = (ClipPlan *)calloc(2, sizeof(ClipPlan));
+  char tail[600];
+  recap_closing_line_for("English", tail, sizeof(tail));
+  ck(tail[0] != 0, "the English closing line is known");
+  lst.items[0].start = 5;  lst.items[0].end = 35;
+  lst.items[1].start = 40; lst.items[1].end = 70;
+  lst.items[0].narration = str_dup(
+      "He opens the door and steps inside the dark room. Then he hears a noise behind "
+      "him and turns around. Someone is standing there and he freezes.");
+  char last[1200];
+  snprintf(last, sizeof(last),
+           "He takes the key and the story ends with the two of them driving away. "
+           "The house burns behind them as the sun comes up. %s", tail);
+  lst.items[1].narration = str_dup(last);
+  cap_plan_narration_length(&lst, 100.0, 0.0, "en", "English");
+  double speech = plan_speech_seconds(lst.items, lst.count, "en");
+  ck(speech <= 100.0 * 1.15, "the trimmed plan fits the target");
+  size_t n = strlen(lst.items[1].narration), tl = strlen(tail);
+  ck(n >= tl && memcmp(lst.items[1].narration + n - tl, tail, tl) == 0,
+     "the closing line of the last clip survives the trim");
+  free_clip_plan_list(&lst);
+}
+
+static void test_trim_handles_cjk_punctuation(void) {
+  ClipPlanList lst;
+  lst.count = 2;
+  lst.items = (ClipPlan *)calloc(2, sizeof(ClipPlan));
+  for (int i = 0; i < 2; i++) {
+    lst.items[i].start = 10 + i * 20;
+    lst.items[i].end   = 10 + i * 20 + 15;
+    lst.items[i].narration = str_dup(
+        "\u4ed6\u4eec\u8d70\u8fdb\u623f\u95f4\u3002\u5c4b\u5b50\u91cc\u5f88\u9ed1\u3002"
+        "\u4ed6\u542c\u5230\u4e00\u4e2a\u58f0\u97f3\u3002\u4ed6\u8f6c\u8eab\u770b\u89c1"
+        "\u4e00\u4e2a\u4eba\u3002\u90a3\u4e2a\u4eba\u6ca1\u6709\u52a8\u3002");
+  }
+  cap_plan_narration_length(&lst, 3.0, 0.0, "zh", "Chinese");
+  double speech = plan_speech_seconds(lst.items, lst.count, "zh");
+  ck(speech <= 3.0 * 1.25, "CJK narrations are trimmed on their own punctuation");
+  for (size_t i = 0; i < lst.count; i++) {
+    size_t n = strlen(lst.items[i].narration);
+    bool ends = false;
+    if (n >= 3 && (unsigned char)lst.items[i].narration[n - 3] == 0xE3 &&
+        (unsigned char)lst.items[i].narration[n - 2] == 0x80 &&
+        (unsigned char)lst.items[i].narration[n - 1] == 0x82)
+      ends = true;      /* the 3-byte 。 terminator */
+    ck(ends, i == 0 ? "the first CJK narration ends on a full stop"
+                    : "the last CJK narration ends on a full stop");
+  }
+  free_clip_plan_list(&lst);
+}
+
+static void test_invented_character_names_are_flagged(void) {
+  ClipPlanList lst;
+  lst.count = 2;
+  lst.items = (ClipPlan *)calloc(2, sizeof(ClipPlan));
+  lst.items[0].start = 1;  lst.items[0].end = 20;
+  lst.items[1].start = 22; lst.items[1].end = 40;
+  lst.items[0].narration = str_dup(
+      "The story begins in a small town. Woody runs across the yard and shouts.");
+  lst.items[1].narration = str_dup(
+      "Buzz turns to him and nods. They climb the fence together.");
+  const char *plot =
+      "Woody is a cowboy doll. When a new toy named Buzz arrives, Woody gets "
+      "jealous and the two of them get lost together.";
+  char suspects[200];
+  int n = plan_name_suspects(&lst, plot, suspects, sizeof(suspects));
+  ck(n == 0, "names that the plot summary uses are not flagged");
+  free(lst.items[1].narration);
+  lst.items[1].narration = str_dup(
+      "Then Rexxy turns to him and nods. They climb the fence together.");
+  n = plan_name_suspects(&lst, plot, suspects, sizeof(suspects));
+  ck(n == 1, "a name the plot summary never mentions is flagged");
+  ck(strstr(suspects, "Rexxy") != NULL, "the flagged name is reported by name");
+  ck(plan_name_suspects(&lst, "", suspects, sizeof(suspects)) == 0,
+     "without a plot summary nothing is guessed about names");
+  free_clip_plan_list(&lst);
+}
+
+static void test_subtitle_copying_is_flagged(void) {
+  ClipPlanList lst;
+  lst.count = 2;
+  lst.items = (ClipPlan *)calloc(2, sizeof(ClipPlan));
+  lst.items[0].start = 1;  lst.items[0].end = 20;
+  lst.items[1].start = 22; lst.items[1].end = 40;
+  const char *line = "you do not understand what i am doing here tonight";
+  lst.items[0].narration = str_dup(
+      "You do not understand what I am doing here tonight, so listen to me now.");
+  lst.items[1].narration = str_dup(
+      "He tells her the bridge is gone and she refuses to turn back.");
+  const char *subs = "1 --> 12\nYou do not understand what I am doing here tonight\n\n";
+  int copied = plan_copied_subtitle_clips(&lst, subs);
+  ck(copied == 1, "one narration repeating a subtitle line word for word is counted");
+  ck(plan_copied_subtitle_clips(&lst, "1 --> 12\nSomething completely different here\n\n") == 0,
+     "an original narration is not counted as copied");
+  free_clip_plan_list(&lst);
+  (void)line;
+}
+
+static void test_transition_command_shape(void) {
+  ck(XFADE_CHUNK >= 2 && XFADE_CHUNK <= 16,
+     "the crossfade chunks stay well inside the command-line limit");
+  char out[64];
+  recap_closing_line_for("Chinese", out, sizeof(out));
+  ck(out[0] != 0, "the Chinese closing line is known");
+  recap_closing_line_for("Russian", out, sizeof(out));
+  ck(out[0] == 0, "a language with no fixed closing line asks for a natural one");
+  char t2[600];
+  recap_closing_line_for("English", t2, sizeof(t2));
+  ck(strstr(t2, "With that the story ends right here") != NULL,
+     "the English closing line is the exact one the prompt names");
+}
+
+
+static void test_audit_trims_a_stubborn_over_long_plan(void) {
+  /* The model keeps writing 3x the narration the 1 minute target allows, even
+     after the correction note.  The audit must try once and then hold the
+     length itself, so the render cannot come out longer than requested. */
+  const char *sent = "He opens the door and steps inside the dark room. "
+                     "Then he hears a noise behind him and turns around.";
+  char big[4096];
+  int at = 0;
+  for (int k = 0; k < 8; k++) at += snprintf(big + at, sizeof(big) - at, "%s", sent);
+  /* the plan as real JSON (parsed directly) and escaped for the reply body */
+  char plan_json[8192];
+  at = 0;
+  at += snprintf(plan_json + at, sizeof(plan_json) - at, "{\"clips\":[");
+  for (int i = 0; i < 3; i++)
+    at += snprintf(plan_json + at, sizeof(plan_json) - at,
+                   "%s{\"start\":%d,\"end\":%d,\"narration\":\"%s\"}",
+                   i ? "," : "", 5 + i * 30, 5 + i * 30 + 25, big);
+  snprintf(plan_json + at, sizeof(plan_json) - at, "]}");
+
+  char esc[16384];
+  {
+    size_t w = 0;
+    for (size_t r = 0; plan_json[r] && w + 3 < sizeof(esc); r++) {
+      if (plan_json[r] == '"') esc[w++] = '\\';
+      esc[w++] = plan_json[r];
+    }
+    esc[w] = 0;
+  }
+
+  stub_reset();
+  stub_set_default_reply(500, "{\"type\":\"error\",\"error\":{\"message\":\"unexpected\"}}");
+  queue_ok_big(esc);
+  queue_ok_big(esc);
+  g_batch_collect = false;
+  g_batch_render = false;
+  g_batch_bypass_lookup = false;
+
+  Config c = cfg_for("https://api.anthropic.com/v1", "claude-sonnet-4-5",
+                     "sk-ant-api03-testkey");
+  snprintf(c.recap_language, sizeof(c.recap_language), "English");
+  c.recap_minutes = 1.0;
+  c.transitions = false;
+  c.transition_seconds = 0;
+
+  ClipPlanList plan = parse_clip_plan_json(plan_json);
+  ck(plan.count == 3, "the over-long plan parses");
+  double before = plan_speech_seconds(plan.items, plan.count, "en");
+  ck(before > 90.0, "the plan really is over three times the 60 s target");
+
+  audit_plan_length_and_script(&c, "Long Movie (2026)",
+                               "1\n5 --> 9\nHe opens the door and steps inside.\n\n",
+                               "", "", false, 3, 20, "en", &plan);
+  ck(stub_request_count() == 1,
+     "the model was asked exactly once more, with the length rule");
+  ck(plan.count == 3, "the corrected plan keeps the configured clip count");
+  double after = plan_speech_seconds(plan.items, plan.count, "en");
+  ck(after <= 60.0 * 1.15, "the accepted plan now fits the 1 minute target");
+  ck(after < before, "the narration really got shorter");
+  free_clip_plan_list(&plan);
+  g_batch_bypass_lookup = false;   /* the next tests rely on the batch lookup */
+}
+
 int main(void) {
   test_endpoint_shapes();
   test_native_claude_request();
@@ -1308,6 +1536,14 @@ int main(void) {
   test_oversized_plan_is_merged_to_the_target();
   test_plan_within_the_target_is_untouched();
   test_openai_plan_249_clips_for_111_target();
+  test_over_long_narration_is_trimmed_to_the_target();
+  test_narration_at_the_target_is_not_touched();
+  test_trim_never_cuts_the_closing_line();
+  test_trim_handles_cjk_punctuation();
+  test_invented_character_names_are_flagged();
+  test_subtitle_copying_is_flagged();
+  test_transition_command_shape();
+  test_audit_trims_a_stubborn_over_long_plan();
   test_openai_no_limit_means_no_extra_requests();
   test_batch_custom_id_shape();
   test_batch_collect_then_render();

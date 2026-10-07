@@ -37,6 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 _TRUNCATE_FIRST_BATCH = False      # set from --truncate-first-batch
 _REASONING_FIRST_REPLY = False     # set from --reasoning-first-reply
 _OVERSIZED_FIRST_PLAN = False      # set from --oversized-first-plan
+_OVERLONG_PLANS = False            # set from --overlong-plans
 
 STATE = {"plans": 0, "responses": 0, "tts": 0, "wiki_searches": 0, "wiki_extracts": 0,
          "batches": {}, "batch_seq": 0, "truncate_first_batch": False,
@@ -91,6 +92,16 @@ def pad_narration(text, seconds, lang):
     """A real model writes to the requested length; the mock should too, so the
     length audit in the app has nothing to complain about.  ~2.7 words per
     second, and never after the closing line."""
+    need = max(int(seconds * 2.7), 25)
+    filler = ("Then the story turns again and the people in it have to decide "
+              "what they are willing to lose.")
+    while len(text.split()) < need:
+        text = text + " " + filler
+    return text
+
+
+def m_pad(text, seconds):
+    """The mock writing far more narration than the target allows."""
     need = max(int(seconds * 2.7), 25)
     filler = ("Then the story turns again and the people in it have to decide "
               "what they are willing to lose.")
@@ -355,6 +366,27 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                   flush=True)
             wanted = over
         plan = build_plan(body, wanted)
+
+        if _OVERLONG_PLANS:
+            # A model that writes far more narration than the requested length
+            # allows (the "20 minute recap comes out at 26" report).  Padding
+            # happens before the closing line, which stays at the very end.
+            tgt = 0
+            tm = re.search(r"Target clip length:\s*(\d+)-(\d+) seconds each",
+                           prompt or "")
+            if tm:
+                tgt = int(((int(tm.group(1)) + int(tm.group(2))) // 2) * 2.5)
+            for _c in plan["clips"]:
+                narr = _c["narration"]
+                outro = ""
+                if CLOSING_LINE in narr:
+                    narr, _, _ = narr.rpartition(CLOSING_LINE)
+                    outro = " " + CLOSING_LINE
+                _c["narration"] = m_pad(narr, tgt or 40) + outro
+            print(f"[mock-openai] writing an over-long plan ({len(plan['clips'])} clips, "
+                  f"about {tgt or 40}s of narration each for a target of about "
+                  f"{(tgt or 40) / 2.5:.0f}s)", flush=True)
+
         text = json.dumps(plan)
         with STATE["lock"]:
             print(f"[mock-openai] returning {len(plan['clips'])} clips", flush=True)
@@ -593,6 +625,11 @@ def main():
                          "incomplete, incomplete_details.reason=max_output_tokens, "
                          "and an output array holding nothing but a reasoning "
                          "item. Later calls answer normally.")
+    ap.add_argument("--overlong-plans", action="store_true",
+                    help="answer EVERY /responses plan request with about 2.5x the "
+                         "narration the asked clip length allows - the reported run "
+                         "where a 20 minute recap came out longer than 20 minutes "
+                         "because the model ignored the length budget.")
     ap.add_argument("--oversized-first-plan", action="store_true",
                     help="answer the FIRST /responses call with THREE times the "
                          "clips the prompt asks for - the reported run where the "
@@ -606,9 +643,11 @@ def main():
     args = ap.parse_args()
 
     global _TRUNCATE_FIRST_BATCH, _REASONING_FIRST_REPLY, _OVERSIZED_FIRST_PLAN
+    global _OVERLONG_PLANS
     _TRUNCATE_FIRST_BATCH = bool(args.truncate_first_batch)
     _REASONING_FIRST_REPLY = bool(args.reasoning_first_reply)
     _OVERSIZED_FIRST_PLAN = bool(args.oversized_first_plan)
+    _OVERLONG_PLANS = bool(args.overlong_plans)
 
     a = ThreadingHTTPServer(("127.0.0.1", args.openai_port), OpenAIHandler)
     b = ThreadingHTTPServer(("127.0.0.1", args.eleven_port), ElevenHandler)

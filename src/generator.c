@@ -497,6 +497,10 @@ typedef struct {
   double max_video_speedup;  /* default 1.75 */
   double recap_minutes;     /* target recap length in minutes; 0 = auto */
   bool   captions;          /* burn small subtitles into clips; default true */
+  /* Smooth the cut between two clips: the clips are crossfaded instead of
+     hard-cut, which is what a rough scene-to-scene jump looks like. */
+  bool   transitions;        /* crossfade between clips; default true */
+  double transition_seconds; /* crossfade length in seconds; default 0.35 */
   double narration_volume;   /* default 2.5  */
   double bgm_volume;         /* default 0.1  */
   bool   bgm_enabled;        /* default true */
@@ -748,6 +752,9 @@ static Config load_config_json(const char *path) {
   c.max_video_speedup = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "max_video_speedup"), MAX_VIDEO_SPEEDUP, 1.0, 8.0);
   c.recap_minutes     = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "recap_minutes"), 0, 0, 180);
   c.captions          = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "captions"), true);
+  c.transitions       = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "transitions"), true);
+  c.transition_seconds =
+      cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "transition_seconds"), 0.35, 0.10, 1.50);
   c.batch_planning    = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "batch_planning"), false);
   c.batch_max_wait_minutes =
       (int)cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "batch_max_wait_minutes"), 720, 0, 2880);
@@ -4289,11 +4296,13 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   snprintf(pace_line, sizeof(pace_line),
            "- The voice speaks about %.1f words per second. A %d-second narration "
            "needs about %d words and a %d-second one about %d words, so aim for "
-           "%d-%d words per narration. Never fewer than %d words in one clip: a "
-           "narration that is too short for its clip gets the clip shortened to "
-           "match, and the finished recap then comes out shorter than asked. "
+           "%d-%d words per narration - %d words is the HARD MAXIMUM for one clip, "
+           "because the finished video has a fixed length and going over here makes "
+           "the recap longer than the viewer asked for. Never fewer than %d words in "
+           "one clip either: a narration that is too short for its clip gets the clip "
+           "shortened to match, and the recap then comes out shorter than asked. "
            "Use %d-%d short sentences per clip.\n",
-           wps, min_sec, wlo, max_sec, whi, wlo, whi, wmin, sent_lo, sent_hi);
+           wps, min_sec, wlo, max_sec, whi, wlo, whi, whi, wmin, sent_lo, sent_hi);
 
   /* With a recap-minutes target the model also needs to know the total, or it
      spreads a short script over many clips and the video comes out short. */
@@ -4303,8 +4312,10 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     int total_words = (int)((double)num_clips * (double)per_clip_sec * wps + 0.5);
     snprintf(total_line, sizeof(total_line),
              "- Together the %d narrations must add up to about %.1f minutes of "
-             "speech (roughly %d words). Each clip carries its own full narration: "
-             "no one-line summaries, no empty narrations.\n",
+             "speech (roughly %d words) and must NEVER add up to more than that: "
+             "the finished recap is cut to the narration, so extra words here "
+             "make the video longer than the length set above. Each clip carries "
+             "its own full narration: no one-line summaries, no empty narrations.\n",
              num_clips, (double)num_clips * (double)per_clip_sec / 60.0, total_words);
   }
 
@@ -4355,6 +4366,8 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "\n"
     "- Third person, present tense, strictly chronological. You are telling the STORY, not describing the video. Write the action as it happens: \"Hank hits the gas and gets the car out of there\", not \"Hank hit the gas\" and not \"Hank will escape\".\n"
     "- One continuous voice. Each clip must feel like the next sentence of the same story, not a separate summary. The reader should never notice where one clip ends and the next begins.\n"
+    "- Tell the plot in the plot's own order, from the opening to the ending. Every clip continues exactly where the previous clip stopped and adds NEW events. Never jump back to an earlier scene, never restart the story, and never tell the same event twice.\n"
+    "- The last clips carry the climax and the outcome: the story must be finished, not left hanging.\n"
     "- Never copy a subtitle line word for word and never list dialogue. Retell everything in your own words; the narration must read like one continuous story, never like subtitles being read out.\n"
     "- Fast pace. Every sentence moves the plot forward: someone does something, something goes wrong, someone decides, something changes. No scenery, no mood-setting, no reflection.\n"
     "- Short, simple, spoken sentences (about 8-16 words each). Plain words. No long clauses, no semicolons, no brackets, no emojis, no stage directions. Write for the ear, not for the eye.\n"
@@ -4384,7 +4397,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "\n"
     "STEP 5: CHOOSING THE CLIPS\n"
     "\n"
-    "- Choose exactly %d non-overlapping time ranges that cover the whole plot arc from the opening to the ending, spaced so that early, middle and final parts of the movie all get fair coverage. Do not spend more than a few clips on the first quarter of the movie.\n"
+    "- Choose exactly %d non-overlapping time ranges that cover the whole plot arc from the opening to the ending, spaced so that early, middle and final parts of the movie all get fair coverage. Do not spend more than a few clips on the first quarter of the movie. The \"clips\" array holds exactly that many objects: more clips make the video longer than the length set above.\n"
     "- Each range must be %d-%d seconds long (end minus start). Never start at 0.\n"
     "- Use INPUT A only for the start and end times. Choose moments with clear action: arrivals, discoveries, confrontations, betrayals, escapes, deaths, big decisions, the climax and the ending.\n"
     "- Each narration must match what happens in its own time range, but may add one short line of setup from earlier so the story stays clear.\n"
@@ -4399,6 +4412,8 @@ static ClipPlanList openai_make_plan(const Config *cfg,
     "5. Is anything in the narration not supported by the subtitles or script? Remove it.\n"
     "6. Is the output valid JSON with nothing else around it?\n"
     "7. Are the clips in increasing order of start time, with no overlapping ranges and no repeated scene?\n"
+    "8. Does every clip continue the story exactly where the previous clip stopped, in the plot's order, with no event told twice?\n"
+    "9. Do the narrations add up to the length asked for in STEP 4, without going over the maximum?\n"
     "\n"
     "OUTPUT FORMAT (strict JSON only)\n"
     "\n"
@@ -5982,6 +5997,254 @@ static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
   return rc == 0 && file_exists(out_mp4);
 }
 
+/* ---------------------------------------------------------------------------
+ * Smooth scene changes: crossfade the clips instead of hard-cutting them.
+ *
+ * The concat demuxer joins the clip files with a hard cut, which is the rough
+ * scene-to-scene jump users see.  ffmpeg's xfade/acrossfade filters blend the
+ * end of one clip into the start of the next instead.  A chain of xfade filters
+ * needs every input in one command, and one command for ~100 clips would blow
+ * the command-line limit, so the clips are merged in chunks (8 at a time) and
+ * the chunk files are merged again until one file is left.
+ *
+ * Every input is normalised first (same size, same frame rate, yuv420p, 48 kHz
+ * stereo) because xfade refuses inputs whose frame rate or timebase differ.
+ * The merge falls back to the plain concat when a clip is too short for the
+ * crossfade or when ffmpeg rejects the filter graph - the recap then simply has
+ * hard cuts again instead of failing.
+ * ------------------------------------------------------------------------ */
+
+#define XFADE_CHUNK 8
+
+static void free_str_list(char **lst, size_t n);          /* further down */
+
+typedef struct {
+  char  *path;
+  double dur;
+  int    owned;    /* temp file created by the merge: delete when consumed */
+} XClip;
+
+static double ffprobe_video_fps(const char *path) {
+  char *esc = sh_escape(path);
+  char cmd[8192];
+  snprintf(cmd, sizeof(cmd),
+           "ffprobe -v error -select_streams v:0 "
+           "-show_entries stream=r_frame_rate "
+           "-of default=noprint_wrappers=1:nokey=1 %s",
+           esc);
+  free(esc);
+  char *out = popen_read_all(cmd);
+  if (!out) return 0.0;
+  double fps = 0.0;
+  int num = 0, den = 0;
+  if (sscanf(out, "%d/%d", &num, &den) == 2 && num > 0 && den > 0)
+    fps = (double)num / (double)den;
+  else
+    fps = atof(out);
+  free(out);
+  return (fps > 1.0 && fps < 240.0) ? fps : 0.0;
+}
+
+/* Read the concat list written by concat_list_add(): one `file 'name'` per
+   line, with '\'' for a literal apostrophe. */
+static bool read_concat_list(const char *list_path, char ***out_names, size_t *out_n) {
+  char *txt = read_entire_file(list_path);
+  if (!txt) return false;
+  char **names = NULL;
+  size_t n = 0, cap = 0;
+  const char *p = txt;
+  while (*p) {
+    const char *eol = strchr(p, '\n');
+    size_t len = eol ? (size_t)(eol - p) : strlen(p);
+    if (len > 7 && strncmp(p, "file '", 6) == 0 && p[len - 1] == '\'') {
+      char *name = (char *)malloc(len);
+      if (!name) die("OOM");
+      size_t at = 0;
+      for (size_t i = 6; i + 1 < len; i++) {
+        if (p[i] == '\'' && i + 3 < len && p[i + 1] == '\\' && p[i + 2] == '\'' &&
+            p[i + 3] == '\'') {
+          name[at++] = '\'';
+          i += 3;
+        } else {
+          name[at++] = p[i];
+        }
+      }
+      name[at] = 0;
+      if (n + 1 > cap) {
+        cap = cap ? cap * 2 : 16;
+        names = (char **)realloc(names, cap * sizeof(char *));
+        if (!names) die("OOM");
+      }
+      names[n++] = name;
+    }
+    if (!eol) break;
+    p = eol + 1;
+  }
+  free(txt);
+  *out_names = names;
+  *out_n = n;
+  return n > 0;
+}
+
+/* One chunk: k inputs -> one file, crossfading every joint. */
+static bool ffmpeg_merge_chunk(XClip *cl, size_t k, double tf, const char *out_mp4,
+                               int frame_w, int frame_h, double fps) {
+  char cmd[16384];
+  size_t o = 0;
+  char fps_filter[32];
+  fps_filter[0] = 0;
+  if (fps > 0.0) snprintf(fps_filter, sizeof(fps_filter), ",fps=%.6g", fps);
+  o += (size_t)snprintf(cmd + o, sizeof(cmd) - o, "ffmpeg -y -hide_banner -loglevel error");
+  for (size_t i = 0; i < k; i++) {
+    char *e = sh_escape(cl[i].path);
+    o += (size_t)snprintf(cmd + o, sizeof(cmd) - o, " -i %s", e);
+    free(e);
+  }
+  o += (size_t)snprintf(cmd + o, sizeof(cmd) - o, " -filter_complex \"");
+  for (size_t i = 0; i < k; i++) {
+    o += (size_t)snprintf(cmd + o, sizeof(cmd) - o,
+                          "[%zu:v]scale=%d:%d:force_original_aspect_ratio=decrease,"
+                          "pad=%d:%d:(ow-iw)/2:(oh-ih)/2%s,format=yuv420p,settb=AVTB[v%zu];",
+                          i, frame_w, frame_h, frame_w, frame_h, fps_filter, i);
+    o += (size_t)snprintf(cmd + o, sizeof(cmd) - o,
+                          "[%zu:a]aresample=48000,"
+                          "aformat=sample_fmts=fltp:channel_layouts=stereo[a%zu];",
+                          i, i);
+  }
+  double merged = cl[0].dur;
+  char prevv[32], preva[32], curv[32], cura[32];
+  snprintf(prevv, sizeof(prevv), "v0");
+  snprintf(preva, sizeof(preva), "a0");
+  for (size_t i = 1; i < k; i++) {
+    double off = merged - tf;
+    if (off < 0.05) off = 0.05;
+    snprintf(curv, sizeof(curv), "vx%zu", i);
+    snprintf(cura, sizeof(cura), "ax%zu", i);
+    o += (size_t)snprintf(cmd + o, sizeof(cmd) - o,
+                          "[%s][v%zu]xfade=transition=fade:duration=%.3f:offset=%.3f[%s];",
+                          prevv, i, tf, off, curv);
+    o += (size_t)snprintf(cmd + o, sizeof(cmd) - o,
+                          "[%s][a%zu]acrossfade=d=%.3f:c1=tri:c2=tri[%s];",
+                          preva, i, tf, cura);
+    snprintf(prevv, sizeof(prevv), "%s", curv);
+    snprintf(preva, sizeof(preva), "%s", cura);
+    merged += cl[i].dur - tf;
+  }
+  char *out_esc = sh_escape(out_mp4);
+  o += (size_t)snprintf(cmd + o, sizeof(cmd) - o,
+                        "\" -map \"[%s]\" -map \"[%s]\" "
+                        "-c:v libx264 -pix_fmt yuv420p -preset veryfast -crf 20 "
+                        "-c:a aac -b:a 192k -movflags +faststart %s",
+                        prevv, preva, out_esc);
+  free(out_esc);
+  if (o >= sizeof(cmd)) {
+    logw("Crossfade command line too long (%zu chars) - using hard cuts for this chunk.", o);
+    return false;
+  }
+  return run_cmd("%s", cmd) == 0 && file_exists(out_mp4);
+}
+
+static void xclip_free(XClip *c) {
+  if (c->owned && c->path) plat_unlink(c->path);
+  free(c->path);
+  c->path = NULL;
+}
+
+/* Merge the clips of a concat list with crossfades.  Returns false (and leaves
+   nothing behind) when a clip is too short for the crossfade or ffmpeg fails,
+   so the caller can fall back to the plain concat. */
+static bool ffmpeg_merge_with_transitions(const char *list_path, const char *out_mp4,
+                                          const char *title, double tf,
+                                          int frame_w, int frame_h) {
+  char **names = NULL;
+  size_t n = 0;
+  if (!read_concat_list(list_path, &names, &n)) return false;
+  if (n < 2) { free_str_list(names, n); return false; }
+  if (tf < 0.10) tf = 0.10;
+
+  XClip *cur = (XClip *)calloc(n, sizeof(XClip));
+  if (!cur) die("OOM");
+  bool ok = true;
+  for (size_t i = 0; i < n && ok; i++) {
+    size_t need = strlen(names[i]) + 8;
+    cur[i].path = (char *)malloc(need);
+    if (!cur[i].path) die("OOM");
+    snprintf(cur[i].path, need, "clips/%s", names[i]);
+    cur[i].dur = ffprobe_duration_seconds(cur[i].path);
+    cur[i].owned = 0;
+    if (cur[i].dur <= tf + 0.25) {
+      logw("Clip %zu is too short (%.2fs) for a %.2fs crossfade - using hard cuts.",
+           i + 1, cur[i].dur, tf);
+      ok = false;
+    }
+  }
+  free_str_list(names, n);
+  if (!ok) {
+    for (size_t i = 0; i < n; i++) xclip_free(&cur[i]);
+    free(cur);
+    return false;
+  }
+  if (frame_w <= 0 || frame_h <= 0) { frame_w = 1280; frame_h = 720; }
+  double fps = ffprobe_video_fps(cur[0].path);
+
+  size_t cur_n = n;
+  size_t round = 0;
+  while (cur_n > 1) {
+    size_t groups = (cur_n + XFADE_CHUNK - 1) / XFADE_CHUNK;
+    XClip *next = (XClip *)calloc(groups, sizeof(XClip));
+    if (!next) die("OOM");
+    logi("Crossfading %zu clip%s (round %zu, %.2f s blends)...",
+         cur_n, cur_n == 1 ? "" : "s", round + 1, tf);
+    size_t g = 0;
+    for (size_t a = 0; a < cur_n; a += XFADE_CHUNK, g++) {
+      size_t k = cur_n - a < XFADE_CHUNK ? cur_n - a : XFADE_CHUNK;
+      if (k == 1) {
+        next[g] = cur[a];              /* carried to the next round as-is */
+        cur[a].path = NULL;
+        continue;
+      }
+      char tmp[PATH_MAX];
+      bool last_round = (groups == 1);
+      if (last_round) snprintf(tmp, sizeof(tmp), "%s", out_mp4);
+      else snprintf(tmp, sizeof(tmp), "clips/%s_xfade_%zu_%zu.mp4", title, round, g);
+      double sum = 0.0;
+      for (size_t i = 0; i < k; i++) sum += cur[a + i].dur;
+      if (!ffmpeg_merge_chunk(&cur[a], k, tf, tmp, frame_w, frame_h, fps)) {
+        logw("Crossfade merge failed - falling back to hard cuts.");
+        for (size_t i = 0; i < k; i++) xclip_free(&cur[a + i]);
+        for (size_t i = 0; i < g; i++) xclip_free(&next[i]);
+        free(next);
+        for (size_t i = a + k; i < cur_n; i++) xclip_free(&cur[i]);
+        free(cur);
+        return false;
+      }
+      for (size_t i = 0; i < k; i++) xclip_free(&cur[a + i]);
+      if (last_round) {
+        next[g].path = NULL;
+        next[g].owned = 0;
+        next[g].dur = sum - (double)(k - 1) * tf;
+        free(next);
+        free(cur);
+        return true;                   /* out_mp4 written */
+      }
+      next[g].path = str_dup(tmp);
+      next[g].owned = 1;
+      next[g].dur = sum - (double)(k - 1) * tf;
+    }
+    free(cur);
+    cur = next;
+    cur_n = groups;
+    round++;
+  }
+  /* Reached only when cur_n == 1 from the start (n == 1), handled above. */
+  if (cur_n == 1 && cur[0].path) {
+    ok = plat_rename(cur[0].path, out_mp4) == 0;
+    xclip_free(&cur[0]);
+  }
+  free(cur);
+  return ok;
+}
+
 static bool ffmpeg_concat_videos(const char *list_txt, const char *out_mp4) {
   char *list_esc = sh_escape(list_txt);
   char *out_esc  = sh_escape(out_mp4);
@@ -6694,6 +6957,632 @@ static ClipPlanList local_make_plan(const char *subs_seconds_text, int num_clips
   return out;
 }
 
+/* ---------------------------------------------------------------------------
+ * Recap length guarantee and script-quality audit.
+ *
+ * Two things a run must not get wrong:
+ *   1. the finished recap must come out at (or just under) the requested
+ *      minutes - a model that writes 30% more narration than the budget makes
+ *      a "20 minute" recap come out at 26;
+ *   2. the narration must be a retold story with the plot summary's character
+ *      names, in the plot's order, not the subtitle lines read out.
+ *
+ * The audit looks for all of that on the accepted plan, asks the model ONCE
+ * for a corrected plan when a defect is worth the call (the note names every
+ * defect at the same time), and then enforces the length deterministically by
+ * cutting whole sentences off the END of over-long narrations - the closing
+ * line of the last clip always survives.  Merging clips cannot shorten the
+ * total (it keeps every word), so trimming is the only honest way to hit the
+ * target once the plan is in hand.
+ * ------------------------------------------------------------------------ */
+
+static void note_append(char *buf, size_t cap, size_t *at, const char *fmt, ...) {
+  if (!buf || cap == 0 || *at >= cap - 1) return;
+  va_list ap;
+  va_start(ap, fmt);
+  int w = vsnprintf(buf + *at, cap - *at, fmt, ap);
+  va_end(ap);
+  if (w > 0) *at += (size_t)w;
+  if (*at > cap - 1) *at = cap - 1;
+}
+
+static unsigned utf8_decode_len(const unsigned char *p, size_t avail, size_t *len) {
+  unsigned v = 0;
+  size_t l = 1;
+  if (avail == 0) { *len = 0; return 0; }
+  if (*p < 0x80) { v = *p; }
+  else if ((*p & 0xE0) == 0xC0 && avail >= 2) { v = ((unsigned)(p[0] & 0x1F) << 6) | (unsigned)(p[1] & 0x3F); l = 2; }
+  else if ((*p & 0xF0) == 0xE0 && avail >= 3) {
+    v = ((unsigned)(p[0] & 0x0F) << 12) | ((unsigned)(p[1] & 0x3F) << 6) | (unsigned)(p[2] & 0x3F);
+    l = 3;
+  } else if ((*p & 0xF8) == 0xF0 && avail >= 4) { v = 0x10000u; l = 4; }
+  *len = l;
+  return v;
+}
+
+/* Byte offset just past the end of the sentence that starts at `pos`: the
+   terminator plus the spaces after it.  Latin, CJK and Arabic terminators, so
+   the trimming works for every language the app narrates in. */
+static size_t next_sentence_cursor(const char *s, size_t n, size_t pos) {
+  if (pos >= n) return n;
+  size_t i = pos;
+  while (i < n) {
+    size_t l = 1;
+    unsigned v = utf8_decode_len((const unsigned char *)s + i, n - i, &l);
+    bool term = (v == '.' || v == '!' || v == '?' || v == 0x3002u ||
+                 v == 0xFF01u || v == 0xFF1Fu || v == 0x061Fu || v == 0x061Bu);
+    if (v == '.' && i + 1 < n && s[i + 1] >= '0' && s[i + 1] <= '9')
+      term = false;                                   /* "3.5" is not an end */
+    i += l;
+    if (!term) continue;
+    while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) i++;
+    return i;
+  }
+  return n;
+}
+
+/* Speech units of one slice of the text (no allocation for normal sentences). */
+static double units_of_slice(const char *s, size_t len, const char *code) {
+  if (len == 0) return 0.0;
+  char stackbuf[768];
+  char *tmp = len + 1 <= sizeof(stackbuf) ? stackbuf : (char *)malloc(len + 1);
+  if (!tmp) die("OOM");
+  memcpy(tmp, s, len);
+  tmp[len] = 0;
+  double u = count_speech_units(tmp, code);
+  if (tmp != stackbuf) free(tmp);
+  return u;
+}
+
+/* The exact closing sentence for the recap language ("" when the language has
+   no fixed line and the model is asked for a natural one instead). */
+static void recap_closing_line_for(const char *recap_language, char *out, size_t outsz) {
+  const char *code = recap_lang_code(recap_language);
+  if (!strcmp(code, "zh"))
+    snprintf(out, outsz,
+             "\u6545\u4e8b\u5c31\u8bb2\u5230\u8fd9\u91cc\u3002"
+             "\u5728\u8bc4\u8bba\u533a\u544a\u8bc9\u6211\u4eec\u4f60\u7684"
+             "\u770b\u6cd5\uff0c\u522b\u5fd8\u4e86\u70b9\u8d5e\u89c6\u9891"
+             "\u5e76\u8ba2\u9605\u9891\u9053\u3002");
+  else if (!strcmp(code, "ar"))
+    snprintf(out, outsz,
+             "\u0648\u0628\u0647\u0630\u0627 \u062a\u0646\u062a\u0647\u064a "
+             "\u0627\u0644\u0642\u0635\u0629 \u0647\u0646\u0627. "
+             "\u0623\u062e\u0628\u0631\u0648\u0646\u0627 \u0641\u064a "
+             "\u0627\u0644\u062a\u0639\u0644\u064a\u0642\u0627\u062a "
+             "\u0628\u0631\u0623\u064a\u0643\u0645 \u0641\u064a \u0647\u0630\u0627 "
+             "\u0627\u0644\u0634\u0631\u062d\u060c \u0648\u0644\u0627 "
+             "\u062a\u0646\u0633\u0648\u0627 \u0627\u0644\u0625\u0639\u062c\u0627\u0628 "
+             "\u0628\u0627\u0644\u0641\u064a\u062f\u064a\u0648 \u0648\u0627\u0644\u0627\u0634\u062a\u0631\u0627\u0643 "
+             "\u0641\u064a \u0627\u0644\u0642\u0646\u0627\u0629.");
+  else if (!strcmp(code, "es"))
+    snprintf(out, outsz,
+             "Y con esto la historia termina justo aqu\u00ed. Cu\u00e9ntanos "
+             "en los comentarios qu\u00e9 te pareci\u00f3 esta explicaci\u00f3n "
+             "y no olvides darle like al video y suscribirte al canal.");
+  else if (!strcmp(code, "en"))
+    snprintf(out, outsz,
+             "With that the story ends right here. Let us know in the comments "
+             "how you liked this explanation and don't forget to like the video "
+             "and subscribe to the channel.");
+  else
+    out[0] = '\0';
+}
+
+/* Keep whole sentences of `text` while they fit in `budget_units`.  At least
+   one sentence always stays.  `tail` (when non-empty and at the very end of
+   the text) is preserved: that is the fixed closing line. */
+static char *narration_trim_to_budget(const char *text, double budget_units,
+                                      const char *code, const char *tail,
+                                      bool *out_trimmed) {
+  if (out_trimmed) *out_trimmed = false;
+  if (!text) return str_dup("");
+  size_t n = strlen(text);
+  if (count_speech_units(text, code) <= budget_units) return str_dup(text);
+
+  size_t body_n = n;
+  if (tail && tail[0]) {
+    size_t tl = strlen(tail);
+    if (tl <= n && memcmp(text + n - tl, tail, tl) == 0) body_n = n - tl;
+  }
+
+  double used = 0.0;
+  size_t keep_end = 0, pos = 0;
+  int kept = 0;
+  while (pos < body_n) {
+    size_t nx = next_sentence_cursor(text, body_n, pos);
+    if (nx <= pos) break;
+    double u = units_of_slice(text + pos, nx - pos, code);
+    if (kept > 0 && used + u > budget_units) break;
+    used += u;
+    keep_end = nx;
+    kept++;
+    pos = nx;
+  }
+  if (kept == 0) {
+    size_t nx = next_sentence_cursor(text, body_n, 0);
+    keep_end = nx > 0 ? nx : body_n;
+  }
+  while (keep_end > 0 && (text[keep_end - 1] == ' ' || text[keep_end - 1] == '\n' ||
+                          text[keep_end - 1] == '\r' || text[keep_end - 1] == '\t'))
+    keep_end--;
+
+  size_t tl = (tail && tail[0] && body_n < n) ? strlen(tail) : 0;
+  char *out = (char *)malloc(keep_end + tl + 2);
+  if (!out) die("OOM");
+  memcpy(out, text, keep_end);
+  size_t at = keep_end;
+  if (tl) {
+    if (at > 0) out[at++] = ' ';
+    memcpy(out + at, tail, tl);
+    at += tl;
+  }
+  out[at] = '\0';
+  if (out_trimmed) *out_trimmed = true;
+  return out;
+}
+
+/* Deterministic length guarantee: hand the plan exactly `target_sec (+ the
+   crossfade overlap the render will eat) of speech by trimming whole sentences
+   off the end of the narrations that are over their share.  The clips stay
+   where they are and the last clip keeps the closing line. */
+static void cap_plan_narration_length(ClipPlanList *plan, double target_sec, double overlap_sec,
+                                      const char *lang_code, const char *recap_language) {
+  if (!plan || plan->count == 0) return;
+  double per_sec = lang_speech_units_per_sec(lang_code);
+  if (per_sec <= 0.0) return;
+  double budget = (target_sec + overlap_sec) * per_sec;
+  if (budget <= 0.0) return;
+
+  double total = 0.0;
+  for (size_t i = 0; i < plan->count; i++)
+    total += count_speech_units(plan->items[i].narration, lang_code);
+  if (total <= budget * 1.02) return;
+
+  char tail[600];
+  recap_closing_line_for(recap_language, tail, sizeof(tail));
+  bool last_has_tail = false;
+  if (tail[0]) {
+    const char *last = plan->items[plan->count - 1].narration;
+    size_t ln = strlen(last), tl = strlen(tail);
+    last_has_tail = (ln >= tl && memcmp(last + ln - tl, tail, tl) == 0);
+  }
+  double tail_units = last_has_tail ? count_speech_units(tail, lang_code) : 0.0;
+
+  double before_min = total / per_sec / 60.0;
+  double remaining_budget = budget;
+  double remaining_units = total;
+  size_t trimmed_clips = 0;
+  for (size_t i = 0; i < plan->count; i++) {
+    double u = count_speech_units(plan->items[i].narration, lang_code);
+    double alloc;
+    if (i + 1 == plan->count) {
+      alloc = remaining_budget;          /* the ending keeps what is left */
+    } else {
+      alloc = remaining_units > 0.0 ? remaining_budget * (u / remaining_units)
+                                    : remaining_budget;
+    }
+    bool trimmed = false;
+    const char *use_tail = (i + 1 == plan->count && last_has_tail) ? tail : NULL;
+    char *shorter = narration_trim_to_budget(plan->items[i].narration, alloc, lang_code,
+                                             use_tail, &trimmed);
+    double kept = count_speech_units(shorter, lang_code);
+    if (trimmed && kept < u) {
+      free(plan->items[i].narration);
+      plan->items[i].narration = shorter;
+      trimmed_clips++;
+    } else {
+      free(shorter);
+      kept = u;
+    }
+    remaining_budget -= kept;
+    remaining_units -= u;
+    if (remaining_budget < 0.0) remaining_budget = 0.0;
+    if (remaining_units < 0.0) remaining_units = 0.0;
+  }
+
+  /* The last clip swallows whatever is left, so a very long ending can push the
+     total back over the budget.  Trim it once more against the real remainder. */
+  double now = 0.0;
+  for (size_t i = 0; i < plan->count; i++)
+    now += count_speech_units(plan->items[i].narration, lang_code);
+  if (now > budget * 1.02 && plan->count > 0) {
+    size_t i = plan->count - 1;
+    double others = now - count_speech_units(plan->items[i].narration, lang_code);
+    double alloc = budget - others;
+    if (alloc < tail_units) alloc = tail_units;    /* never cut the closing line */
+    bool trimmed = false;
+    char *shorter = narration_trim_to_budget(plan->items[i].narration, alloc, lang_code,
+                                             last_has_tail ? tail : NULL, &trimmed);
+    if (trimmed) {
+      free(plan->items[i].narration);
+      plan->items[i].narration = shorter;
+      trimmed_clips++;
+    } else {
+      free(shorter);
+    }
+  }
+
+  double after = plan_speech_seconds(plan->items, plan->count, lang_code);
+  logw("The narrations were longer than the requested length: trimmed whole sentences "
+       "from %zu of %zu clips to hold the target (%.1f min -> %.1f min of speech).",
+       trimmed_clips, plan->count, before_min, after / 60.0);
+}
+
+/* Capitalised words (length >= 3, not ALL-CAPS) inside `text`.  `mid_sentence`
+   skips the first word of every sentence, where the capital is just grammar. */
+static bool token_is_name_like(const char *s, size_t len) {
+  if (len < 3 || len > 40) return false;
+  if (!(s[0] >= 'A' && s[0] <= 'Z')) return false;
+  bool any_lower = false;
+  for (size_t i = 1; i < len; i++) {
+    if (s[i] >= 'a' && s[i] <= 'z') any_lower = true;
+    else if (s[i] != '\'' && s[i] != '-' && s[i] != '.') return false;
+  }
+  return any_lower;
+}
+
+/* Names the narration uses that the plot summary never mentions: the model
+   invented or misheard them.  Returns how many distinct suspects were found
+   (and writes them into `out` when it is not NULL). */
+static int plan_name_suspects(const ClipPlanList *plan, const char *plot_summary,
+                              char *out, size_t outsz) {
+  if (!plan || plan->count == 0 || !plot_summary || !plot_summary[0]) return 0;
+
+  /* set of capitalised words the plot summary uses */
+  size_t plot_n = strlen(plot_summary);
+  char **known = NULL;
+  size_t n_known = 0, cap_known = 0;
+  for (size_t i = 0; i < plot_n; ) {
+    unsigned char ch = (unsigned char)plot_summary[i];
+    if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '\'') {
+      size_t j = i;
+      while (j < plot_n && ((plot_summary[j] >= 'A' && plot_summary[j] <= 'Z') ||
+                            (plot_summary[j] >= 'a' && plot_summary[j] <= 'z') ||
+                            plot_summary[j] == '\'' || plot_summary[j] == '-'))
+        j++;
+      size_t len = j - i;
+      if (token_is_name_like(plot_summary + i, len)) {
+        char *tok = (char *)malloc(len + 1);
+        if (!tok) die("OOM");
+        memcpy(tok, plot_summary + i, len);
+        tok[len] = 0;
+        bool dup = false;
+        for (size_t k = 0; k < n_known; k++)
+          if (str_icmp(known[k], tok) == 0) { dup = true; break; }
+        if (dup) free(tok);
+        else {
+          if (n_known + 1 > cap_known) {
+            cap_known = cap_known ? cap_known * 2 : 64;
+            known = (char **)realloc(known, cap_known * sizeof(char *));
+            if (!known) die("OOM");
+          }
+          known[n_known++] = tok;
+        }
+      }
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  if (n_known == 0) { free(known); return 0; }
+
+  char suspects[8][64];
+  int n_sus = 0, counts[8];
+  for (int i = 0; i < 8; i++) counts[i] = 0;
+  bool at_sentence_start = true;
+  for (size_t c = 0; c < plan->count; c++) {
+    const char *t = plan->items[c].narration ? plan->items[c].narration : "";
+    size_t n = strlen(t);
+    at_sentence_start = true;
+    for (size_t i = 0; i < n; ) {
+      unsigned char ch = (unsigned char)t[i];
+      if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '\'') {
+        size_t j = i;
+        while (j < n && ((t[j] >= 'A' && t[j] <= 'Z') || (t[j] >= 'a' && t[j] <= 'z') ||
+                         t[j] == '\'' || t[j] == '-'))
+          j++;
+        size_t len = j - i;
+        if (!at_sentence_start && token_is_name_like(t + i, len)) {
+          char tok[64];
+          size_t take = len < sizeof(tok) - 1 ? len : sizeof(tok) - 1;
+          memcpy(tok, t + i, take);
+          tok[take] = 0;
+          bool known_tok = false;
+          for (size_t k = 0; k < n_known; k++)
+            if (str_icmp(known[k], tok) == 0) { known_tok = true; break; }
+          if (!known_tok) {
+            int slot = -1;
+            for (int s = 0; s < n_sus; s++)
+              if (str_icmp(suspects[s], tok) == 0) { slot = s; break; }
+            if (slot < 0 && n_sus < 8) {
+              slot = n_sus++;
+              snprintf(suspects[slot], sizeof(suspects[slot]), "%s", tok);
+            }
+            if (slot >= 0) counts[slot]++;
+          }
+        }
+        at_sentence_start = false;
+        i = j;
+      } else {
+        if (ch == '.' || ch == '!' || ch == '?') at_sentence_start = true;
+        i++;
+      }
+    }
+  }
+  for (size_t k = 0; k < n_known; k++) free(known[k]);
+  free(known);
+
+  if (n_sus > 0 && out && outsz > 0) {
+    size_t at = 0;
+    out[0] = '\0';
+    for (int s = 0; s < n_sus; s++) {
+      int w = snprintf(out + at, outsz - at, "%s%s", s ? ", " : "", suspects[s]);
+      if (w < 0 || (size_t)w >= outsz - at) break;
+      at += (size_t)w;
+    }
+  }
+  return n_sus;
+}
+
+/* How many narrations repeat a run of eight words of the subtitles verbatim -
+   the "it is reading the subtitles, not retelling the story" check. */
+static int plan_copied_subtitle_clips(const ClipPlanList *plan, const char *subs_text) {
+  if (!plan || plan->count == 0 || !subs_text || !subs_text[0]) return 0;
+
+  /* normalise the subtitles once: lowercase, single spaces */
+  size_t sn = strlen(subs_text);
+  char *norm = (char *)malloc(sn + 2);
+  if (!norm) die("OOM");
+  size_t nn = 0;
+  bool pending_space = false;
+  for (size_t i = 0; i < sn; i++) {
+    unsigned char c = (unsigned char)subs_text[i];
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+      if (pending_space && nn > 0) norm[nn++] = ' ';
+      pending_space = false;
+      norm[nn++] = (char)c;
+    } else if (c >= 'A' && c <= 'Z') {
+      if (pending_space && nn > 0) norm[nn++] = ' ';
+      pending_space = false;
+      norm[nn++] = (char)(c - 'A' + 'a');
+    } else if (c == '\'') {
+      continue;
+    } else {
+      pending_space = true;
+    }
+  }
+  norm[nn] = '\0';
+
+  int copied = 0;
+  char nbuf[512];
+  for (size_t c = 0; c < plan->count; c++) {
+    const char *t = plan->items[c].narration ? plan->items[c].narration : "";
+    size_t tn = strlen(t);
+    size_t words[128];
+    int nw = 0;
+    for (size_t i = 0; i < tn && nw < 128; ) {
+      unsigned char ch = (unsigned char)t[i];
+      if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+        size_t j = i;
+        while (j < tn && ((t[j] >= 'a' && t[j] <= 'z') || (t[j] >= 'A' && t[j] <= 'Z') ||
+                          (t[j] >= '0' && t[j] <= '9') || t[j] == '\''))
+          j++;
+        words[nw++] = i;
+        i = j;
+      } else {
+        i++;
+      }
+    }
+    bool hit = false;
+    for (int w = 0; w + 8 <= nw && !hit; w++) {
+      size_t at = 0;
+      for (int k = 0; k < 8; k++) {
+        size_t wi = words[w + k];
+        size_t we = wi;
+        while (we < tn && ((t[we] >= 'a' && t[we] <= 'z') || (t[we] >= 'A' && t[we] <= 'Z') ||
+                           (t[we] >= '0' && t[we] <= '9') || t[we] == '\''))
+          we++;
+        for (size_t x = wi; x < we && at + 2 < sizeof(nbuf); x++) {
+          char ch = t[x];
+          if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+          if (ch == '\'') continue;
+          nbuf[at++] = ch;
+        }
+        if (k < 7 && at + 2 < sizeof(nbuf)) nbuf[at++] = ' ';
+      }
+      nbuf[at] = '\0';
+      if (at >= 20 && strstr(norm, nbuf)) hit = true;
+    }
+    if (hit) copied++;
+  }
+  free(norm);
+  return copied;
+}
+
+static bool plan_missing_closing_line(const ClipPlanList *plan, const char *tail) {
+  if (!plan || plan->count == 0 || !tail || !tail[0]) return false;
+  const char *last = plan->items[plan->count - 1].narration;
+  size_t ln = strlen(last), tl = strlen(tail);
+  return !(ln >= tl && memcmp(last + ln - tl, tail, tl) == 0);
+}
+
+/* Lower is better.  Length closeness dominates; the script defects are weighed
+   so that a plan fixing two names is not thrown away for a tiny length change. */
+static double plan_audit_score(const ClipPlanList *plan, const char *lang_code,
+                               double budget_sec, const char *plot_summary,
+                               const char *subs_text, const char *tail,
+                               int *out_suspects, int *out_copied) {
+  double score = 0.0;
+  int sus = 0, cop = 0;
+  if (budget_sec > 0.0) {
+    double sp = plan_speech_seconds(plan->items, plan->count, lang_code);
+    double dev = sp - budget_sec;
+    if (dev < 0) dev = -dev;
+    score += dev / budget_sec;
+  }
+  if (plot_summary && plot_summary[0]) {
+    sus = plan_name_suspects(plan, plot_summary, NULL, 0);
+    double s = 0.15 * (double)sus;
+    score += s > 1.0 ? 1.0 : s;
+  }
+  if (subs_text && subs_text[0]) {
+    cop = plan_copied_subtitle_clips(plan, subs_text);
+    score += 2.0 * (double)cop / (double)(plan->count ? plan->count : 1);
+  }
+  if (plan_missing_closing_line(plan, tail)) score += 0.6;
+  if (out_suspects) *out_suspects = sus;
+  if (out_copied) *out_copied = cop;
+  return score;
+}
+
+/* The audit itself: one combined re-ask, then the deterministic length cap. */
+static void audit_plan_length_and_script(const Config *cfg, const char *movie_title,
+                                         const char *subs_seconds, const char *script_text,
+                                         const char *plot_summary, bool subs_placeholder,
+                                         int num_clips, int per_clip_sec,
+                                         const char *lang_code, ClipPlanList *plan) {
+  if (!plan || plan->count == 0) return;
+
+  char tail[600];
+  recap_closing_line_for(cfg->recap_language, tail, sizeof(tail));
+
+  double overlap = 0.0;
+  if (cfg->transitions && plan->count > 1)
+    overlap = (double)(plan->count - 1) * cfg->transition_seconds;
+
+  bool want_length = (per_clip_sec > 0 && cfg->recap_minutes >= 1.0);
+  double target_sec = want_length ? cfg->recap_minutes * 60.0 : 0.0;
+  double budget_sec = target_sec + overlap;
+
+  double speech = plan_speech_seconds(plan->items, plan->count, lang_code);
+  if (want_length)
+    logi("Plan speech: about %.1f min of narration for the %.0f min target (%zu clips).",
+         speech / 60.0, cfg->recap_minutes, plan->count);
+
+  bool too_short = want_length && speech < budget_sec * 0.80;
+  bool too_long  = want_length && speech > budget_sec * 1.15;
+  bool english = (lang_code[0] == 'e' && lang_code[1] == 'n' && lang_code[2] == 0);
+
+  int sus = 0, copied = 0;
+  char suspects[400];
+  suspects[0] = '\0';
+  if (english) {
+    sus = plan_name_suspects(plan, plot_summary, suspects, sizeof(suspects));
+    if (sus > 0)
+      logw("Possible name problem: %d character name(s) in the narration are not in "
+           "the plot summary: %s", sus, suspects);
+    if (subs_seconds && subs_seconds[0])
+      copied = plan_copied_subtitle_clips(plan, subs_seconds);
+    if (copied > 0)
+      logw("%d of %zu narrations repeat a whole subtitle line word for word - a retold "
+           "story must not read the subtitles out.", copied, plan->count);
+  }
+  bool no_outro = plan_missing_closing_line(plan, tail);
+  if (no_outro)
+    logw("The last narration does not end with the required closing line.");
+
+  bool copies_bad = copied >= 2 && copied * 4 >= (int)plan->count;
+  if ((too_long || too_short || sus > 0 || copies_bad || no_outro) && !g_batch_collect) {
+    char note[3200];
+    size_t no = 0;
+    note[0] = '\0';
+    if (too_long) {
+      int cap_words = (int)((double)per_clip_sec * lang_speech_units_per_sec(lang_code) + 0.5);
+      note_append(note, sizeof(note), &no,
+                  "CRITICAL LENGTH RULE: the previous narrations added up to about %d seconds "
+                  "of speech, but this whole video must be about %d seconds (%.0f minutes) - "
+                  "that is at most about %d words per narration. Keep the SAME clip windows, "
+                  "keep every important event, but rewrite the narrations SHORTER: no detail "
+                  "that is not needed to follow the story, never more than %d words in one "
+                  "clip. ",
+                  (int)speech, (int)target_sec, cfg->recap_minutes, cap_words, cap_words);
+    } else if (too_short) {
+      int mn = 0, mx = 0;
+      clip_seconds_range(per_clip_sec, &mn, &mx);
+      double per_sec = lang_speech_units_per_sec(lang_code);
+      bool in_chars = lang_counts_chars(lang_code);
+      note_append(note, sizeof(note), &no,
+                  "CRITICAL LENGTH RULE: the narrations of the previous answer added up to "
+                  "only about %d seconds of speech, but the target for this video is about "
+                  "%d seconds (%.0f minutes). Every clip must carry a FULL narration of "
+                  "roughly %d-%d %s (a %d to %d second clip needs that much speech) - not "
+                  "one line, not a short summary. Rewrite the whole plan with full-length "
+                  "narrations and keep the same JSON shape. ",
+                  (int)speech, (int)target_sec, cfg->recap_minutes,
+                  (int)((double)mn * per_sec + 0.5), (int)((double)mx * per_sec + 0.5),
+                  in_chars ? "characters" : "words", mn, mx);
+    }
+    if (sus > 0)
+      note_append(note, sizeof(note), &no,
+                  "CHARACTER NAMES: the previous answer names character(s) that do not "
+                  "appear anywhere in INPUT C: %s. Use the exact names and the exact "
+                  "spelling of INPUT C for every character, and name only the characters "
+                  "who take part in that clip's own moment. ",
+                  suspects);
+    if (copies_bad)
+      note_append(note, sizeof(note), &no,
+                  "RETOLD STORY: %d of the %zu narrations repeat a subtitle line word for "
+                  "word. The narration must tell the story in your own words, never read "
+                  "the subtitles out. ",
+                  copied, plan->count);
+    if (no_outro)
+      note_append(note, sizeof(note), &no,
+                  "ENDING: the LAST narration must finish the story and then end exactly "
+                  "with: \"%s\" ", tail);
+
+    logw("Asking the model once more for a corrected plan (%s).",
+         too_long ? "too long" : too_short ? "too short" :
+         sus > 0 ? "character names" : copies_bad ? "subtitle copying" : "the closing line");
+    double old_score = plan_audit_score(plan, lang_code, want_length ? budget_sec : 0.0,
+                                        plot_summary, english ? subs_seconds : NULL, tail,
+                                        NULL, NULL);
+    g_batch_bypass_lookup = true;
+    ClipPlanList better = openai_make_plan(cfg, movie_title, subs_seconds,
+                                           script_text ? script_text : "",
+                                           plot_summary ? plot_summary : "",
+                                           subs_placeholder, num_clips, per_clip_sec,
+                                           NULL, NULL, note);
+    if (better.count > 0) {
+      double new_score = plan_audit_score(&better, lang_code, want_length ? budget_sec : 0.0,
+                                          plot_summary, english ? subs_seconds : NULL, tail,
+                                          NULL, NULL);
+      if (new_score + 0.02 < old_score) {
+        logok("The corrected plan is closer to the rules (score %.2f -> %.2f).",
+              old_score, new_score);
+        cap_clip_plan_to_max(&better, num_clips, lang_code);
+        free_clip_plan_list(plan);
+        *plan = better;
+      } else {
+        logw("The corrected plan was not better (score %.2f vs %.2f) - keeping the first.",
+             new_score, old_score);
+        free_clip_plan_list(&better);
+      }
+    } else {
+      logw("The model did not return a usable corrected plan - keeping the first one.");
+    }
+  }
+
+  /* Deterministic guarantee: never render more speech than the target. */
+  if (want_length) {
+    speech = plan_speech_seconds(plan->items, plan->count, lang_code);
+    if (speech > budget_sec * 1.02) {
+      cap_plan_narration_length(plan, target_sec, overlap, lang_code, cfg->recap_language);
+      speech = plan_speech_seconds(plan->items, plan->count, lang_code);
+    }
+    if (speech > budget_sec * 1.05)
+      logw("Even after trimming the narrations hold %.1f min of speech for the %.0f min "
+           "target - the model ignored the length rule by too much. Try a stronger model, "
+           "or lower min_clips/max_clips so the plan starts smaller.",
+           speech / 60.0, cfg->recap_minutes);
+    else if (!too_short && speech < budget_sec * 0.85)
+      logw("The narrations hold %.1f min of speech for the %.0f min target - expect a "
+           "recap near %.1f min. A stronger model, fewer clips (min_clips/max_clips) or a "
+           "lower max_video_speedup change this.",
+           speech / 60.0, cfg->recap_minutes, speech / 60.0);
+  }
+}
+
 static bool process_movie(const Config *cfg, const char *movie_path, const char *movie_title,
                           int num_clips, int movie_index, int movie_total,
                           const char *out_suffix, bool retire_after) {
@@ -6944,63 +7833,14 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
            cfg->recap_language);
   }
 
-  /* Length audit.  With "recap_minutes" set, the narrations have to add up to
-     the requested speaking time: a model that writes one-liners per clip makes
-     the video come out far shorter than asked (the clip is sped up at most
-     max_video_speedup and then cut down to the narration). */
-  if (per_clip_sec > 0 && cfg->recap_minutes >= 1.0 && plan.count > 0) {
-    double target_sec = cfg->recap_minutes * 60.0;
-    double speech = plan_speech_seconds(plan.items, plan.count, lang_code);
-    logi("Plan speech: about %.1f min of narration for the %.0f min target (%zu clips).",
-         speech / 60.0, cfg->recap_minutes, plan.count);
-
-    if (speech > target_sec * 1.5) {
-      logw("The narrations add up to %.1f min of speech for the %.0f min target - "
-           "about %.1fx too long. Clips are sped up at most max_video_speedup and "
-           "then cut to the narration, so expect a longer recap than asked.",
-           speech / 60.0, cfg->recap_minutes, speech / target_sec);
-    } else if (speech < target_sec * 0.8) {
-      int mn = 0, mx = 0;
-      clip_seconds_range(per_clip_sec, &mn, &mx);
-      double per_sec = lang_speech_units_per_sec(lang_code);
-      bool in_chars = lang_counts_chars(lang_code);
-      const char *unit = in_chars ? "characters" : "words";
-      char len_note[900];
-      snprintf(len_note, sizeof(len_note),
-               "CRITICAL LENGTH RULE: the narrations of the previous answer added up to "
-               "only about %d seconds of speech, but the target for this video is about "
-               "%d seconds (%.0f minutes). Every clip must carry a FULL narration of "
-               "roughly %d-%d %s (a %d to %d second clip needs that much speech) - not "
-               "one line, not a short summary. Rewrite the whole plan with full-length "
-               "narrations and keep the same JSON shape.",
-               (int)speech, (int)target_sec, cfg->recap_minutes,
-               (int)((double)mn * per_sec + 0.5), (int)((double)mx * per_sec + 0.5),
-               unit, mn, mx);
-      logw("The narrations are much shorter than the %.0f minute target (%.1f min of "
-           "speech) - asking the model once more for full-length narrations.",
-           cfg->recap_minutes, speech / 60.0);
-      g_batch_bypass_lookup = true;
-      ClipPlanList longer = openai_make_plan(cfg, movie_title, subs_seconds,
-                                             imsdb_script ? imsdb_script : "",
-                                             plot_summary ? plot_summary : "",
-                                             subs_placeholder, num_clips, per_clip_sec,
-                                             NULL, NULL, len_note);
-      double speech2 = longer.count ? plan_speech_seconds(longer.items, longer.count, lang_code) : 0.0;
-      if (longer.count > 0 && speech2 > speech) {
-        logok("Second attempt: about %.1f min of narration (was %.1f min).",
-              speech2 / 60.0, speech / 60.0);
-        free_clip_plan_list(&plan);
-        plan = longer;
-        speech = speech2;
-      } else {
-        free_clip_plan_list(&longer);
-        logw("The model still wrote short narrations - expect a recap near %.1f min "
-             "instead of %.0f min. A stronger model, fewer clips (min_clips/max_clips) "
-             "or a lower max_video_speedup change this.",
-             speech / 60.0, cfg->recap_minutes);
-      }
-    }
-  }
+  /* Length guarantee + script-quality audit: one combined re-ask when the plan
+     breaks a rule, then a deterministic cap of the narration length so the
+     finished recap cannot come out longer than the requested minutes. */
+  audit_plan_length_and_script(cfg, movie_title, subs_seconds,
+                               imsdb_script ? imsdb_script : "",
+                               plot_summary ? plot_summary : "",
+                               subs_placeholder, num_clips, per_clip_sec,
+                               lang_code, &plan);
 
   if (plan.count == 0 && !cfg->offline_planner) {
     logw("No AI clip plan for %s - skipping this movie instead of turning the raw "
@@ -7131,12 +7971,24 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   snprintf(tmp_concat, sizeof(tmp_concat), "clips/%s_concat_tmp.mp4", movie_title);
 
   report_progress(GEN_STAGE_CONCAT, movie_index, movie_total, 0, (int)made, movie_title);
-  logi("Concatenating clips -> %s", tmp_concat);
-  if (!ffmpeg_concat_videos(concat_list_path, tmp_concat)) {
-    logw("Concat failed for %s", movie_title);
-    return false;
+  logi("Joining clips -> %s", tmp_concat);
+  bool joined = false;
+  if (cfg->transitions && made >= 2) {
+    logi("Smooth scene changes: %.2f s crossfade between clips (set \"transitions\": false "
+         "to go back to hard cuts).", cfg->transition_seconds);
+    joined = ffmpeg_merge_with_transitions(concat_list_path, tmp_concat, movie_title,
+                                           cfg->transition_seconds, frame_w, frame_h);
+    if (joined) logok("Joined with crossfades: %s", tmp_concat);
   }
-  logok("Concat OK: %s", tmp_concat);
+  if (!joined) {
+    if (cfg->transitions && made >= 2)
+      logw("Crossfade join did not work - falling back to hard cuts.");
+    if (!ffmpeg_concat_videos(concat_list_path, tmp_concat)) {
+      logw("Concat failed for %s", movie_title);
+      return false;
+    }
+    logok("Concat OK: %s", tmp_concat);
+  }
 
   double final_dur = ffprobe_duration_seconds(tmp_concat);
   if (final_dur <= 0.1) {

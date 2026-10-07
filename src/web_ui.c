@@ -694,10 +694,12 @@ static cJSON *config_read_json(void) {
   ADD_NUM("bgm_volume",        "bgm_volume",        0.1);
   ADD_NUM("recap_minutes",     "recap_minutes",     0);
   ADD_NUM("tts_rate",          "tts_rate",          110);
+  ADD_NUM("transition_seconds", "transition_seconds", 0.35);
 
   ADD_BOOL("bgm_enabled",   "bgm_enabled",   true);
   ADD_BOOL("make_vertical", "make_vertical", true);
   ADD_BOOL("captions",        "captions",        true);
+  ADD_BOOL("transitions",     "transitions",     true);
   ADD_BOOL("retire_movies", "retire_movies", true);
   ADD_BOOL("auto_transcribe", "auto_transcribe", true);
   ADD_BOOL("use_wikipedia_plot", "use_wikipedia_plot", true);
@@ -755,7 +757,7 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
 
   const char *num_keys[] = {
     "min_clips", "max_clips", "max_video_speedup", "narration_volume", "bgm_volume",
-    "recap_minutes", "tts_rate", NULL
+    "recap_minutes", "tts_rate", "transition_seconds", NULL
   };
   for (int i = 0; num_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, num_keys[i]);
@@ -765,7 +767,7 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
     else cJSON_AddNumberToObject(root, num_keys[i], v->valuedouble);
   }
 
-  const char *bool_keys[] = { "bgm_enabled", "make_vertical", "retire_movies", "captions", "auto_transcribe",
+  const char *bool_keys[] = { "bgm_enabled", "make_vertical", "retire_movies", "captions", "transitions", "auto_transcribe",
                              "use_wikipedia_plot", "offline_planner", "batch_planning", NULL };
   for (int i = 0; bool_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, bool_keys[i]);
@@ -1012,6 +1014,8 @@ static const char *PAGE_HTML[] = {
   "      <label class='chk'><input type='checkbox' id='bgm_enabled'> Background music</label>",
   "      <label class='chk'><input type='checkbox' id='make_vertical'> Also render vertical 9:16</label>",
   "      <label class='chk'><input type='checkbox' id='captions'> Burn-in small subtitles</label>",
+  "      <label class='chk'><input type='checkbox' id='transitions'> Smooth scene changes <span class='hint'>crossfade between clips instead of hard cuts</span></label>",
+  "      <div><label class='f'>Crossfade seconds</label><input type='number' id='transition_seconds' step='0.05' min='0.1' max='1.5'></div>",
   "      <label class='chk'><input type='checkbox' id='use_wikipedia_plot'> Fetch the plot summary from Wikipedia <span class='hint'>names come from a real text</span></label>",
   "      <label class='f'>Wikipedia API <span class='hint'>empty = pick the language automatically from the narration language</span></label>",
   "      <input type='text' id='wikipedia_base_url' placeholder='https://en.wikipedia.org/w/api.php'>",
@@ -1143,8 +1147,8 @@ static const char *PAGE_HTML[] = {
   "  var texts = ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
   "               'tts_base_url','tts_voice','tts_language','tts_model','whisper_model','caption_font',",
   "               'caption_font_zh','caption_font_ar','caption_font_es','wikipedia_base_url'];",
-  "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','tts_rate'];",
-  "  var bools = ['bgm_enabled','make_vertical','retire_movies','captions','use_wikipedia_plot','offline_planner','batch_planning'];",
+  "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','tts_rate','transition_seconds'];",
+  "  var bools = ['bgm_enabled','make_vertical','retire_movies','captions','transitions','use_wikipedia_plot','offline_planner','batch_planning'];",
   "  texts.forEach(function(k){ el(k).value = c[k] || ''; });",
   "  nums.forEach(function(k){ el(k).value = c[k]; });",
   "  bools.forEach(function(k){ el(k).checked = !!c[k]; });",
@@ -1272,8 +1276,8 @@ static const char *PAGE_HTML[] = {
   "  if (el('lang_es').checked) rl.push('Spanish (neutral Latin American)');",
   "  if (!rl.length) rl.push('');",
   "  body.recap_languages = rl;",
-  "  ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','tts_rate'].forEach(function(k){ body[k] = Number(el(k).value); });",
-  "  ['bgm_enabled','make_vertical','retire_movies','captions','use_wikipedia_plot','offline_planner','batch_planning'].forEach(function(k){ body[k] = el(k).checked; });",
+  "  ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','tts_rate','transition_seconds'].forEach(function(k){ body[k] = Number(el(k).value); });",
+  "  ['bgm_enabled','make_vertical','retire_movies','captions','transitions','use_wikipedia_plot','offline_planner','batch_planning'].forEach(function(k){ body[k] = el(k).checked; });",
   "  if (el('open_api_key').value) body.open_api_key = el('open_api_key').value;",
   "  if (el('elevenlabs_api_key').value) body.elevenlabs_api_key = el('elevenlabs_api_key').value;",
   "  if (el('tts_api_key').value) body.tts_api_key = el('tts_api_key').value;",

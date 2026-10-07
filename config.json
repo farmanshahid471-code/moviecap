@@ -22,6 +22,8 @@
   "recap_minutes": 0,
   "tts_rate": 110,
   "captions": true,
+  "transitions": true,
+  "transition_seconds": 0.35,
   "auto_transcribe": true,
   "whisper_model": "small",
   "use_wikipedia_plot": true,
