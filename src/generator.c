@@ -4084,6 +4084,9 @@ static MemBuf openai_post_plan_responses(const Config *cfg, const char *endpoint
   return resp;
 }
 
+static void cap_clip_plan_to_max(ClipPlanList *lst, int max_clips,
+                                 const char *lang_code);          /* further down */
+
 static ClipPlanList openai_make_plan(const Config *cfg,
                                      const char *movie_title,
                                      const char *subs_seconds_text,
@@ -4305,10 +4308,21 @@ static ClipPlanList openai_make_plan(const Config *cfg,
              num_clips, (double)num_clips * (double)per_clip_sec / 60.0, total_words);
   }
 
+  /* The count is repeated as a hard limit at the top of the prompt: a model
+     that overshoots (249 clips for a 111-clip target in a user run) makes the
+     recap many times longer than the requested minutes. */
+  char count_line[420];
+  snprintf(count_line, sizeof(count_line),
+           "- HARD LIMIT: the \"clips\" array must hold EXACTLY %d clip objects. "
+           "Write that last clip and stop - do not continue the story after it. "
+           "More clips make the video longer than the length set above.\n",
+           num_clips);
+
   const char *prompt_fmt =
     "Movie: %s\n"
     "Narration language: %s\n"
     "Number of clips: %d\n"
+    "%s"
     "Target clip length: %d-%d seconds each\n"
     "%s"
     "\n"
@@ -4400,6 +4414,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
                       title_utf8,          /* Movie:                    */
                       lang_label,          /* Narration language:       */
                       num_clips,           /* Number of clips:          */
+                      count_line,          /* the hard clip limit       */
                       min_sec, max_sec,    /* Target clip length:       */
                       language_rule,
                       subs_trim,           /* INPUT A                   */
@@ -4423,7 +4438,8 @@ static ClipPlanList openai_make_plan(const Config *cfg,
   char *prompt = (char *)malloc((size_t)plen + plot_len + demand_len + 1);
   if (!prompt) die("OOM");
   snprintf(prompt, (size_t)plen + plot_len + 1, prompt_fmt,
-           title_utf8, lang_label, num_clips, min_sec, max_sec, language_rule,
+           title_utf8, lang_label, num_clips, count_line, min_sec, max_sec,
+           language_rule,
            subs_trim, placeholder_note, scr_trim, title_utf8, plot_trim,
            title_utf8, closing_line, closing_extra, pace_line, words_extra,
            total_line, num_clips, min_sec, max_sec);
@@ -4581,6 +4597,7 @@ static ClipPlanList openai_make_plan(const Config *cfg,
               ClipPlanList plan = parse_clip_plan_json(out_text);
               free(out_text);
               if (plan.count > 0) {
+                cap_clip_plan_to_max(&plan, num_clips, recap_lang_code(cfg->recap_language));
                 logok("Using the batched plan for %s [%s] (%zu clips) - no live API "
                       "call, 50%% cheaper.", movie_title, batch_lang_label(cfg),
                       plan.count);
@@ -4737,6 +4754,9 @@ have_response:;
     }
     free(r2.data);
   }
+
+  if (plan.count > 0)
+    cap_clip_plan_to_max(&plan, num_clips, recap_lang_code(cfg->recap_language));
 
   free(out_text);
   free(chat_body);
@@ -6263,6 +6283,104 @@ static double plan_speech_seconds(const ClipPlan *items, size_t n, const char *c
   return per_sec > 0.0 ? units / per_sec : 0.0;
 }
 
+static int cmp_clip_start(const void *a, const void *b) {
+  const ClipPlan *x = (const ClipPlan *)a, *y = (const ClipPlan *)b;
+  return (x->start > y->start) - (x->start < y->start);
+}
+
+/* Models sometimes answer with far more clips than the target - a user run
+   asked for 111 clips and the reply held 249, which made the finished recap
+   45.9 minutes long instead of the requested 20.  Asking again would spend
+   money and may shorten the story, so the plan is merged down instead: the
+   cheapest neighbouring pairs (shortest combined span) are fused until the
+   count fits.  A fused clip spans the whole group and carries ALL of its
+   narration, so every event stays in the video - only the cut points change.
+   The narration-to-window ratio of a fused clip is the same as the two it
+   came from, so the pacing (and the speed-cap) is unaffected.
+   Call with the per-run target (num_clips); it returns without touching the
+   plan when the count already fits. */
+static void cap_clip_plan_to_max(ClipPlanList *lst, int max_clips,
+                                 const char *lang_code) {
+  if (!lst || lst->count == 0 || max_clips <= 0) return;
+  if (lst->count <= (size_t)max_clips) return;
+
+  size_t n = lst->count;
+  double before = plan_speech_seconds(lst->items, n, lang_code);
+  logw("The model answered with %zu clips for a %d-clip target (%.1fx too many): "
+       "that plan would make the recap far longer than the requested length. "
+       "Merging neighbouring clips into %d clips - the narration is kept whole, "
+       "so no part of the story is lost.", n, max_clips,
+       (double)n / (double)max_clips, max_clips);
+
+  ClipPlan *tmp = (ClipPlan *)calloc(n, sizeof(ClipPlan));
+  size_t *gs = (size_t *)calloc(n, sizeof(size_t));
+  size_t *ge = (size_t *)calloc(n, sizeof(size_t));
+  if (!tmp || !gs || !ge) die("OOM");
+  for (size_t i = 0; i < n; i++) tmp[i] = lst->items[i];
+
+  /* Playing order first: a model that appends a scene from the beginning must
+     still come out in chronological order after the merge. */
+  qsort(tmp, n, sizeof(ClipPlan), cmp_clip_start);
+
+  size_t ng = 0;
+  for (size_t i = 0; i < n; i++) { gs[ng] = i; ge[ng] = i; ng++; }
+
+  while (ng > (size_t)max_clips) {
+    size_t best = 0;
+    int best_span = -1;
+    for (size_t i = 0; i + 1 < ng; i++) {
+      int span = tmp[ge[i + 1]].end - tmp[gs[i]].start;
+      if (best_span < 0 || span < best_span) { best = i; best_span = span; }
+    }
+    ge[best] = ge[best + 1];
+    for (size_t i = best + 1; i + 1 < ng; i++) { gs[i] = gs[i + 1]; ge[i] = ge[i + 1]; }
+    ng--;
+  }
+
+  ClipPlanList out;
+  out.items = (ClipPlan *)calloc(ng, sizeof(ClipPlan));
+  if (!out.items) die("OOM");
+  out.count = ng;
+  for (size_t j = 0; j < ng; j++) {
+    out.items[j].start = tmp[gs[j]].start;
+    out.items[j].end   = tmp[ge[j]].end;
+    if (out.items[j].end <= out.items[j].start)
+      out.items[j].end = out.items[j].start + 1;
+    size_t len = 1;
+    for (size_t k = gs[j]; k <= ge[j]; k++) {
+      const char *t = tmp[k].narration ? tmp[k].narration : "";
+      len += strlen(t) + 1;
+    }
+    char *buf = (char *)malloc(len);
+    if (!buf) die("OOM");
+    size_t at = 0;
+    for (size_t k = gs[j]; k <= ge[j]; k++) {
+      const char *t = tmp[k].narration ? tmp[k].narration : "";
+      size_t tl = strlen(t);
+      if (!tl) continue;
+      if (at) buf[at++] = ' ';
+      memcpy(buf + at, t, tl);
+      at += tl;
+    }
+    buf[at] = '\0';
+    out.items[j].narration = buf;
+  }
+
+  /* The plan now owns the joined narrations; release the originals. */
+  for (size_t i = 0; i < n; i++) free(lst->items[i].narration);
+  free(lst->items);
+  lst->items = out.items;
+  lst->count = out.count;
+
+  logok("Clip count corrected: %zu -> %zu clips (was about %.1f min of "
+        "narration, now %.1f min).", n, out.count, before / 60.0,
+        plan_speech_seconds(out.items, out.count, lang_code) / 60.0);
+
+  free(tmp);
+  free(gs);
+  free(ge);
+}
+
 /* Find a user-provided SRT whose name approximately matches the movie title.
  * Names are normalized to lowercase alphanumerics, so "Toy Story 5 (2026)
  * [1080p].mp4" matches "Toy Story 5.srt". Files ending in _modified.srt or
@@ -6836,7 +6954,12 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     logi("Plan speech: about %.1f min of narration for the %.0f min target (%zu clips).",
          speech / 60.0, cfg->recap_minutes, plan.count);
 
-    if (speech < target_sec * 0.8) {
+    if (speech > target_sec * 1.5) {
+      logw("The narrations add up to %.1f min of speech for the %.0f min target - "
+           "about %.1fx too long. Clips are sped up at most max_video_speedup and "
+           "then cut to the narration, so expect a longer recap than asked.",
+           speech / 60.0, cfg->recap_minutes, speech / target_sec);
+    } else if (speech < target_sec * 0.8) {
       int mn = 0, mx = 0;
       clip_seconds_range(per_clip_sec, &mn, &mx);
       double per_sec = lang_speech_units_per_sec(lang_code);
@@ -7035,6 +7158,12 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
            "spoken lines were too short for their clip ranges. Try a stronger model, "
            "fewer clips (min_clips/max_clips), or set \"recap_minutes\": 0.",
            cfg->recap_minutes, cfg->max_video_speedup);
+    else if (final_dur > want * 1.15)
+      logw("This recap came out longer than the %.0f minutes asked for (%.1f min). "
+           "The plan held too many clips or its narrations were longer than their "
+           "clip ranges; the log above names which. Lower max_clips so the model "
+           "plans fewer clips, or check the model did not ignore the clip count.",
+           cfg->recap_minutes, final_dur / 60.0);
   }
 
   /* Cancelled after the clips were joined: keep the recap we already have and

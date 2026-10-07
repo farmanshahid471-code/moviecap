@@ -1167,6 +1167,122 @@ static void test_openai_no_limit_means_no_extra_requests(void) {
   free_clip_plan_list(&plan);
 }
 
+
+/* ------------------------------------------- plan count / length enforcement */
+
+static void test_oversized_plan_is_merged_to_the_target(void) {
+  ClipPlanList lst;
+  lst.count = 10;
+  lst.items = (ClipPlan *)calloc(10, sizeof(ClipPlan));
+  for (int i = 0; i < 10; i++) {
+    lst.items[i].start = 100 + i * 12;
+    lst.items[i].end   = 100 + i * 12 + 10;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Event %02d.", i + 1);
+    lst.items[i].narration = str_dup(buf);
+  }
+  cap_clip_plan_to_max(&lst, 4, "en");
+  ck(lst.count == 4, "a 10-clip plan asked for 4 clips comes back with 4");
+  ck(lst.items[0].start == 100, "the merged plan still starts at the first clip");
+  ck(lst.items[3].end == 100 + 9 * 12 + 10,
+     "the merged plan still ends at the last clip");
+  bool all_kept = true;
+  char joined[512];
+  joined[0] = '\0';
+  for (size_t i = 0; i < lst.count; i++) {
+    if (strlen(joined) + strlen(lst.items[i].narration) + 2 < sizeof(joined))
+      strcat(joined, lst.items[i].narration);
+    strcat(joined, " ");
+  }
+  for (int i = 1; i <= 10; i++) {
+    char tag[16];
+    snprintf(tag, sizeof(tag), "Event %02d", i);
+    if (!strstr(joined, tag)) all_kept = false;
+  }
+  ck(all_kept, "merging keeps every narration - no event of the story is dropped");
+  free_clip_plan_list(&lst);
+}
+
+static void test_plan_within_the_target_is_untouched(void) {
+  ClipPlanList lst;
+  lst.count = 3;
+  lst.items = (ClipPlan *)calloc(3, sizeof(ClipPlan));
+  for (int i = 0; i < 3; i++) {
+    lst.items[i].start = 50 + i * 12;
+    lst.items[i].end   = 50 + i * 12 + 10;
+    lst.items[i].narration = str_dup("A scene.");
+  }
+  cap_clip_plan_to_max(&lst, 111, "en");
+  ck(lst.count == 3, "a plan below the target is not padded or changed");
+  ck_str(lst.items[1].narration, "A scene.", "the narrations are exactly as written");
+  free_clip_plan_list(&lst);
+}
+
+static void queue_ok_big(const char *text) {
+  size_t need = strlen(text) + 512;
+  char *buf = (char *)malloc(need);
+  if (!buf) exit(2);
+  snprintf(buf, need,
+           "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\","
+           "\"model\":\"claude-sonnet-4-5\",\"stop_reason\":\"end_turn\","
+           "\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],"
+           "\"usage\":{\"input_tokens\":10,\"output_tokens\":20}}", text);
+  stub_queue_reply(200, buf);
+  free(buf);
+}
+
+static void test_openai_plan_249_clips_for_111_target(void) {
+  /* Reproduces the user's run 3: target 111 clips (config allows 80-120),
+     model replies with 249.  The accepted plan must honour the target. */
+  size_t need = 249 * 140 + 512;
+  char *json = (char *)malloc(need);
+  if (!json) exit(2);
+  size_t at = 0;
+  at += (size_t)snprintf(json + at, need - at, "{\\\"clips\\\":[");
+  for (int i = 0; i < 249; i++) {
+    at += (size_t)snprintf(json + at, need - at,
+                           "%s{\\\"start\\\":%d,\\\"end\\\":%d,\\\"narration\\\":"
+                           "\\\"Part %03d of the tale continues here with what happens "
+                           "next in the movie.\\\"}",
+                           i ? "," : "", 12 + i * 12, 12 + i * 12 + 10, i + 1);
+  }
+  snprintf(json + at, need - at, "]}");
+
+  stub_reset();
+  stub_set_default_reply(500, "{\"type\":\"error\",\"error\":{\"message\":\"unexpected\"}}");
+  queue_ok_big(json);
+  free(json);
+
+  g_batch_collect = false;
+  g_batch_render = false;
+  g_batch_bypass_lookup = false;
+
+  Config c = cfg_for("https://api.anthropic.com/v1", "claude-sonnet-4-5",
+                     "sk-ant-api03-testkey");
+  snprintf(c.recap_language, sizeof(c.recap_language), "English");
+  c.recap_minutes = 20.0;
+
+  ClipPlanList plan = openai_make_plan(&c, "Toy Story 5 (2026)",
+                                       "1\n12 --> 20\nThe story starts here.\n\n",
+                                       "", "", false, 111, 10, NULL, NULL, NULL);
+  ck(plan.count == 111, "249 clips for a 111-clip target are merged down to 111");
+  ck(plan.count <= 120, "the accepted plan stays inside max_clips");
+  ck(plan.items[0].start == 12, "the merged plan starts where the movie starts");
+  ck(plan.items[plan.count - 1].end == 12 + 248 * 12 + 10,
+     "the merged plan still reaches the end of the story");
+  ck(plan.items[0].narration != NULL &&
+     strstr(plan.items[0].narration, "Part 001") != NULL,
+     "the first clip of the story is still narrated");
+  ck(plan.items[plan.count - 1].narration != NULL &&
+     strstr(plan.items[plan.count - 1].narration, "Part 249") != NULL,
+     "the last clip of the story is still narrated");
+  bool contiguous = true;
+  for (size_t i = 1; i < plan.count; i++)
+    if (plan.items[i].start < plan.items[i - 1].start) contiguous = false;
+  ck(contiguous, "the merged plan is in playing order");
+  free_clip_plan_list(&plan);
+}
+
 int main(void) {
   test_endpoint_shapes();
   test_native_claude_request();
@@ -1189,6 +1305,9 @@ int main(void) {
   test_openai_reasoning_model_asked_again_with_room();
   test_openai_reasoning_model_then_drops_effort();
   test_openai_provider_ceiling_is_obeyed();
+  test_oversized_plan_is_merged_to_the_target();
+  test_plan_within_the_target_is_untouched();
+  test_openai_plan_249_clips_for_111_target();
   test_openai_no_limit_means_no_extra_requests();
   test_batch_custom_id_shape();
   test_batch_collect_then_render();

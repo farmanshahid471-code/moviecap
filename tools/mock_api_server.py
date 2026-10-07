@@ -36,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 _TRUNCATE_FIRST_BATCH = False      # set from --truncate-first-batch
 _REASONING_FIRST_REPLY = False     # set from --reasoning-first-reply
+_OVERSIZED_FIRST_PLAN = False      # set from --oversized-first-plan
 
 STATE = {"plans": 0, "responses": 0, "tts": 0, "wiki_searches": 0, "wiki_extracts": 0,
          "batches": {}, "batch_seq": 0, "truncate_first_batch": False,
@@ -340,6 +341,19 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             })
 
         wanted = 8
+        prompt = ""
+        for item in body.get("input", []):
+            if item.get("role") == "user":
+                prompt = item.get("content", "")
+        m = re.search(r"Number of clips:\s*(\d+)", prompt or "")
+        if m:
+            wanted = max(1, int(m.group(1)))
+        if _OVERSIZED_FIRST_PLAN and STATE["responses"] <= 1:
+            over = wanted * 3
+            print(f"[mock-openai] replying with {over} clips for the {wanted}-clip "
+                  f"target (oversized plan, like the reported 249-for-111 run)",
+                  flush=True)
+            wanted = over
         plan = build_plan(body, wanted)
         text = json.dumps(plan)
         with STATE["lock"]:
@@ -579,6 +593,11 @@ def main():
                          "incomplete, incomplete_details.reason=max_output_tokens, "
                          "and an output array holding nothing but a reasoning "
                          "item. Later calls answer normally.")
+    ap.add_argument("--oversized-first-plan", action="store_true",
+                    help="answer the FIRST /responses call with THREE times the "
+                         "clips the prompt asks for - the reported run where the "
+                         "model planned 249 clips for a 111-clip (20 minute) "
+                         "target. Later calls answer normally.")
     ap.add_argument("--truncate-first-batch", action="store_true",
                     help="answer the FIRST batch with a reply that stops at the "
                          "output limit (stop_reason=max_tokens), the way an "
@@ -586,9 +605,10 @@ def main():
                          "completely. Used to test the escalation path.")
     args = ap.parse_args()
 
-    global _TRUNCATE_FIRST_BATCH, _REASONING_FIRST_REPLY
+    global _TRUNCATE_FIRST_BATCH, _REASONING_FIRST_REPLY, _OVERSIZED_FIRST_PLAN
     _TRUNCATE_FIRST_BATCH = bool(args.truncate_first_batch)
     _REASONING_FIRST_REPLY = bool(args.reasoning_first_reply)
+    _OVERSIZED_FIRST_PLAN = bool(args.oversized_first_plan)
 
     a = ThreadingHTTPServer(("127.0.0.1", args.openai_port), OpenAIHandler)
     b = ThreadingHTTPServer(("127.0.0.1", args.eleven_port), ElevenHandler)

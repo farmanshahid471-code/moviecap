@@ -655,6 +655,77 @@ jobs:
           if (-not $vid) { Write-Host "::error title=pthink::no video was rendered"; exit 1 }
           Write-Host "thinking-model recovery OK: no token limit imposed, unfinished reply retried with 128000, video rendered"
 
+      - name: "Test an oversized clip plan is merged back to the configured count"
+        shell: pwsh
+        run: |
+          # The reported failure: the config asked for 111 clips (a 20 minute
+          # recap), the model planned 249, and the run rendered all 249 - the
+          # "20 minute" recap came out at 45.9 minutes of narration.  An
+          # oversized plan must be brought back to the configured clip count.
+          $ErrorActionPreference = 'Continue'
+          $pg = Join-Path (Get-Location) "pbig"
+          New-Item -ItemType Directory -Force "$pg\movies" | Out-Null
+          New-Item -ItemType Directory -Force "$pg\scripts\srt_files" | Out-Null
+          Copy-Item build\Release\movie_summary_cli.exe $pg\
+          Copy-Item -Recurse resources $pg\resources
+          '{"open_api_key":"sk-mock-plan","openai_base_url":"http://127.0.0.1:9200/v1","openai_model":"gpt-5.2","tts_provider":"piper","min_clips":4,"max_clips":4,"recap_minutes":0,"use_wikipedia_plot":false,"auto_transcribe":false}' | Set-Content "$pg\config.json"
+          $lines = @()
+          $idx = 1
+          for ($t = 0; $t -lt 58; $t += 2) {
+            $lines += "$idx"
+            $lines += ("00:00:{0:D2},000 --> 00:00:{1:D2},000" -f $t, ($t + 2))
+            $lines += "Scene $t - the story moves forward here."
+            $lines += ""
+            $idx++
+          }
+          ($lines -join "`r`n") | Set-Content "$pg\scripts\srt_files\Big Plan 2026 1080p.srt"
+          & "C:\ProgramData\chocolatey\bin\ffmpeg.exe" -hide_banner -loglevel error -f lavfi -i testsrc=size=640x360:duration=120 -c:v libx264 "$pg\movies\Big Plan (2026).mp4"
+          if ($LASTEXITCODE -ne 0) { throw "ffmpeg could not build the test movie" }
+
+          $srv = Start-Process -FilePath "python" `
+            -ArgumentList "tools/mock_api_server.py","--openai-port","9200","--eleven-port","9201","--tts-port","8021","--wiki-port","9202","--oversized-first-plan" `
+            -PassThru -RedirectStandardOutput "mockbig.log" -RedirectStandardError "mockbig.err"
+          Start-Sleep -Seconds 4
+          try {
+            $env:Path = "C:\ProgramData\chocolatey\bin;C:\Windows\System32;C:\Windows"
+            Push-Location $pg
+            .\movie_summary_cli.exe 2>&1 | Tee-Object -FilePath ..\pbig.log
+            $rc = $LASTEXITCODE
+            Pop-Location
+          } finally {
+            Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+          }
+          $tail = (Get-Content pbig.log -Tail 12) -join " ||| "
+          Write-Host "::warning title=pbig-tail::$tail"
+          Get-Content mockbig.log -Tail 10 | ForEach-Object { Write-Host "::notice title=mockbig:: $_" }
+          if ($rc -ne 0) { Write-Host "::error title=pbig::cli exited $rc"; exit 1 }
+
+          # 1. the mock really did overshoot: 12 clips for a 4-clip target
+          if (-not (Select-String -Path mockbig.log -Pattern "replying with 12 clips for the 4-clip target" -Quiet)) {
+            Write-Host "::error title=pbig::the oversized plan was never served - the test did not run"
+            exit 1 }
+          # 2. the app merged it back to the configured count instead of using it
+          if (-not (Select-String -Path pbig.log -Pattern "Clip count corrected: 12 -> 4 clips" -Quiet)) {
+            Write-Host "::error title=pbig::the oversized plan was not corrected"
+            exit 1 }
+          if (-not (Select-String -Path pbig.log -Pattern "Clip plan ready: 4 clips" -Quiet)) {
+            Write-Host "::error title=pbig::the accepted plan is not the configured count"
+            exit 1 }
+          # 3. only the corrected number of clips may reach the renderer
+          if (-not (Select-String -Path pbig.log -Pattern "Building clip 4:" -Quiet)) {
+            Write-Host "::error title=pbig::the fourth clip was never built"
+            exit 1 }
+          if (Select-String -Path pbig.log -Pattern "Building clip 5:" -Quiet) {
+            Write-Host "::error title=pbig::a fifth clip was rendered - the oversized plan was used"
+            exit 1 }
+          if (-not (Select-String -Path pbig.log -Pattern "All done. Processed: 1" -Quiet)) {
+            Write-Host "::error title=pbig::the run did not finish the movie"; exit 1 }
+          $vid = Get-Item "$pg\output\Big Plan (2026).mp4" -ErrorAction SilentlyContinue
+          if (-not $vid) { Write-Host "::error title=pbig::no video was rendered"; exit 1 }
+          $dur = & "C:\ProgramData\chocolatey\bin\ffprobe.exe" -v error -show_entries format=duration -of csv=p=0 "$pg\output\Big Plan (2026).mp4"
+          Write-Host "pbig video: $($vid.Length) bytes, $dur s"
+          Write-Host "oversized plan OK: 12 clips merged down to 4, only 4 clips rendered, video written"
+
       - name: "Test run.bat web brings the control panel up"
         shell: pwsh
         run: |

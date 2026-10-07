@@ -693,10 +693,9 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
   - `api.anthropic.com` is not retried on the OpenAI-style `/chat/completions` path (it does not
     exist there) — the log tells you instead. For gateways that path is derived from the Anthropic
     base URL with the pasted tail, `/v1` and `/anthropic` peeled off.
-  - the OpenAI-style paths ask for a full plan too: `max_output_tokens` on the Responses API and
-    `max_completion_tokens` on `/chat/completions` (dropped automatically for providers that only
-    know `max_tokens`). If a reply still stops early, the log warns that only part of the clip plan
-    arrived instead of quietly shipping a half-length recap.
+  - the OpenAI-style paths never impose a token limit of this app's own (see the DeepSeek bullet
+    below). If a reply still stops early, the log warns that only part of the clip plan arrived
+    instead of quietly shipping a half-length recap.
   - DeepSeek's gateway maps `claude-*` model names to its own models, so a `claude-sonnet-...` model
     works against `https://api.deepseek.com/anthropic` too.
 
@@ -710,6 +709,15 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
   the recap, and it obeys any ceiling the provider names (e.g. "maximum 8192"). The model's own
   output limit is the only limit in play — raise it in your provider's dashboard if a very long recap
   still cannot be written in one reply.
+- **The clip plan is held to the configured clip count** — a model that overshoots (a user run
+  asked for 111 clips, a 20-minute recap, and the reply held 249 clips, i.e. 45.9 minutes of
+  narration) no longer gets its plan rendered as-is. The count is a hard limit in the prompt, and
+  if the reply still comes back over it the app merges neighbouring clips down to the target
+  instead of dropping clips: a merged clip spans the whole group it covers and carries **all** of
+  its narration, so no part of the story is lost and the narration-to-window ratio (the pacing and
+  the speed-cap) stays the same. The log says exactly what happened
+  (`Clip count corrected: 249 -> 111 clips`), and a narration set that is still far over the
+  requested minutes is warned about. `min_clips`/`max_clips` stay in charge of the accepted range.
 - **Batch planning (50% cheaper Claude runs)** — `"batch_planning": true` with an
   Anthropic-compatible `openai_base_url` (or the checkbox in the panel).  The recap you watch is
   identical; only the price and the waiting change:
