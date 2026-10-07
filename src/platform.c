@@ -206,7 +206,7 @@ bool plat_getcwd(char *out, size_t outsz) {
 
 bool plat_chdir(const char *path) {
   if (!path) return false;
-  wchar_t *w = utf8_to_wide(path);
+  wchar_t *w = u8_to_w(path);
   if (!w) return false;
   bool ok = (_wchdir(w) == 0);
   free(w);
