@@ -123,6 +123,16 @@ no browser extension, nothing to install. The page gives you:
 - **START GENERATION** / **CANCEL** (the run stops at the next step boundary)
 - a live **stage + progress bar** (movie 2 of 5 · clip 7 of 24 · "Narration (TTS)")
 - a **live log** with colour-coded `[INFO] / [OK] / [WARN] / [FATAL] / [ffmpeg]` lines
+- **uploads are filed by type, whichever tab is open** — a movie (`mp4`, `mkv`, `mov`, `avi`,
+  `webm`, ...) always lands in `movies\`, subtitles and scripts (`srt`, `vtt`, `ass`, `txt`, ...)
+  in `scripts\srt_files\`, music (`mp3`, `m4a`, `wav`, ...) in `backgroundmusic\`; the file list
+  jumps to the folder the file landed in. Nothing to think about: pick a movie while the
+  Subtitles tab is up and it still goes to the right place (before, it went to the wrong folder
+  and the run then reported *"No .mp4 files found in movies/"* although the upload had worked).
+  If a movie is already sitting in the wrong folder, a run adopts it — videos found in
+  `scripts\srt_files\`, `backgroundmusic\` or the project root are moved into `movies\` (and a
+  `Title.srt` left next to the movie is moved into `scripts\srt_files\`), never overwriting
+  anything
 - **every setting** in `config.json` editable in the form (API keys, models, voice,
   clip count, speed cap, music/narration volume, BGM on/off, vertical render on/off,
   auto-retire on/off, API base URLs) — keys are shown masked and are never echoed back
