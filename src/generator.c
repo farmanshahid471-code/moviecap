@@ -4794,6 +4794,32 @@ have_response:;
   return plan;
 }
 
+/* Narration speed for the clips still to be synthesized, as a multiplier on the
+   configured tts_rate.  The plan's word budget comes from an estimated pace
+   (lang_speech_units_per_sec) and a real voice can speak half again as fast as
+   that, or slower.  After the first clip the app knows the difference and
+   scales the narration speed of the rest so the recap still lands on the
+   minutes that were asked for - slowing the voice down is what turns a 13
+   minute render into the 20 minutes on the label. */
+static double g_tts_pace_scale = 1.0;
+
+/* How far the narration speed has to move for a voice speaking `real` speech
+   units per second to take the time the plan assumed (`assumed` per second).
+   Returns a multiplier for the configured tts_rate, kept inside a band that
+   still sounds like a person reading; 1.0 means "leave the voice alone". */
+static double pace_scale_for(double assumed, double real, int tts_rate) {
+  if (assumed <= 0.0 || real <= 0.0 || tts_rate <= 0) return 1.0;
+  double scale = assumed / real;                 /* a fast voice gets slowed down */
+  double lo = 60.0 / (double)tts_rate;           /* never outside 60-180% overall */
+  double hi = 180.0 / (double)tts_rate;
+  if (scale < lo) scale = lo;
+  if (scale > hi) scale = hi;
+  if (scale < 0.75) scale = 0.75;
+  if (scale > 1.33) scale = 1.33;
+  if (scale > 0.94 && scale < 1.07) return 1.0;  /* close enough - keep the voice */
+  return scale;
+}
+
 static bool elevenlabs_tts_to_mp3(const Config *cfg, const char *text, const char *out_mp3_path) {
   char url[1024];
   snprintf(url, sizeof(url),
@@ -4803,11 +4829,11 @@ static bool elevenlabs_tts_to_mp3(const Config *cfg, const char *text, const cha
   cJSON *root = cJSON_CreateObject();
   cJSON_AddStringToObject(root, "text", text);
   cJSON_AddStringToObject(root, "model_id", cfg->eleven_model_id);
-  if (cfg->tts_rate > 0 && cfg->tts_rate != 100) {
-    double sp = cfg->tts_rate / 100.0;
+  {
+    double sp = (cfg->tts_rate > 0 ? cfg->tts_rate / 100.0 : 1.0) * g_tts_pace_scale;
     if (sp < 0.7) sp = 0.7;
     if (sp > 1.2) sp = 1.2;
-    cJSON_AddNumberToObject(root, "speed", sp);
+    if (sp != 1.0) cJSON_AddNumberToObject(root, "speed", sp);
   }
   char *body = cJSON_PrintUnformatted(root);
   cJSON_Delete(root);
@@ -4931,11 +4957,11 @@ static bool tts_xtts(const Config *cfg, const char *text, const char *out_mp3_pa
   cJSON_AddStringToObject(root, "text", text);
   cJSON_AddStringToObject(root, "speaker_wav", cfg->tts_voice);
   cJSON_AddStringToObject(root, "language", cfg->tts_language);
-  if (cfg->tts_rate > 0 && cfg->tts_rate != 100) {
-    double sp = cfg->tts_rate / 100.0;
+  {
+    double sp = (cfg->tts_rate > 0 ? cfg->tts_rate / 100.0 : 1.0) * g_tts_pace_scale;
     if (sp < 0.5) sp = 0.5;
     if (sp > 2.0) sp = 2.0;
-    cJSON_AddNumberToObject(root, "speed", sp);
+    if (sp != 1.0) cJSON_AddNumberToObject(root, "speed", sp);
   }
   char *body = cJSON_PrintUnformatted(root);
   cJSON_Delete(root);
@@ -4953,11 +4979,12 @@ static bool tts_piper(const Config *cfg, const char *text, const char *out_mp3_p
   cJSON *root = cJSON_CreateObject();
   cJSON_AddStringToObject(root, "text", text);
   if (cfg->tts_voice[0]) cJSON_AddStringToObject(root, "voice", cfg->tts_voice);
-  if (cfg->tts_rate > 0 && cfg->tts_rate != 100) {
-    double ls = 100.0 / (double)cfg->tts_rate;   /* smaller length_scale = faster */
+  {
+    double rate = (cfg->tts_rate > 0 ? (double)cfg->tts_rate : 100.0) * g_tts_pace_scale;
+    double ls = 100.0 / rate;                    /* smaller length_scale = faster */
     if (ls < 0.5) ls = 0.5;
     if (ls > 2.0) ls = 2.0;
-    cJSON_AddNumberToObject(root, "length_scale", ls);
+    if (ls != 1.0) cJSON_AddNumberToObject(root, "length_scale", ls);
   }
   char *body = cJSON_PrintUnformatted(root);
   cJSON_Delete(root);
@@ -4977,11 +5004,11 @@ static bool tts_openai_compat(const Config *cfg, const char *text, const char *o
   cJSON_AddStringToObject(root, "input", text);
   cJSON_AddStringToObject(root, "voice", cfg->tts_voice[0] ? cfg->tts_voice : "alloy");
   cJSON_AddStringToObject(root, "response_format", "mp3");
-  if (cfg->tts_rate > 0 && cfg->tts_rate != 100) {
-    double sp = cfg->tts_rate / 100.0;
+  {
+    double sp = (cfg->tts_rate > 0 ? cfg->tts_rate / 100.0 : 1.0) * g_tts_pace_scale;
     if (sp < 0.25) sp = 0.25;
     if (sp > 4.0) sp = 4.0;
-    cJSON_AddNumberToObject(root, "speed", sp);
+    if (sp != 1.0) cJSON_AddNumberToObject(root, "speed", sp);
   }
   char *body = cJSON_PrintUnformatted(root);
   cJSON_Delete(root);
@@ -5107,9 +5134,10 @@ static bool tts_edge(const Config *cfg, const char *text, const char *out_mp3_pa
   fclose(f);
   const char *voice = cfg->tts_voice[0] ? cfg->tts_voice : "en-US-ChristopherNeural";
   char rate_arg[48] = "";
-  if (cfg->tts_rate > 0 && cfg->tts_rate != 100) {
-    int d = cfg->tts_rate - 100;
-    snprintf(rate_arg, sizeof(rate_arg), " --rate \"%s%d%%\"", d > 0 ? "+" : "", d);
+  {
+    int d = (int)lround((cfg->tts_rate > 0 ? (double)cfg->tts_rate : 100.0) * g_tts_pace_scale) - 100;
+    if (d != 0)
+      snprintf(rate_arg, sizeof(rate_arg), " --rate \"%s%d%%\"", d > 0 ? "+" : "", d);
   }
   int rc = run_cmd("\"%s\" edge_tts_synth.py --voice %s --text-file \"%s\" --out \"%s\"%s",
                    py, voice, txt, out_mp3_path, rate_arg);
@@ -8017,6 +8045,10 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
       logw("Cancel requested - stopping after clip %zu of %zu.", i, plan.count);
       break;
     }
+    /* A fresh movie starts from the configured narration speed; the measured
+       correction below belongs to this run only (the web panel can render
+       several movies in one process). */
+    if (i == 0) g_tts_pace_scale = 1.0;
 
     int start_s = plan.items[i].start;
     int end_s   = plan.items[i].end;
@@ -8051,27 +8083,43 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
         double real = units / nar_dur;
         logi("Voice pace: %.2f %s per second (the plan assumed %.1f, tts_rate %d%%).",
              real, lang_counts_chars(lang_code) ? "characters" : "words", assumed, cfg->tts_rate);
+
+        /* The same measurement tells the TTS how to speak the REST of the plan:
+           a voice that is faster than the estimate gets slowed down (so the
+           minutes on the label are not quietly lost), a slower one gets sped
+           up.  pace_scale_for keeps the change inside a natural band. */
+        double scale = pace_scale_for(assumed, real, cfg->tts_rate);
+        g_tts_pace_scale = scale;   /* assigned even at 1.0 - never carry a stale one */
+        if (scale != 1.0) {
+          logw("Narrating the remaining clips %d%% %s to hold the %.0f minute target.",
+               (int)lround(fabs(scale - 1.0) * 100.0), scale < 1.0 ? "slower" : "faster",
+               cfg->recap_minutes);
+        }
         double overlap = (cfg->transitions && plan.count > 1)
                              ? (double)(plan.count - 1) * cfg->transition_seconds : 0.0;
         double budget_sec = cfg->recap_minutes * 60.0 + overlap;
+        /* An engine that ignores the speed field still speaks at `real`, so the
+           trim below plans on the pessimistic pace: the slower of the two. */
+        double eff = real * (scale < 1.0 ? scale : 1.0);
         double rest_units = 0.0;
         for (size_t k = 1; k < plan.count; k++)
           rest_units += count_speech_units(plan.items[k].narration, lang_code);
-        double rest_sec = real > 0.0 ? rest_units / real : 0.0;
+        double rest_sec = eff > 0.0 ? rest_units / eff : 0.0;
         if (nar_dur + rest_sec > budget_sec * 1.05) {
           char tail[600];
           recap_closing_line_for(cfg->recap_language, tail, sizeof(tail));
-          double allowed_units = (budget_sec - nar_dur) * real;
+          double allowed_units = (budget_sec - nar_dur) * eff;
           if (allowed_units < 0.0) allowed_units = 0.0;
-          logw("The voice speaks %.2f words per second, not the %.1f the plan assumed: at "
+          logw("The voice speaks %.2f %s per second, not the %.1f the plan assumed: at "
                "that pace these narrations would run %.1f min for the %.0f min target. "
                "Trimming the narrations of the remaining clips to the time that is left.",
-               real, assumed, (nar_dur + rest_sec) / 60.0, cfg->recap_minutes);
+               real, lang_counts_chars(lang_code) ? "characters" : "words", assumed,
+               (nar_dur + rest_sec) / 60.0, cfg->recap_minutes);
           size_t cut = 0;
           for (size_t k = 1; k < plan.count; k++) {
             double u = count_speech_units(plan.items[k].narration, lang_code);
             double share = rest_units > 0.0 ? allowed_units * (u / rest_units) : allowed_units;
-            double window_units = (double)(plan.items[k].end - plan.items[k].start) * real;
+            double window_units = (double)(plan.items[k].end - plan.items[k].start) * eff;
             if (window_units > 0.0 && share > window_units) share = window_units;
             bool is_last = (k + 1 == plan.count);
             const char *use_tail = NULL;

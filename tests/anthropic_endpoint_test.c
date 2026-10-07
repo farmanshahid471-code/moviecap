@@ -1555,6 +1555,30 @@ static void test_voice_pace_trim_keeps_whole_sentences(void) {
   free(out);
 }
 
+static void test_pace_scale_speaks_the_requested_minutes(void) {
+  /* The plan budgets words for 2.6 words per second.  A voice that really
+     speaks 3.9 words per second turns a 20 minute recap into 13 minutes, so the
+     remaining clips must be narrated more slowly - and a slow voice the other
+     way round.  The scale stays inside a band that still sounds human. */
+  double fast = pace_scale_for(2.6, 3.9, 110);
+  ck(fast < 1.0, "a fast voice is slowed down");
+  ck(fast >= 0.75, "but never slowed past the natural band");
+  ck(fabs(fast * 3.9 - 2.6) < 0.9, "the slowed voice lands near the planned pace");
+
+  double slow = pace_scale_for(2.6, 1.6, 110);
+  ck(slow > 1.0, "a slow voice is sped up");
+  ck(slow <= 1.33, "but never sped past the natural band");
+
+  ck(pace_scale_for(2.6, 2.7, 110) == 1.0, "a voice at the assumed pace is left alone");
+  ck(pace_scale_for(2.6, 2.75, 110) == 1.0, "a few percent off is left alone");
+  ck(pace_scale_for(2.6, 2.9, 110) < 1.0, "ten percent off is corrected");
+  ck(pace_scale_for(0.0, 3.0, 110) == 1.0, "no estimate means no change");
+  ck(pace_scale_for(2.6, 0.0, 110) == 1.0, "no measurement means no change");
+  ck(pace_scale_for(2.6, 3.9, 0) == 1.0, "no configured rate means no change");
+  ck(pace_scale_for(4.0, 1.0, 100) <= 1.33, "the fastest correction is still bounded");
+  ck(pace_scale_for(1.0, 4.0, 100) >= 0.75, "the slowest correction is still bounded");
+}
+
 int main(void) {
   test_endpoint_shapes();
   test_native_claude_request();
@@ -1589,6 +1613,7 @@ int main(void) {
   test_transition_command_shape();
   test_audit_trims_a_stubborn_over_long_plan();
   test_voice_pace_trim_keeps_whole_sentences();
+  test_pace_scale_speaks_the_requested_minutes();
   test_openai_no_limit_means_no_extra_requests();
   test_batch_custom_id_shape();
   test_batch_collect_then_render();
