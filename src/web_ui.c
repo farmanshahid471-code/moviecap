@@ -693,6 +693,7 @@ static cJSON *config_read_json(void) {
   ADD_NUM("narration_volume",  "narration_volume",  2.5);
   ADD_NUM("bgm_volume",        "bgm_volume",        0.1);
   ADD_NUM("recap_minutes",     "recap_minutes",     0);
+  ADD_NUM("min_recap_minutes", "min_recap_minutes", 0);
   ADD_NUM("tts_rate",          "tts_rate",          110);
   ADD_NUM("transition_seconds", "transition_seconds", 0.35);
 
@@ -727,6 +728,7 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
 
   const char *str_keys[] = {
     "eleven_voice_id", "eleven_model_id", "openai_model", "batch_max_wait_minutes",
+    "transition_style",
     "openai_base_url", "elevenlabs_base_url",
     "tts_provider", "tts_base_url", "tts_voice", "tts_language", "tts_model",
     "whisper_model", "caption_font", "caption_font_zh", "caption_font_ar", "caption_font_es",
@@ -757,7 +759,7 @@ static bool config_write_json(cJSON *patch, char *err, size_t errsz) {
 
   const char *num_keys[] = {
     "min_clips", "max_clips", "max_video_speedup", "narration_volume", "bgm_volume",
-    "recap_minutes", "tts_rate", "transition_seconds", NULL
+    "recap_minutes", "min_recap_minutes", "tts_rate", "transition_seconds", NULL
   };
   for (int i = 0; num_keys[i]; i++) {
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(patch, num_keys[i]);
@@ -980,7 +982,9 @@ static const char *PAGE_HTML[] = {
   "        <div><label class='f'>TTS model</label><input type='text' id='eleven_model_id'></div>",
   "        <div><label class='f'>Clips (min)</label><input type='number' id='min_clips' min='1' max='200'></div>",
   "        <div><label class='f'>Clips (max)</label><input type='number' id='max_clips' min='1' max='200'></div>",
-  "        <div><label class='f'>Recap minutes (0=auto)</label><input type='number' id='recap_minutes' min='0' max='180'></div>",
+  "        <div><label class='f'>Recap minutes <span class='hint'>top of the band, 0 = auto</span></label><input type='number' id='recap_minutes' min='0' max='180'></div>",
+  "        <div><label class='f'>Shortest recap minutes <span class='hint'>bottom of the band, 0 = half of the top</span></label><input type='number' id='min_recap_minutes' min='0' max='180'></div>",
+  "        <div><label class='f'>Scene fade <span class='hint'>fade, fadeblack, dissolve, smoothleft, slideleft, circleopen, radial, pixelize, none</span></label><input type='text' id='transition_style'></div>",
   "        <div><label class='f'>Recap languages <span class='hint'>one recap per checked language, in this order (max 4)</span></label></div>",
   "        <div class='hint' style='margin-top:-6px;margin-bottom:8px'>One run renders every checked language back to back, each into its own file (<i>Title (Chinese).mp4</i>). Put <i>Title</i>.zh.srt / <i>Title</i>.ar.srt / <i>Title</i>.es.srt in scripts/srt_files to recap in that language directly - otherwise the English subtitles get translated. More languages (French, German, Hindi, Japanese, Russian, ...) can be added in config.json as <i>recap_languages</i> names or two letter codes; the caption font and the Edge voice follow the language automatically, and a CJK/Arabic system font is picked for the captions when the boxes below are empty.</div>",
   "        <div style='display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px'>",
@@ -1146,8 +1150,9 @@ static const char *PAGE_HTML[] = {
   "  cfgLoaded = true;",
   "  var texts = ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
   "               'tts_base_url','tts_voice','tts_language','tts_model','whisper_model','caption_font',",
-  "               'caption_font_zh','caption_font_ar','caption_font_es','wikipedia_base_url'];",
-  "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','tts_rate','transition_seconds'];",
+  "               'caption_font_zh','caption_font_ar','caption_font_es','wikipedia_base_url',",
+  "               'transition_style'];",
+  "  var nums  = ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','min_recap_minutes','tts_rate','transition_seconds'];",
   "  var bools = ['bgm_enabled','make_vertical','retire_movies','captions','transitions','use_wikipedia_plot','offline_planner','batch_planning'];",
   "  texts.forEach(function(k){ el(k).value = c[k] || ''; });",
   "  nums.forEach(function(k){ el(k).value = c[k]; });",
@@ -1267,7 +1272,8 @@ static const char *PAGE_HTML[] = {
   "  var body = {};",
   "  ['openai_model','eleven_voice_id','eleven_model_id','openai_base_url','elevenlabs_base_url',",
   "   'tts_base_url','tts_voice','tts_language','tts_model','caption_font',",
-  "   'caption_font_zh','caption_font_ar','caption_font_es','wikipedia_base_url'].forEach(function(k){ body[k] = el(k).value; });",
+  "   'caption_font_zh','caption_font_ar','caption_font_es','wikipedia_base_url',",
+  "   'transition_style'].forEach(function(k){ body[k] = el(k).value; });",
   "  body.tts_provider = el('tts_provider').value;",
   "  var rl = [];",
   "  if (el('lang_en').checked) rl.push('');",
@@ -1276,7 +1282,7 @@ static const char *PAGE_HTML[] = {
   "  if (el('lang_es').checked) rl.push('Spanish (neutral Latin American)');",
   "  if (!rl.length) rl.push('');",
   "  body.recap_languages = rl;",
-  "  ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','tts_rate','transition_seconds'].forEach(function(k){ body[k] = Number(el(k).value); });",
+  "  ['min_clips','max_clips','max_video_speedup','narration_volume','bgm_volume','recap_minutes','min_recap_minutes','tts_rate','transition_seconds'].forEach(function(k){ body[k] = Number(el(k).value); });",
   "  ['bgm_enabled','make_vertical','retire_movies','captions','transitions','use_wikipedia_plot','offline_planner','batch_planning'].forEach(function(k){ body[k] = el(k).checked; });",
   "  if (el('open_api_key').value) body.open_api_key = el('open_api_key').value;",
   "  if (el('elevenlabs_api_key').value) body.elevenlabs_api_key = el('elevenlabs_api_key').value;",

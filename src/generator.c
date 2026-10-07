@@ -495,12 +495,14 @@ typedef struct {
   int    min_clips;          /* default 20   */
   int    max_clips;          /* default 30   */
   double max_video_speedup;  /* default 1.75 */
-  double recap_minutes;     /* target recap length in minutes; 0 = auto */
+  double recap_minutes;     /* target (maximum) recap length in minutes; 0 = auto */
+  double min_recap_minutes; /* shortest acceptable recap; 0 = half the target */
   bool   captions;          /* burn small subtitles into clips; default true */
   /* Smooth the cut between two clips: the clips are crossfaded instead of
      hard-cut, which is what a rough scene-to-scene jump looks like. */
-  bool   transitions;        /* crossfade between clips; default true */
-  double transition_seconds; /* crossfade length in seconds; default 0.35 */
+  bool   transitions;        /* fade between clips; default true */
+  double transition_seconds; /* fade length in seconds; default 0.35 */
+  char   transition_style[24];/* "fade", "fadeblack", "slideleft", "none" (hard cuts) */
   double narration_volume;   /* default 2.5  */
   double bgm_volume;         /* default 0.1  */
   bool   bgm_enabled;        /* default true */
@@ -519,6 +521,43 @@ static void cfg_set_str(char *dst, size_t dstsz, const cJSON *node) {
 static bool cfg_get_bool(const cJSON *node, bool def) {
   if (cJSON_IsBool(node)) return cJSON_IsTrue(node) ? true : false;
   if (cJSON_IsNumber(node)) return node->valuedouble != 0.0;
+  return def;
+}
+
+/* The xfade transitions the app offers (plus its own "none"/"cut" for the plain
+ * hard cut of the original AI-Movie-Shorts).  Anything else is refused instead of
+ * being handed to ffmpeg as a filter name. */
+static bool transition_style_known(const char *val) {
+  static const char *allowed[] = { "fade", "fadeblack", "fadewhite", "dissolve", "smoothleft",
+                                   "smoothright", "smoothup", "smoothdown", "slideleft",
+                                   "slideright", "circleopen", "radial", "pixelize",
+                                   "none", "cut", NULL };
+  if (!val || !val[0]) return false;
+  for (int i = 0; allowed[i]; i++)
+    if (strcmp(val, allowed[i]) == 0) return true;
+  return false;
+}
+
+/* How the joins change the finished length: with the held frames above, every
+ * fade adds one fade length to the timeline (the held frames are extra picture,
+ * the narrations stay untouched).  Hard cuts add nothing. */
+/* The length the recap is aiming at is a BAND, not one number: a 10-20 minute
+   recap of a real film cannot be written to the second, and every part of the
+   pipeline (plan budget, trim, warnings) has to agree on the same two ends.
+   `recap_minutes` is the top of the band (and the hard cap), `min_recap_minutes`
+   the bottom; 0 for the bottom means "half the top", so asking for 20 minutes
+   accepts anything from 10 minutes up. */
+static void recap_band_minutes(const Config *cfg, double *lo, double *hi) {
+  double top = cfg->recap_minutes > 0.0 ? cfg->recap_minutes : 0.0;
+  double bot = cfg->min_recap_minutes > 0.0 ? cfg->min_recap_minutes : top * 0.5;
+  if (bot < 0.0) bot = 0.0;
+  if (bot > top) bot = top;
+  if (lo) *lo = bot;
+  if (hi) *hi = top;
+}
+
+static const char *cfg_get_str(const cJSON *node, const char *def) {
+  if (cJSON_IsString(node) && node->valuestring && node->valuestring[0]) return node->valuestring;
   return def;
 }
 
@@ -751,10 +790,28 @@ static Config load_config_json(const char *path) {
   c.max_clips         = cfg_get_int(cJSON_GetObjectItemCaseSensitive(root, "max_clips"), MAX_NUM_CLIPS, 1, 200);
   c.max_video_speedup = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "max_video_speedup"), MAX_VIDEO_SPEEDUP, 1.0, 8.0);
   c.recap_minutes     = cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "recap_minutes"), 0, 0, 180);
+  c.min_recap_minutes =
+      cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "min_recap_minutes"), 0, 0, 180);
+  if (c.min_recap_minutes > c.recap_minutes) c.min_recap_minutes = c.recap_minutes;
   c.captions          = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "captions"), true);
   c.transitions       = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "transitions"), true);
   c.transition_seconds =
       cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "transition_seconds"), 0.35, 0.10, 1.50);
+  {
+    /* Which xfade filter the joins use.  "none" (or "cut") is the hard cut the
+       original AI-Movie-Shorts used; everything else is an ffmpeg xfade
+       transition name (see `ffmpeg -h filter=xfade`). */
+    const char *val = cfg_get_str(cJSON_GetObjectItemCaseSensitive(root, "transition_style"),
+                                  "fade");
+    if (!transition_style_known(val)) {
+      logw("Unknown \"transition_style\": \"%s\" - using \"fade\". Known styles: fade, "
+           "fadeblack, fadewhite, dissolve, smoothleft, smoothright, smoothup, smoothdown, "
+           "slideleft, slideright, circleopen, radial, pixelize, none.", val);
+      val = "fade";
+    }
+    snprintf(c.transition_style, sizeof(c.transition_style), "%s", val);
+    if (!strcmp(val, "none") || !strcmp(val, "cut")) c.transitions = false;
+  }
   c.batch_planning    = cfg_get_bool(cJSON_GetObjectItemCaseSensitive(root, "batch_planning"), false);
   c.batch_max_wait_minutes =
       (int)cfg_get_dbl(cJSON_GetObjectItemCaseSensitive(root, "batch_max_wait_minutes"), 720, 0, 2880);
@@ -4321,17 +4378,32 @@ static ClipPlanList openai_make_plan(const Config *cfg,
 
   /* With a recap-minutes target the model also needs to know the total, or it
      spreads a short script over many clips and the video comes out short. */
-  char total_line[400];
+  char total_line[560];
   total_line[0] = '\0';
   if (per_clip_sec > 0) {
+    double top_min = (double)num_clips * (double)per_clip_sec / 60.0;
     int total_words = (int)((double)num_clips * (double)per_clip_sec * wps + 0.5);
-    snprintf(total_line, sizeof(total_line),
-             "- Together the %d narrations must add up to about %.1f minutes of "
-             "speech (roughly %d words) and must NEVER add up to more than that: "
-             "the finished recap is cut to the narration, so extra words here "
-             "make the video longer than the length set above. Each clip carries "
-             "its own full narration: no one-line summaries, no empty narrations.\n",
-             num_clips, (double)num_clips * (double)per_clip_sec / 60.0, total_words);
+    double band_lo = 0.0, band_hi = 0.0;
+    recap_band_minutes(cfg, &band_lo, &band_hi);
+    if (band_lo < band_hi - 0.05) {
+      snprintf(total_line, sizeof(total_line),
+               "- Together the %d narrations must add up to %.1f to %.1f minutes of "
+               "speech (roughly %d-%d words): aim for the TOP of that range, but "
+               "never go over it - the finished recap is cut to the narration, so "
+               "extra words make the video longer than the length set above, and "
+               "too few make it shorter than the length the viewer asked for. Each "
+               "clip carries its own full narration: no one-line summaries, no "
+               "empty narrations.\n",
+               num_clips, band_lo, band_hi, total_words / 2, total_words);
+    } else {
+      snprintf(total_line, sizeof(total_line),
+               "- Together the %d narrations must add up to about %.1f minutes of "
+               "speech (roughly %d words) and must NEVER add up to more than that: "
+               "the finished recap is cut to the narration, so extra words here "
+               "make the video longer than the length set above. Each clip carries "
+               "its own full narration: no one-line summaries, no empty narrations.\n",
+               num_clips, top_min, total_words);
+    }
   }
 
   /* The count is repeated as a hard limit at the top of the prompt: a model
@@ -6059,6 +6131,11 @@ static bool ffmpeg_make_adjusted_clip(const Config *cfg, const char *input_mp4,
 
 #define XFADE_CHUNK 8
 
+static double transition_join_seconds(bool transitions, size_t clips, double tf) {
+  if (!transitions || clips < 2 || tf <= 0.0) return 0.0;
+  return (double)(clips - 1) * tf;
+}
+
 static void free_str_list(char **lst, size_t n);          /* further down */
 
 typedef struct {
@@ -6130,8 +6207,11 @@ static bool read_concat_list(const char *list_path, char ***out_names, size_t *o
 }
 
 /* One chunk: k inputs -> one file, crossfading every joint. */
-static bool ffmpeg_merge_chunk(XClip *cl, size_t k, double tf, const char *out_mp4,
-                               int frame_w, int frame_h, double fps) {
+static bool ffmpeg_merge_chunk(XClip *cl, size_t k, double tf, const char *style,
+                               const char *out_mp4,
+                               int frame_w, int frame_h, double fps,
+                               bool pad_here, size_t first_index, size_t total_units,
+                               double *out_len) {
   char cmd[16384];
   size_t o = 0;
   char fps_filter[32];
@@ -6144,17 +6224,34 @@ static bool ffmpeg_merge_chunk(XClip *cl, size_t k, double tf, const char *out_m
     free(e);
   }
   o += (size_t)snprintf(cmd + o, sizeof(cmd) - o, " -filter_complex \"");
+  double merged = 0.0;
   for (size_t i = 0; i < k; i++) {
+    size_t gi = first_index + i;
+    double lead = (pad_here && gi > 0) ? tf : 0.0;
+    double tail = (pad_here && gi + 1 < total_units) ? tf : 0.0;
     o += (size_t)snprintf(cmd + o, sizeof(cmd) - o,
                           "[%zu:v]scale=%d:%d:force_original_aspect_ratio=decrease,"
-                          "pad=%d:%d:(ow-iw)/2:(oh-ih)/2%s,format=yuv420p,settb=AVTB[v%zu];",
-                          i, frame_w, frame_h, frame_w, frame_h, fps_filter, i);
+                          "pad=%d:%d:(ow-iw)/2:(oh-ih)/2%s,format=yuv420p,settb=AVTB",
+                          i, frame_w, frame_h, frame_w, frame_h, fps_filter);
+    if (lead > 0.001 || tail > 0.001)
+      o += (size_t)snprintf(cmd + o, sizeof(cmd) - o,
+                            ",tpad=start_mode=clone:start_duration=%.3f:"
+                            "stop_mode=clone:stop_duration=%.3f", lead, tail);
+    o += (size_t)snprintf(cmd + o, sizeof(cmd) - o, "[v%zu];", i);
     o += (size_t)snprintf(cmd + o, sizeof(cmd) - o,
                           "[%zu:a]aresample=48000,"
-                          "aformat=sample_fmts=fltp:channel_layouts=stereo[a%zu];",
-                          i, i);
+                          "aformat=sample_fmts=fltp:channel_layouts=stereo", i);
+    if (lead > 0.001)
+      o += (size_t)snprintf(cmd + o, sizeof(cmd) - o, ",adelay=delays=%d:all=1",
+                            (int)llround(lead * 1000.0));
+    if (tail > 0.001)
+      o += (size_t)snprintf(cmd + o, sizeof(cmd) - o, ",apad=pad_dur=%.3f", tail);
+    o += (size_t)snprintf(cmd + o, sizeof(cmd) - o, "[a%zu];", i);
+    /* The blend covers the outgoing clip's held frame and the incoming clip's
+       held frame, so no two words overlap and no picture is lost. */
+    if (i == 0) merged = cl[0].dur + lead + tail;
+    else        merged = merged - tf + cl[i].dur + lead + tail;
   }
-  double merged = cl[0].dur;
   char prevv[32], preva[32], curv[32], cura[32];
   snprintf(prevv, sizeof(prevv), "v0");
   snprintf(preva, sizeof(preva), "a0");
@@ -6164,14 +6261,13 @@ static bool ffmpeg_merge_chunk(XClip *cl, size_t k, double tf, const char *out_m
     snprintf(curv, sizeof(curv), "vx%zu", i);
     snprintf(cura, sizeof(cura), "ax%zu", i);
     o += (size_t)snprintf(cmd + o, sizeof(cmd) - o,
-                          "[%s][v%zu]xfade=transition=fade:duration=%.3f:offset=%.3f[%s];",
-                          prevv, i, tf, off, curv);
+                          "[%s][v%zu]xfade=transition=%s:duration=%.3f:offset=%.3f[%s];",
+                          prevv, i, style && style[0] ? style : "fade", tf, off, curv);
     o += (size_t)snprintf(cmd + o, sizeof(cmd) - o,
                           "[%s][a%zu]acrossfade=d=%.3f:c1=tri:c2=tri[%s];",
                           preva, i, tf, cura);
     snprintf(prevv, sizeof(prevv), "%s", curv);
     snprintf(preva, sizeof(preva), "%s", cura);
-    merged += cl[i].dur - tf;
   }
   char *out_esc = sh_escape(out_mp4);
   o += (size_t)snprintf(cmd + o, sizeof(cmd) - o,
@@ -6181,9 +6277,10 @@ static bool ffmpeg_merge_chunk(XClip *cl, size_t k, double tf, const char *out_m
                         prevv, preva, out_esc);
   free(out_esc);
   if (o >= sizeof(cmd)) {
-    logw("Crossfade command line too long (%zu chars) - using hard cuts for this chunk.", o);
+    logw("Fade command line too long (%zu chars) - using hard cuts for this chunk.", o);
     return false;
   }
+  if (out_len) *out_len = merged;
   return run_cmd("%s", cmd) == 0 && file_exists(out_mp4);
 }
 
@@ -6197,7 +6294,7 @@ static void xclip_free(XClip *c) {
    nothing behind) when a clip is too short for the crossfade or ffmpeg fails,
    so the caller can fall back to the plain concat. */
 static bool ffmpeg_merge_with_transitions(const char *list_path, const char *out_mp4,
-                                          const char *title, double tf,
+                                          const char *title, double tf, const char *style,
                                           int frame_w, int frame_h) {
   char **names = NULL;
   size_t n = 0;
@@ -6236,8 +6333,8 @@ static bool ffmpeg_merge_with_transitions(const char *list_path, const char *out
     size_t groups = (cur_n + XFADE_CHUNK - 1) / XFADE_CHUNK;
     XClip *next = (XClip *)calloc(groups, sizeof(XClip));
     if (!next) die("OOM");
-    logi("Crossfading %zu clip%s (round %zu, %.2f s blends)...",
-         cur_n, cur_n == 1 ? "" : "s", round + 1, tf);
+    logi("Fading %zu clip%s (%s, round %zu, %.2f s blends)...",
+         cur_n, cur_n == 1 ? "" : "s", style && style[0] ? style : "fade", round + 1, tf);
     size_t g = 0;
     for (size_t a = 0; a < cur_n; a += XFADE_CHUNK, g++) {
       size_t k = cur_n - a < XFADE_CHUNK ? cur_n - a : XFADE_CHUNK;
@@ -6250,9 +6347,13 @@ static bool ffmpeg_merge_with_transitions(const char *list_path, const char *out
       bool last_round = (groups == 1);
       if (last_round) snprintf(tmp, sizeof(tmp), "%s", out_mp4);
       else snprintf(tmp, sizeof(tmp), "clips/%s_xfade_%zu_%zu.mp4", title, round, g);
-      double sum = 0.0;
-      for (size_t i = 0; i < k; i++) sum += cur[a + i].dur;
-      if (!ffmpeg_merge_chunk(&cur[a], k, tf, tmp, frame_w, frame_h, fps)) {
+      /* The held frames / silence are added in the first round only: the chunk
+         files of the later rounds carry them already. */
+      bool pad_here = (round == 0);
+      size_t total_units = (round == 0) ? n : 0;
+      double est_len = 0.0;
+      if (!ffmpeg_merge_chunk(&cur[a], k, tf, style, tmp, frame_w, frame_h, fps,
+                              pad_here, a, total_units, &est_len)) {
         logw("Crossfade merge failed - falling back to hard cuts.");
         for (size_t i = 0; i < k; i++) xclip_free(&cur[a + i]);
         for (size_t i = 0; i < g; i++) xclip_free(&next[i]);
@@ -6265,14 +6366,20 @@ static bool ffmpeg_merge_with_transitions(const char *list_path, const char *out
       if (last_round) {
         next[g].path = NULL;
         next[g].owned = 0;
-        next[g].dur = sum - (double)(k - 1) * tf;
         free(next);
         free(cur);
         return true;                   /* out_mp4 written */
       }
       next[g].path = str_dup(tmp);
       next[g].owned = 1;
-      next[g].dur = sum - (double)(k - 1) * tf;
+      /* Measure what the blend actually produced: the next round offsets its
+         blends from this, and a mismatch means the held frames did not land
+         where the maths expects them. */
+      next[g].dur = ffprobe_duration_seconds(tmp);
+      if (next[g].dur <= 0.05) next[g].dur = est_len;
+      else if (est_len > 0.05 && fabs(next[g].dur - est_len) > 0.20)
+        logw("Fade check: the maths expected %.2f s but the file holds %.2f s.",
+             est_len, next[g].dur);
     }
     free(cur);
     cur = next;
@@ -7115,11 +7222,12 @@ static void recap_closing_line_for(const char *recap_language, char *out, size_t
 /* Keep whole sentences of `text` while they fit in `budget_units`.  At least
    one sentence always stays.  `tail` (when non-empty and at the very end of
    the text) is preserved: that is the fixed closing line. */
-/* Deterministic length guarantee: hand the plan exactly `target_sec (+ the
-   crossfade overlap the render will eat) of speech.  Sentences are the smallest
-   unit the trim may cut, so a strict per-clip allocation under-shoots by up to
-   one sentence per clip; the refill pass then gives that slack back to the
-   clips that have room left inside their own time range. */
+/* Deterministic length guarantee: hand the plan exactly `target_sec - join_sec`
+   of speech, i.e. the target less the time the fades will add (pass a negative
+   overlap_sec for the modern joins, 0 for hard cuts).  Sentences are the
+   smallest unit the trim may cut, so a strict per-clip allocation under-shoots
+   by up to one sentence per clip; the refill pass then gives that slack back to
+   the clips that have room left inside their own time range. */
 static void cap_plan_narration_length(ClipPlanList *plan, double target_sec, double overlap_sec,
                                       const char *lang_code, const char *recap_language) {
   if (!plan || plan->count == 0) return;
@@ -7562,18 +7670,29 @@ static void audit_plan_length_and_script(const Config *cfg, const char *movie_ti
   char tail[600];
   recap_closing_line_for(cfg->recap_language, tail, sizeof(tail));
 
-  double overlap = 0.0;
-  if (cfg->transitions && plan->count > 1)
-    overlap = (double)(plan->count - 1) * cfg->transition_seconds;
+  /* The fades add one fade length per junction to the finished video, so the
+     narration budget is what is left of the target after them. */
+  double join_sec = transition_join_seconds(cfg->transitions, plan->count,
+                                            cfg->transition_seconds);
 
   bool want_length = (per_clip_sec > 0 && cfg->recap_minutes >= 1.0);
-  double target_sec = want_length ? cfg->recap_minutes * 60.0 : 0.0;
-  double budget_sec = target_sec + overlap;
+  double band_lo = 0.0, band_hi = 0.0;
+  recap_band_minutes(cfg, &band_lo, &band_hi);
+  double target_sec = want_length ? band_hi * 60.0 : 0.0;
+  double floor_sec  = want_length ? band_lo * 60.0 : 0.0;
+  double budget_sec = target_sec - join_sec;
+  double floor_budget = floor_sec - join_sec;
 
   double speech = plan_speech_seconds(plan->items, plan->count, lang_code);
-  if (want_length)
-    logi("Plan speech: about %.1f min of narration for the %.0f min target (%zu clips).",
-         speech / 60.0, cfg->recap_minutes, plan->count);
+  if (want_length) {
+    if (band_lo < band_hi - 0.05)
+      logi("Plan speech: about %.1f min of narration for the %.0f-%.0f min target "
+           "(%zu clips, aiming at %.0f).",
+           speech / 60.0, band_lo, band_hi, plan->count, band_hi);
+    else
+      logi("Plan speech: about %.1f min of narration for the %.0f min target (%zu clips).",
+           speech / 60.0, band_hi, plan->count);
+  }
 
   if (want_length) {
     for (size_t i = 0; i < plan->count; i++) {
@@ -7588,7 +7707,10 @@ static void audit_plan_length_and_script(const Config *cfg, const char *movie_ti
     }
   }
 
-  bool too_short = want_length && speech < budget_sec * 0.80;
+  /* Below the bottom of the band is as much a length failure as above the top:
+     a 20 minute recap that comes out at 9 minutes is not the video that was
+     asked for. */
+  bool too_short = want_length && speech < floor_budget * 0.80;
   bool too_long  = want_length && speech > budget_sec * 1.15;
   bool english = (lang_code[0] == 'e' && lang_code[1] == 'n' && lang_code[2] == 0);
 
@@ -7619,12 +7741,12 @@ static void audit_plan_length_and_script(const Config *cfg, const char *movie_ti
       int cap_words = (int)((double)per_clip_sec * lang_speech_units_per_sec(lang_code) + 0.5);
       note_append(note, sizeof(note), &no,
                   "CRITICAL LENGTH RULE: the previous narrations added up to about %d seconds "
-                  "of speech, but this whole video must be about %d seconds (%.0f minutes) - "
+                  "of speech, but this whole video must be at most %d seconds (%.0f minutes) - "
                   "that is at most about %d words per narration. Keep the SAME clip windows, "
                   "keep every important event, but rewrite the narrations SHORTER: no detail "
                   "that is not needed to follow the story, never more than %d words in one "
                   "clip. ",
-                  (int)speech, (int)target_sec, cfg->recap_minutes, cap_words, cap_words);
+                  (int)speech, (int)target_sec, band_hi, cap_words, cap_words);
     } else if (too_short) {
       int mn = 0, mx = 0;
       clip_seconds_range(per_clip_sec, &mn, &mx);
@@ -7632,12 +7754,12 @@ static void audit_plan_length_and_script(const Config *cfg, const char *movie_ti
       bool in_chars = lang_counts_chars(lang_code);
       note_append(note, sizeof(note), &no,
                   "CRITICAL LENGTH RULE: the narrations of the previous answer added up to "
-                  "only about %d seconds of speech, but the target for this video is about "
-                  "%d seconds (%.0f minutes). Every clip must carry a FULL narration of "
-                  "roughly %d-%d %s (a %d to %d second clip needs that much speech) - not "
-                  "one line, not a short summary. Rewrite the whole plan with full-length "
-                  "narrations and keep the same JSON shape. ",
-                  (int)speech, (int)target_sec, cfg->recap_minutes,
+                  "only about %d seconds of speech, but this video must be at least %d "
+                  "seconds (%.0f minutes) and at most %d seconds (%.0f minutes). Every clip "
+                  "must carry a FULL narration of roughly %d-%d %s (a %d to %d second clip "
+                  "needs that much speech) - not one line, not a short summary. Rewrite the "
+                  "whole plan with full-length narrations and keep the same JSON shape. ",
+                  (int)speech, (int)floor_sec, band_lo, (int)target_sec, band_hi,
                   (int)((double)mn * per_sec + 0.5), (int)((double)mx * per_sec + 0.5),
                   in_chars ? "characters" : "words", mn, mx);
     }
@@ -7695,19 +7817,19 @@ static void audit_plan_length_and_script(const Config *cfg, const char *movie_ti
   if (want_length) {
     speech = plan_speech_seconds(plan->items, plan->count, lang_code);
     if (speech > budget_sec * 1.02) {
-      cap_plan_narration_length(plan, target_sec, overlap, lang_code, cfg->recap_language);
+      cap_plan_narration_length(plan, target_sec, -join_sec, lang_code, cfg->recap_language);
       speech = plan_speech_seconds(plan->items, plan->count, lang_code);
     }
     if (speech > budget_sec * 1.05)
       logw("Even after trimming the narrations hold %.1f min of speech for the %.0f min "
-           "target - the model ignored the length rule by too much. Try a stronger model, "
-           "or lower min_clips/max_clips so the plan starts smaller.",
-           speech / 60.0, cfg->recap_minutes);
-    else if (!too_short && speech < budget_sec * 0.85)
-      logw("The narrations hold %.1f min of speech for the %.0f min target - expect a "
-           "recap near %.1f min. A stronger model, fewer clips (min_clips/max_clips) or a "
-           "lower max_video_speedup change this.",
-           speech / 60.0, cfg->recap_minutes, speech / 60.0);
+           "top of the %.0f-%.0f min band - the model ignored the length rule by too much. "
+           "Try a stronger model, or lower min_clips/max_clips so the plan starts smaller.",
+           speech / 60.0, band_hi, band_lo, band_hi);
+    else if (!too_short && speech < floor_budget * 0.85)
+      logw("The narrations hold %.1f min of speech, under the %.0f min floor of the "
+           "%.0f-%.0f min target - expect a recap near %.1f min. A stronger model, fewer "
+           "clips (min_clips/max_clips) or a lower max_video_speedup change this.",
+           speech / 60.0, band_lo, band_lo, band_hi, speech / 60.0);
   }
 }
 
@@ -7883,8 +8005,16 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   if (cfg->recap_minutes >= 1.0) {
     per_clip_sec = (int)((cfg->recap_minutes * 60.0) / (double)num_clips);
     if (per_clip_sec > 0 && per_clip_sec < 8) per_clip_sec = 8;
-    if (per_clip_sec > 0)
-      logi("Target recap length ~%.0f min => about %d s per clip.", cfg->recap_minutes, per_clip_sec);
+    if (per_clip_sec > 0) {
+      double band_lo = 0.0, band_hi = 0.0;
+      recap_band_minutes(cfg, &band_lo, &band_hi);
+      if (band_lo < band_hi - 0.05)
+        logi("Target recap length %.0f-%.0f min => about %d s per clip at %d clips. "
+             "(min_recap_minutes = 0 means half of recap_minutes.)",
+             band_lo, band_hi, per_clip_sec, num_clips);
+      else
+        logi("Target recap length ~%.0f min => about %d s per clip.", band_hi, per_clip_sec);
+    }
   }
 
   report_progress(GEN_STAGE_PLANNING, movie_index, movie_total, 0, 0, movie_title);
@@ -8095,9 +8225,9 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
                (int)lround(fabs(scale - 1.0) * 100.0), scale < 1.0 ? "slower" : "faster",
                cfg->recap_minutes);
         }
-        double overlap = (cfg->transitions && plan.count > 1)
-                             ? (double)(plan.count - 1) * cfg->transition_seconds : 0.0;
-        double budget_sec = cfg->recap_minutes * 60.0 + overlap;
+        double join_sec = transition_join_seconds(cfg->transitions, plan.count,
+                                                 cfg->transition_seconds);
+        double budget_sec = cfg->recap_minutes * 60.0 - join_sec;
         /* An engine that ignores the speed field still speaks at `real`, so the
            trim below plans on the pessimistic pace: the slower of the two. */
         double eff = real * (scale < 1.0 ? scale : 1.0);
@@ -8180,15 +8310,19 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
   logi("Joining clips -> %s", tmp_concat);
   bool joined = false;
   if (cfg->transitions && made >= 2) {
-    logi("Smooth scene changes: %.2f s crossfade between clips (set \"transitions\": false "
-         "to go back to hard cuts).", cfg->transition_seconds);
+    logi("Smooth scene changes: %.2f s \"%s\" between clips. Every clip holds its last "
+         "picture (and a matching silence) for the fade, so the two narrations never talk "
+         "over each other. Set \"transition_style\": \"none\" for the plain hard cuts, or "
+         "\"transitions\": false to switch it off.",
+         cfg->transition_seconds, cfg->transition_style);
     joined = ffmpeg_merge_with_transitions(concat_list_path, tmp_concat, movie_title,
-                                           cfg->transition_seconds, frame_w, frame_h);
-    if (joined) logok("Joined with crossfades: %s", tmp_concat);
+                                           cfg->transition_seconds, cfg->transition_style,
+                                           frame_w, frame_h);
+    if (joined) logok("Joined with %s fades: %s", cfg->transition_style, tmp_concat);
   }
   if (!joined) {
     if (cfg->transitions && made >= 2)
-      logw("Crossfade join did not work - falling back to hard cuts.");
+      logw("The fade join did not work - falling back to hard cuts.");
     if (!ffmpeg_concat_videos(concat_list_path, tmp_concat)) {
       logw("Concat failed for %s", movie_title);
       return false;
@@ -8207,21 +8341,36 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
      under-writes the narrations cannot be fixed downstream, the video simply
      has to be sped up (capped by max_video_speedup) and comes out short. */
   if (cfg->recap_minutes >= 1.0) {
-    double want = cfg->recap_minutes * 60.0;
-    logi("Recap length: %.1f min of the %.0f min target (%.0f%%).",
-         final_dur / 60.0, cfg->recap_minutes, 100.0 * final_dur / want);
-    if (final_dur < want * 0.85)
-      logw("This recap is much shorter than the %.0f minutes asked for. Each clip "
-           "was sped up at most %.2fx and then cut down to its narration, so the "
+    double band_lo = 0.0, band_hi = 0.0;
+    recap_band_minutes(cfg, &band_lo, &band_hi);
+    double want = band_hi * 60.0;
+    char band_note[160];
+    band_note[0] = '\0';
+    if (band_lo < band_hi - 0.05) {
+      if (final_dur < band_lo * 60.0 * 0.98)
+        snprintf(band_note, sizeof(band_note), " - below the %.0f min floor of the band.",
+                 band_lo);
+      else if (final_dur > want * 1.05)
+        snprintf(band_note, sizeof(band_note), " - above the %.0f min top of the band.",
+                 band_hi);
+      else
+        snprintf(band_note, sizeof(band_note), " - inside the %.0f-%.0f min band.",
+                 band_lo, band_hi);
+    }
+    logi("Recap length: %.1f min of the %.0f min target (%.0f%%)%s",
+         final_dur / 60.0, band_hi, 100.0 * final_dur / want, band_note);
+    if (final_dur < band_lo * 60.0 * 0.98)
+      logw("This recap is shorter than the %.0f minutes the band bottoms out at (%.1f min). "
+           "Each clip is sped up at most %.2fx and then cut down to its narration, so the "
            "spoken lines were too short for their clip ranges. Try a stronger model, "
            "fewer clips (min_clips/max_clips), or set \"recap_minutes\": 0.",
-           cfg->recap_minutes, cfg->max_video_speedup);
+           band_lo, final_dur / 60.0, cfg->max_video_speedup);
     else if (final_dur > want * 1.15)
-      logw("This recap came out longer than the %.0f minutes asked for (%.1f min). "
+      logw("This recap came out longer than the %.0f minutes at the top of the band (%.1f min). "
            "The plan held too many clips or its narrations were longer than their "
            "clip ranges; the log above names which. Lower max_clips so the model "
            "plans fewer clips, or check the model did not ignore the clip count.",
-           cfg->recap_minutes, final_dur / 60.0);
+           band_hi, final_dur / 60.0);
   }
 
   /* Cancelled after the clips were joined: keep the recap we already have and
@@ -8479,6 +8628,13 @@ int run_generation(void) {
   if (span < 0) span = 0;
   int num_clips = cfg.min_clips + (span > 0 ? (rand() % (span + 1)) : 0);
   logi("Clip plan target: %d clips (config allows %d-%d).", num_clips, cfg.min_clips, cfg.max_clips);
+  {
+    double band_lo = 0.0, band_hi = 0.0;
+    recap_band_minutes(&cfg, &band_lo, &band_hi);
+    if (band_hi >= 1.0)
+      logi("Recap length band: %.0f-%.0f min (aiming at %.0f, never over it).",
+           band_lo, band_hi, band_hi);
+  }
 
   /* Collect the movie list first: process_movie() moves files out of movies/,
      and modifying a directory while enumerating it is unreliable on Windows. */

@@ -126,8 +126,10 @@ no browser extension, nothing to install. The page gives you:
 - **every setting** in `config.json` editable in the form (API keys, models, voice,
   clip count, speed cap, music/narration volume, BGM on/off, vertical render on/off,
   auto-retire on/off, API base URLs) — keys are shown masked and are never echoed back
-- **target recap length** (`recap_minutes`, minutes, 0 = automatic): the planner makes
-  clip windows and narrations longer so the finished video lands near that length
+- **target recap length is a range** (`recap_minutes` = the top, `min_recap_minutes` = the
+  bottom, 0 for the bottom = half of the top): the planner aims at the top of the band,
+  the trim holds it there, and the run says which end it landed on. Asking for 20 minutes
+  accepts 10-20, so a good story is not padded to fill a number
 - **burnt-in subtitles** (`captions`, on by default): the narration as small centred
   captions (~3.5% of frame height, thin outline) — readable, never huge. Each caption
   changes exactly when the voice moves on to the next sentence: the clip length is
@@ -305,8 +307,11 @@ Edit `config.json` in the project root (or use the **Settings** card in the web 
 | `tts_api_key` | empty | optional bearer token for `openai_tts`; falls back to `open_api_key` |
 | `min_clips` / `max_clips` | `20` / `30` | a random clip count in this range is requested per run (1-200) |
 | `max_video_speedup` | `1.75` | cap for the video speed-up when the narration is short |
-| `transitions` | `true` | crossfade between clips instead of a hard cut: a short blend hides the rough scene-to-scene jump. `false` = hard cuts |
-| `transition_seconds` | `0.35` | length of that crossfade, 0.10-1.50 s. The fade eats this much of the video per joint, so the narration length is allowed for it |
+| `recap_minutes` | `20` | top of the recap length band (0 = automatic, i.e. no length target) |
+| `min_recap_minutes` | `10` | bottom of the band: shorter than this counts as a failed target. `0` = half of `recap_minutes` |
+| `transitions` | `true` | fade between clips instead of a hard cut: a short blend hides the rough scene-to-scene jump. `false` = hard cuts |
+| `transition_seconds` | `0.35` | length of that fade, 0.10-1.50 s. Each clip holds its last picture (and a matching silence) for the fade, so the joins add this much per junction and the narration budget allows for it |
+| `transition_style` | `fade` | the ffmpeg fade to use: `fade`, `fadeblack`, `fadewhite`, `dissolve`, `smoothleft/right/up/down`, `slideleft/right`, `circleopen`, `radial`, `pixelize` — or `none`/`cut` for the plain hard cut of the original AI-Movie-Shorts |
 | `narration_volume` | `2.5` | narration gain when mixing |
 | `bgm_volume` | `0.1` | background-music gain when mixing |
 | `bgm_enabled` | `true` | set `false` for narration-only output |
@@ -409,19 +414,38 @@ Before giving up it retries in this order (each one is a single extra request):
 
 Set `"offline_planner": true` if you prefer a raw-subtitle video over no video.
 
-### Recap length (`recap_minutes`)
+### Recap length (`recap_minutes` + `min_recap_minutes`)
 
-`"recap_minutes": 20` divides the target by the clip count and asks the model for that many
-seconds of *speech* per clip (`20 min / 30 clips => 40 s per clip => about 90-125 words`).
-The prompt says so twice (STEP 4 and STEP 5), and the run checks afterwards that the plan's
-narrations really add up to the requested speaking time. If they do not, it asks the model
-once more for full-length narrations, and then reports the truth:
+A recap is never exactly 20 minutes long - a story that is told well lands where it lands.
+So the length is a **band**: `"recap_minutes": 20` is the top (and the hard cap) and
+`"min_recap_minutes": 10` the bottom, i.e. anything from 10 to 20 minutes counts as the
+video that was asked for. `min_recap_minutes: 0` means "half of the top", so 20 alone already
+gives a 10-20 band. The log names the band everywhere it matters:
 
 ```
-Plan speech: about 6.9 min of narration for the 20 min target (30 clips).
-The narrations are much shorter than the 20 minute target (6.9 min of speech) - asking the model once more for full-length narrations.
-Recap length: 12.1 min of the 20 min target (60%).
+Recap length band: 10-20 min (aiming at 20, never over it).
+Target recap length 10-20 min => about 60 s per clip at 20 clips.
+Plan speech: about 18.2 min of narration for the 10-20 min target (20 clips, aiming at 20).
+Recap length: 17.6 min of the 20 min target (88%) - inside the 10-20 min band.
 ```
+
+The top of the band divides into per-clip windows and word budgets for the model
+(`20 min / 30 clips => 40 s per clip => about 90-125 words`), the prompt asks for the top of
+the band, and the run checks afterwards that the plan's narrations really add up to it. Over
+the top it asks the model once more, then trims whole sentences until the speech fits; under
+the bottom it asks once more for full-length narrations and, if that fails, says so honestly
+instead of padding the video:
+
+```
+Recap length: 8.4 min of the 20 min target (42%) - below the 10 min floor of the band.
+This recap is shorter than the 10 minutes the band bottoms out at (8.4 min). Each clip is
+sped up at most 1.75x and then cut down to its narration, so the spoken lines were too short
+for their clip ranges. Try a stronger model, fewer clips (min_clips/max_clips), or set
+"recap_minutes": 0.
+```
+
+Set `"recap_minutes": 0` for no length target at all (the recap is as long as the narration
+the model wrote).
 
 The reason the number matters: each clip's video is sped up (at most `max_video_speedup`) to
 fit its narration, so **the finished recap can never be longer than the narrations are** - a
@@ -713,13 +737,21 @@ It still builds on macOS/Linux (`cmake -S . -B build && cmake --build build`, us
   the recap, and it obeys any ceiling the provider names (e.g. "maximum 8192"). The model's own
   output limit is the only limit in play — raise it in your provider's dashboard if a very long recap
   still cannot be written in one reply.
-- **Smooth scene changes (crossfade)** — clips are joined with a short crossfade instead of a hard
-  cut (`"transitions": true`, `"transition_seconds": 0.35`; both in the panel). The clips are
-  normalised first (same size, same frame rate, yuv420p, 48 kHz stereo) because the ffmpeg fade
-  filters refuse mismatched inputs; the join happens in chunks of 8 and the chunks are joined again,
-  so a 100-clip recap still fits in one command line. If a clip is too short for the fade or ffmpeg
-  rejects the graph, the run logs it and falls back to the plain concat (hard cuts) instead of
-  failing. Set `"transitions": false` for the old behaviour.
+- **Smooth scene changes, without talking over the narration** — clips are joined with a short
+  fade instead of a hard cut (`"transitions": true`, `"transition_seconds": 0.35`,
+  `"transition_style": "fade"`; all three in the panel). A naive crossfade blends the *narrations*
+  too, so two voices talk over each other at every cut; here every clip is grown by a **held frame
+  and a matching silence**, and the fade runs between those held frames. One narration ends exactly
+  when the next begins, every word stays at full volume, and each clip's picture is fully visible
+  for exactly as long as its narration (verified: in a merged 10-clip recap the tones of the clip
+  narrations sit in their own windows with one 0.35 s gap between them, chunked joins included).
+  The joins add one fade length per junction to the finished video, which the length budget allows
+  for. The clips are normalised first (same size, same frame rate, yuv420p, 48 kHz stereo) because
+  the ffmpeg fade filters refuse mismatched inputs; the join happens in chunks of 8 and the chunks
+  are joined again, so a 100-clip recap still fits in one command line. If a clip is too short for
+  the fade or ffmpeg rejects the graph, the run logs it and falls back to the plain concat (hard
+  cuts) instead of failing. `"transition_style": "none"` (or `"transitions": false`) gives exactly
+  the original repo's hard cut.
 - **The recap length is held, not hoped for** — a model that writes more narration than the time
   budget allows (the reported "asked for 20 minutes, got 20+") is told once, in one combined note,
   exactly what is wrong: the words it may use per clip, the names it invented, any subtitle line it

@@ -1579,6 +1579,147 @@ static void test_pace_scale_speaks_the_requested_minutes(void) {
   ck(pace_scale_for(1.0, 4.0, 100) >= 0.75, "the slowest correction is still bounded");
 }
 
+static void test_recap_band_is_a_range(void) {
+  /* "Give me a 20 minute recap" now means 10-20 minutes: the top is the hard cap,
+     the bottom is what still counts as the video that was asked for, and 0 for
+     the bottom means half of the top. */
+  Config cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  double lo = 0, hi = 0;
+  cfg.recap_minutes = 20.0;
+  cfg.min_recap_minutes = 0.0;
+  recap_band_minutes(&cfg, &lo, &hi);
+  ck(hi == 20.0 && lo == 10.0, "20 minutes asked -> 10-20 min band");
+  cfg.min_recap_minutes = 12.0;
+  recap_band_minutes(&cfg, &lo, &hi);
+  ck(lo == 12.0 && hi == 20.0, "an explicit bottom is used as it is");
+  cfg.min_recap_minutes = 45.0;                 /* above the top */
+  recap_band_minutes(&cfg, &lo, &hi);
+  ck(lo == 20.0 && hi == 20.0, "a bottom above the top is clamped to the top");
+  cfg.recap_minutes = 0.0;                      /* auto */
+  cfg.min_recap_minutes = 0.0;
+  recap_band_minutes(&cfg, &lo, &hi);
+  ck(lo == 0.0 && hi == 0.0, "no length requested -> no band");
+  cfg.recap_minutes = 1.0;
+  recap_band_minutes(&cfg, &lo, &hi);
+  ck(lo == 0.5 && hi == 1.0, "the CI's 1 minute recap bands at 0.5-1");
+}
+
+static void test_transition_styles_and_join_length(void) {
+  /* The fade names the app accepts, and what a fade costs in length: one fade
+     per junction, because every clip is grown by a held frame instead of the
+     narrations being overlapped. */
+  ck(transition_style_known("fade"), "fade is a known style");
+  ck(transition_style_known("fadeblack"), "fadeblack is a known style");
+  ck(transition_style_known("slideleft"), "slideleft is a known style");
+  ck(transition_style_known("dissolve"), "dissolve is a known style");
+  ck(transition_style_known("pixelize"), "pixelize is a known style");
+  ck(transition_style_known("none") && transition_style_known("cut"),
+     "the original repo's hard cut is a style of its own");
+  ck(!transition_style_known(NULL), "no style is not a style");
+  ck(!transition_style_known(""), "an empty style is not a style");
+  ck(!transition_style_known("fade;rm -rf /"), "a filter name from outside is refused");
+  ck(!transition_style_known("Fade"), "the filter names are case sensitive");
+
+  ck(transition_join_seconds(true, 20, 0.35) > 6.6 &&
+     transition_join_seconds(true, 20, 0.35) < 6.7,
+     "20 clips fade into 19 junctions of 0.35 s");
+  ck(transition_join_seconds(false, 20, 0.35) == 0.0, "hard cuts add nothing");
+  ck(transition_join_seconds(true, 1, 0.35) == 0.0, "one clip has no junction");
+  ck(transition_join_seconds(true, 5, 0.0) == 0.0, "no fade length, no cost");
+}
+
+static void test_plan_request_asks_for_the_band_and_audits_it(void) {
+  /* The band has to reach the model in the request itself, and the audit has to
+     hold the plan to it: over the top it trims, under the floor it says so. */
+  stub_reset();
+  stub_set_default_reply(500, "{\"type\":\"error\",\"error\":{\"message\":\"unexpected\"}}");
+  queue_ok_big("{\\\"clips\\\":[{\\\"start\\\":12,\\\"end\\\":42,\\\"narration\\\":\\\"The story "
+               "begins in a small town where nothing ever happens to anyone at all.\\\"}]}");
+
+  g_batch_collect = false;
+  g_batch_render = false;
+  g_batch_bypass_lookup = false;
+
+  Config c = cfg_for("https://api.anthropic.com/v1", "claude-sonnet-4-5",
+                     "sk-ant-api03-testkey");
+  snprintf(c.recap_language, sizeof(c.recap_language), "English");
+  c.recap_minutes = 20.0;
+  c.min_recap_minutes = 10.0;
+
+  ClipPlanList plan = openai_make_plan(&c, "Toy Story 5 (2026)",
+                                       "1\n12 --> 20\nThe story starts here.\n\n",
+                                       "", "", false, 25, 48, NULL, NULL, NULL);
+  ck(stub_request_count() == 1, "one plan request");
+  const char *body = stub_request_body(0);
+  ck(strstr(body, "add up to 10.0 to 20.0 minutes of speech") != NULL,
+     "the request carries the top AND the bottom of the band");
+  ck(strstr(body, "never go over it") != NULL,
+     "the request says the top is a hard cap");
+  ck(strstr(body, "Target clip length: 38-57 seconds each") != NULL,
+     "the per-clip window still comes from the clip length");
+  ck(strstr(body, "array must hold EXACTLY 25 clip objects") != NULL,
+     "the clip count is still a hard limit");
+  free_clip_plan_list(&plan);
+
+  /* Over the top: the deterministic trim must land the speech inside the band. */
+  Config cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.recap_minutes = 20.0;
+  cfg.min_recap_minutes = 10.0;
+  cfg.transition_seconds = 0.35;
+  cfg.transitions = true;
+  snprintf(cfg.recap_language, sizeof(cfg.recap_language), "English");
+  ClipPlanList over;
+  over.count = 20;
+  over.items = (ClipPlan *)calloc(20, sizeof(ClipPlan));
+  const char *sent = "He opens the door and steps inside the dark room. "
+                     "Then he hears a noise behind him and turns around quickly.";
+  for (int i = 0; i < 20; i++) {
+    over.items[i].start = 60 + i * 60;
+    over.items[i].end   = 60 + i * 60 + 60;
+    char buf[2048];
+    int at = 0;
+    for (int k = 0; k < 4; k++) at += snprintf(buf + at, sizeof(buf) - at, "%s", sent);
+    over.items[i].narration = str_dup(buf);
+  }
+  double join = transition_join_seconds(cfg.transitions, over.count, cfg.transition_seconds);
+  ck(join > 6.6 && join < 6.7, "20 clips carry 19 fades of 0.35 s");
+  g_batch_collect = true;          /* no re-ask: only the deterministic trim */
+  audit_plan_length_and_script(&cfg, "Toy Story 5 (2026)", NULL, NULL, NULL, false, 20, 60,
+                               "en", &over);
+  g_batch_collect = false;
+  double speech = plan_speech_seconds(over.items, over.count, "en");
+  double allowed = (cfg.recap_minutes * 60.0 - join) * 1.02;
+  ck(speech <= allowed, "a 24 minute plan is trimmed to fit the 20 minute top");
+  ck(speech > (cfg.min_recap_minutes * 60.0 - join) * 0.8,
+     "the trimmed plan is still above the 10 minute floor");
+  ck(over.count == 20, "the trim never drops a clip");
+  bool all_narrated = true;
+  for (size_t i = 0; i < over.count; i++)
+    if (!over.items[i].narration || over.items[i].narration[0] == '\0') all_narrated = false;
+  ck(all_narrated, "every clip still has a narration after the trim");
+  free_clip_plan_list(&over);
+
+  /* Under the floor: the audit keeps the plan but must not stay silent about it. */
+  ClipPlanList under;
+  under.count = 3;
+  under.items = (ClipPlan *)calloc(3, sizeof(ClipPlan));
+  for (int i = 0; i < 3; i++) {
+    under.items[i].start = 60 + i * 30;
+    under.items[i].end   = 60 + i * 30 + 30;
+    under.items[i].narration = str_dup("A short line happens here and that is all.");
+  }
+  g_batch_collect = true;
+  audit_plan_length_and_script(&cfg, "Toy Story 5 (2026)", NULL, NULL, NULL, false, 3, 30,
+                               "en", &under);
+  g_batch_collect = false;
+  ck(under.count == 3, "a plan under the floor is left alone");
+  ck(plan_speech_seconds(under.items, under.count, "en") < 20.0 * 60.0,
+     "the short plan really is short");
+  free_clip_plan_list(&under);
+}
+
 int main(void) {
   test_endpoint_shapes();
   test_native_claude_request();
@@ -1614,6 +1755,9 @@ int main(void) {
   test_audit_trims_a_stubborn_over_long_plan();
   test_voice_pace_trim_keeps_whole_sentences();
   test_pace_scale_speaks_the_requested_minutes();
+  test_recap_band_is_a_range();
+  test_transition_styles_and_join_length();
+  test_plan_request_asks_for_the_band_and_audits_it();
   test_openai_no_limit_means_no_extra_requests();
   test_batch_custom_id_shape();
   test_batch_collect_then_render();

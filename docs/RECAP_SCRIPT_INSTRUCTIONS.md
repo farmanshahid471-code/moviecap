@@ -18,8 +18,10 @@ breaks one of the hard rules.
 | `{{CLIP_SEC}}` | the length of one clip in the video | `10` |
 | `{{WORDS_MIN}}` | minimum words in one narration (`CLIP_SEC x 2.6`) | `26` |
 | `{{WORDS_MAX}}` | maximum words in one narration (`CLIP_SEC x 2.6`) | `26` |
-| `{{TOTAL_MIN}}` | requested recap length in minutes | `20` |
-| `{{WORDS_TOTAL}}` | `CLIP_COUNT x CLIP_SEC x 2.6`, the whole script's word budget | `28860` |
+| `{{TOTAL_MIN}}` | top of the requested recap length band, in minutes (the hard cap) | `20` |
+| `{{TOTAL_MIN_FLOOR}}` | bottom of the band: below this the video is not the one that was asked for | `10` |
+| `{{WORDS_TOTAL}}` | `CLIP_COUNT x CLIP_SEC x 2.6`, the whole script's word budget at the top | `28860` |
+| `{{WORDS_TOTAL_MIN}}` | the same budget at the bottom of the band | `14430` |
 | `{{CLOSING}}` | the exact closing sentence (see §7) | `With that the story ends right here. …` |
 
 `CLIP_SEC x 2.6` is the measured pace of the narration voice (2.6 words per second at the app's
@@ -122,8 +124,11 @@ Do this silently; never output it.
 - A `{{CLIP_SEC}}`-second clip therefore needs about **`{{WORDS_MIN}}`–`{{WORDS_MAX}}` words**, and
   `{{WORDS_MAX}}` is a **hard maximum** — going over makes the finished video longer than the
   viewer asked for. Never fewer than 25 words in one clip either.
-- All `{{CLIP_COUNT}}` narrations together must add up to about `{{TOTAL_MIN}}` minutes of speech
-  (roughly `{{WORDS_TOTAL}}` words) and must **never** add up to more.
+- All `{{CLIP_COUNT}}` narrations together must add up to **`{{TOTAL_MIN_FLOOR}}` to
+  `{{TOTAL_MIN}}` minutes** of speech (roughly `{{WORDS_TOTAL_MIN}}`–`{{WORDS_TOTAL}}` words):
+  aim for the top of that band, never go over it, and never go under the bottom. A recap of a
+  good film is not padded to hit an exact number - it lands inside the band with every scene
+  getting the time its story needs.
 - Every clip carries a full narration: no one-line summaries, no empty strings.
 - Use about `CLIP_SEC / 12` to `CLIP_SEC / 12 + 2` short sentences per clip (a 10 s clip ≈ 2–3
   sentences).
@@ -197,11 +202,21 @@ after:
 | Rule | What happens if the plan breaks it |
 |---|---|
 | exactly `{{CLIP_COUNT}}` clips | extra clips are merged down to the target (whole narrations kept) |
-| total speech ≤ requested minutes (+ crossfade) | the model is asked once with a combined correction note, then whole sentences are trimmed off the end of the long narrations until the speech fits; the fixed closing line always survives |
+| total speech ≤ top of the band (less the fades) | the model is asked once with a combined correction note, then whole sentences are trimmed off the end of the long narrations until the speech fits; the fixed closing line always survives |
+| total speech ≥ bottom of the band | the model is asked once more for full-length narrations; if it still comes back short the run says so and names the knobs (stronger model, fewer clips, `max_video_speedup`) instead of padding the video |
 | names that appear in no plot summary | reported by name and included in the correction note |
 | subtitle lines copied word for word | counted, reported, and included in the correction note |
 | missing exact closing line | reported and requested again |
 | clip windows | clips are cut from the movie at those seconds, sped up at most `max_video_speedup`, then cut to the narration |
+
+## 11b. How the clip joins behave (so the pacing can be trusted)
+
+Every clip's picture is retimed to its own narration and the clips are joined with a short fade
+(`transition_style`, default `fade`; `none` = hard cuts). Each clip holds its last picture - and a
+matching silence - for the fade, so **the fades run between the narrations, never over them**: one
+narration ends exactly when the next one begins, every word stays at full volume, and no line is
+cut or doubled. The joins add a fraction of a second each (`transition_seconds` x junctions) and
+the length budget already allows for it, so a plan that fits the band stays inside it.
 
 ## 12. Worked example (style target)
 

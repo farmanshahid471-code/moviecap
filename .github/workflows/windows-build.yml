@@ -591,6 +591,18 @@ jobs:
           if (-not (Select-String -Path "$pb\scripts\plans\*.result.json" -Pattern "don't forget to like the video" -Quiet)) {
             Write-Host "::error title=pbatch::the batched plan does not carry the closing line"; exit 1 }
 
+          # The scene fades must not talk over the narration: every clip is grown
+          # by a held frame and a matching silence, and the merge checks that the
+          # length it produced is the length the maths expected.
+          if (-not (Select-String -Path pbatch.log -Pattern "Smooth scene changes: 0.35 s .fade. between clips" -Quiet)) {
+            Write-Host "::error title=pbatch::the fade join never described what it does"; exit 1 }
+          if (-not (Select-String -Path pbatch.log -Pattern "Joined with fade fades" -Quiet)) {
+            Write-Host "::error title=pbatch::the clips were not joined with fades"; exit 1 }
+          if (Select-String -Path pbatch.log -Pattern "Fade check:" -Quiet) {
+            Write-Host "::error title=pbatch::the fades did not land where the maths expected them"; exit 1 }
+          if (Select-String -Path pbatch.log -Pattern "did not work - falling back to hard cuts" -Quiet) {
+            Write-Host "::error title=pbatch::the fade join failed and fell back to hard cuts"; exit 1 }
+
           $vid = Get-Item "$pb\output\Batch Run (2026).mp4" -ErrorAction SilentlyContinue
           if (-not $vid) { Write-Host "::error title=pbatch::no video was rendered"; exit 1 }
           $dur = & "C:\ProgramData\chocolatey\bin\ffprobe.exe" -v error -show_entries format=duration -of csv=p=0 "$pb\output\Batch Run (2026).mp4"
@@ -784,7 +796,7 @@ jobs:
           New-Item -ItemType Directory -Force "$pl\scripts\srt_files" | Out-Null
           Copy-Item build\Release\movie_summary_cli.exe $pl\
           Copy-Item -Recurse resources $pl\resources
-          '{"open_api_key":"sk-mock-len","openai_base_url":"http://127.0.0.1:9300/v1","openai_model":"gpt-5.2","tts_provider":"piper","min_clips":3,"max_clips":3,"recap_minutes":1,"use_wikipedia_plot":false,"auto_transcribe":false,"transitions":false}' | Set-Content "$pl\config.json"
+          '{"open_api_key":"sk-mock-len","openai_base_url":"http://127.0.0.1:9300/v1","openai_model":"gpt-5.2","tts_provider":"piper","min_clips":3,"max_clips":3,"recap_minutes":1,"min_recap_minutes":0.5,"use_wikipedia_plot":false,"auto_transcribe":false,"transitions":false}' | Set-Content "$pl\config.json"
           $lines = @()
           $idx = 1
           for ($t = 0; $t -lt 118; $t += 2) {
@@ -836,6 +848,13 @@ jobs:
           # 1. the mock really did write far more narration than the target
           if (-not (Select-String -Path mocklen.log -Pattern "writing an over-long plan" -Quiet)) {
             Write-Host "::error title=plen::the over-long plan was never served - the test did not run"
+            exit 1 }
+          # 1b. the requested length is a band, and the run says where it landed
+          if (-not (Select-String -Path plen.log -Pattern "Recap length band: 0-1 min" -Quiet)) {
+            Write-Host "::error title=plen::the recap length band was not reported"
+            exit 1 }
+          if (-not (Select-String -Path plen.log -Pattern "inside the 0-1 min band" -Quiet)) {
+            Write-Host "::error title=plen::the run never said the recap is inside the band"
             exit 1 }
           # 2. the app noticed and re-asked once with the length rule
           if (-not (Select-String -Path plen.log -Pattern "Asking the model once more for a corrected plan" -Quiet)) {
