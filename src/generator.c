@@ -7231,6 +7231,56 @@ static void cap_plan_narration_length(ClipPlanList *plan, double target_sec, dou
        trimmed_clips, plan->count, before_min, after / 60.0);
 }
 
+/* Trim one narration to at most `budget_units` of speech: whole sentences only,
+   at least one sentence kept, the fixed closing line (when it ends the text)
+   preserved.  Used by the live pace correction below. */
+static char *trim_narration_to_units(const char *text, double budget_units, const char *code,
+                                     const char *tail, bool *out_trimmed) {
+  if (out_trimmed) *out_trimmed = false;
+  if (!text) return str_dup("");
+  size_t n = strlen(text);
+  if (count_speech_units(text, code) <= budget_units) return str_dup(text);
+  size_t body_n = n;
+  if (tail && tail[0]) {
+    size_t tl = strlen(tail);
+    if (tl <= n && memcmp(text + n - tl, tail, tl) == 0) body_n = n - tl;
+  }
+  double acc = 0.0;
+  size_t keep = 0, pos = 0;
+  int kept = 0;
+  while (pos < body_n) {
+    size_t nx = next_sentence_cursor(text, body_n, pos);
+    if (nx <= pos) break;
+    double u = units_of_slice(text + pos, nx - pos, code);
+    if (kept > 0 && acc + u > budget_units) break;
+    acc += u;
+    keep = nx;
+    kept++;
+    pos = nx;
+  }
+  if (kept == 0) {
+    size_t nx = next_sentence_cursor(text, body_n, 0);
+    keep = nx > 0 ? nx : body_n;
+  }
+  while (keep > 0 && (text[keep - 1] == ' ' || text[keep - 1] == '\n' ||
+                      text[keep - 1] == '\r' || text[keep - 1] == '\t'))
+    keep--;
+  bool append_tail = (tail && tail[0] && body_n < n);
+  size_t tl = append_tail ? strlen(tail) : 0;
+  char *out = (char *)malloc(keep + tl + 2);
+  if (!out) die("OOM");
+  memcpy(out, text, keep);
+  size_t at = keep;
+  if (append_tail) {
+    if (at > 0) out[at++] = ' ';
+    memcpy(out + at, tail, tl);
+    at += tl;
+  }
+  out[at] = '\0';
+  if (out_trimmed) *out_trimmed = true;
+  return out;
+}
+
 /* Capitalised words (length >= 3, not ALL-CAPS) inside `text`.  `mid_sentence`
    skips the first word of every sentence, where the capital is just grammar. */
 static bool token_is_name_like(const char *s, size_t len) {
@@ -7972,6 +8022,64 @@ static bool process_movie(const Config *cfg, const char *movie_path, const char 
     if (nar_dur <= 0.1) {
       logw("Bad narration duration for clip %zu", i + 1);
       continue;
+    }
+
+    /* The plan was built for a pace the model only estimated.  After the first
+       clip the REAL pace of this voice is known, and if the rest of the plan
+       would push the recap past the requested minutes the remaining narrations
+       are trimmed to the time that is actually left.  (The other direction -
+       a voice slower than the plan hoped - can only be reported.) */
+    if (i == 0 && plan.count > 1 && cfg->recap_minutes >= 1.0) {
+      double units = count_speech_units(plan.items[0].narration, lang_code);
+      double assumed = lang_speech_units_per_sec(lang_code);
+      if (units > 0.0 && assumed > 0.0) {
+        double real = units / nar_dur;
+        logi("Voice pace: %.2f %s per second (the plan assumed %.1f, tts_rate %d%%).",
+             real, lang_counts_chars(lang_code) ? "characters" : "words", assumed, cfg->tts_rate);
+        double overlap = (cfg->transitions && plan.count > 1)
+                             ? (double)(plan.count - 1) * cfg->transition_seconds : 0.0;
+        double budget_sec = cfg->recap_minutes * 60.0 + overlap;
+        double rest_units = 0.0;
+        for (size_t k = 1; k < plan.count; k++)
+          rest_units += count_speech_units(plan.items[k].narration, lang_code);
+        double rest_sec = real > 0.0 ? rest_units / real : 0.0;
+        if (nar_dur + rest_sec > budget_sec * 1.05) {
+          char tail[600];
+          recap_closing_line_for(cfg->recap_language, tail, sizeof(tail));
+          double allowed_units = (budget_sec - nar_dur) * real;
+          if (allowed_units < 0.0) allowed_units = 0.0;
+          logw("The voice speaks %.2f words per second, not the %.1f the plan assumed: at "
+               "that pace these narrations would run %.1f min for the %.0f min target. "
+               "Trimming the narrations of the remaining clips to the time that is left.",
+               real, assumed, (nar_dur + rest_sec) / 60.0, cfg->recap_minutes);
+          size_t cut = 0;
+          for (size_t k = 1; k < plan.count; k++) {
+            double u = count_speech_units(plan.items[k].narration, lang_code);
+            double share = rest_units > 0.0 ? allowed_units * (u / rest_units) : allowed_units;
+            double window_units = (double)(plan.items[k].end - plan.items[k].start) * real;
+            if (window_units > 0.0 && share > window_units) share = window_units;
+            bool is_last = (k + 1 == plan.count);
+            const char *use_tail = NULL;
+            if (is_last && tail[0]) {
+              const char *t = plan.items[k].narration;
+              size_t ln = strlen(t), tl = strlen(tail);
+              if (ln >= tl && memcmp(t + ln - tl, tail, tl) == 0) use_tail = tail;
+            }
+            bool trimmed = false;
+            char *shorter = trim_narration_to_units(plan.items[k].narration, share,
+                                                    lang_code, use_tail, &trimmed);
+            if (trimmed) {
+              free(plan.items[k].narration);
+              plan.items[k].narration = shorter;
+              cut++;
+            } else {
+              free(shorter);
+            }
+          }
+          logw("Trimmed %zu of the remaining %zu narrations to hold the %.0f minute target.",
+               cut, plan.count - 1, cfg->recap_minutes);
+        }
+      }
     }
 
     char out_clip_name[PATH_MAX];

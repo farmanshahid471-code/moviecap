@@ -1516,6 +1516,45 @@ static void test_audit_trims_a_stubborn_over_long_plan(void) {
   g_batch_bypass_lookup = false;   /* the next tests rely on the batch lookup */
 }
 
+
+static void test_voice_pace_trim_keeps_whole_sentences(void) {
+  /* The voice speaks faster than the estimate, so after the first clip the app
+     re-trims the REST of the plan with the measured pace.  That trim must obey
+     the same rules: whole sentences, closing line kept. */
+  char tail[600];
+  recap_closing_line_for("English", tail, sizeof(tail));
+  const char *sent = "He opens the door and steps inside the dark room. "
+                     "Then he hears a noise behind him and turns around.";
+  char body[2048];
+  int at = 0;
+  for (int k = 0; k < 6; k++) at += snprintf(body + at, sizeof(body) - at, "%s", sent);
+  char with_tail[2600];
+  snprintf(with_tail, sizeof(with_tail), "%s %s", body, tail);
+
+  bool trimmed = false;
+  char *out = trim_narration_to_units(body, 30.0, "en", NULL, &trimmed);
+  ck(trimmed, "an over-budget narration is trimmed");
+  ck(count_speech_units(out, "en") <= 30.0 * 1.05, "the trim obeys the measured-pace budget");
+  size_t n = strlen(out);
+  ck(n > 0 && out[n - 1] == '.', "the trimmed narration ends on a whole sentence");
+  free(out);
+
+  out = trim_narration_to_units(with_tail, 40.0, "en", tail, &trimmed);
+  ck(trimmed, "the narration with the closing line is trimmed too");
+  n = strlen(out);
+  size_t tl = strlen(tail);
+  ck(n >= tl && memcmp(out + n - tl, tail, tl) == 0,
+     "the closing line survives the measured-pace trim");
+  ck(count_speech_units(out, "en") >= 30.0,
+     "the closing line alone keeps the narration above the tiny budget");
+  free(out);
+
+  out = trim_narration_to_units("Short line here.", 40.0, "en", NULL, &trimmed);
+  ck(!trimmed && strcmp(out, "Short line here.") == 0,
+     "a narration inside the budget is returned untouched");
+  free(out);
+}
+
 int main(void) {
   test_endpoint_shapes();
   test_native_claude_request();
@@ -1549,6 +1588,7 @@ int main(void) {
   test_subtitle_copying_is_flagged();
   test_transition_command_shape();
   test_audit_trims_a_stubborn_over_long_plan();
+  test_voice_pace_trim_keeps_whole_sentences();
   test_openai_no_limit_means_no_extra_requests();
   test_batch_custom_id_shape();
   test_batch_collect_then_render();
